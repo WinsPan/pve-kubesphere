@@ -373,25 +373,24 @@ start_vms() {
     done
 }
 
-# 等待虚拟机完全启动
-wait_for_vms() {
-    log_step "等待虚拟机完全启动..."
+# 等待虚拟机完全启动并配置服务
+wait_and_configure_vms() {
+    log_step "等待虚拟机完全启动并配置服务..."
     
     for i in "${!VM_CONFIGS[@]}"; do
         IFS=':' read -r vm_name cpu_count memory disk_size template_file <<< "${VM_CONFIGS[$i]}"
         vm_ip="10.0.0.$((10 + i))"
         vm_id=$((VM_BASE_ID + i))
         
-        log_info "等待虚拟机 $vm_name ($vm_ip) 启动..."
+        log_info "等待虚拟机 $vm_name ($vm_ip) 启动并配置服务..."
         
         # 检查虚拟机状态
         local vm_status=$(qm list | grep "$vm_id" | awk '{print $3}')
         log_info "虚拟机 $vm_name 状态: $vm_status"
         
-        # 等待虚拟机完全启动（最多等待5分钟）
-        local timeout=300
+        # 等待SSH可用（最多等待5分钟）
+        local ssh_timeout=300
         local elapsed=0
-        local ssh_timeout=60
         
         log_info "等待SSH端口开放 (超时: ${ssh_timeout}秒)..."
         
@@ -437,7 +436,7 @@ wait_for_vms() {
             done
             
             if [ $elapsed -ge $ssh_timeout ]; then
-                log_error "虚拟机 $vm_name SSH连接失败，请手动检查"
+                log_error "虚拟机 $vm_name SSH连接失败，跳过配置"
                 log_info "手动检查命令："
                 log_info "qm status $vm_id"
                 log_info "qm terminal $vm_id"
@@ -462,38 +461,7 @@ wait_for_vms() {
         done
         
         if [ $elapsed -ge 180 ]; then
-            log_warn "系统启动等待超时，但SSH已可用"
-        fi
-        
-        log_info "虚拟机 $vm_name 启动完成"
-    done
-}
-
-# 配置虚拟机SSH和防火墙
-configure_vm_services() {
-    log_step "配置虚拟机SSH和防火墙..."
-    
-    for i in "${!VM_CONFIGS[@]}"; do
-        IFS=':' read -r vm_name cpu_count memory disk_size template_file <<< "${VM_CONFIGS[$i]}"
-        vm_ip="10.0.0.$((10 + i))"
-        vm_id=$((VM_BASE_ID + i))
-        
-        log_info "配置 $vm_name ($vm_ip) 的SSH和防火墙..."
-        
-        # 等待SSH连接可用
-        local retry_count=0
-        while [ $retry_count -lt 30 ]; do
-            if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@$vm_ip "echo 'SSH ready'" > /dev/null 2>&1; then
-                break
-            fi
-            log_info "等待SSH连接... (${retry_count}/30)"
-            sleep 10
-            retry_count=$((retry_count + 1))
-        done
-        
-        if [ $retry_count -ge 30 ]; then
-            log_error "无法连接到 $vm_name，跳过配置"
-            continue
+            log_warn "系统启动等待超时，但SSH已可用，继续配置"
         fi
         
         # 配置SSH服务
@@ -543,7 +511,7 @@ ufw --force disable
 ufw status verbose
 EOF
         
-        log_success "$vm_name SSH和防火墙配置完成"
+        log_success "$vm_name 启动和配置完成"
     done
 }
 
@@ -631,11 +599,8 @@ main() {
     # 启动虚拟机
     start_vms
     
-    # 等待虚拟机完全启动
-    wait_for_vms
-    
-    # 配置虚拟机SSH和防火墙
-    configure_vm_services
+    # 等待虚拟机完全启动并配置服务
+    wait_and_configure_vms
     
     # 生成主机列表文件
     generate_hosts_file
