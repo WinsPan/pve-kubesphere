@@ -688,7 +688,9 @@ wait_and_configure_vms() {
             ssh_configured=true
             
             # 配置SSH服务
-            ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF'
+            ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF' || {
+                log_warn "SSH配置失败，但继续执行..."
+            }
 # 启用SSH服务
 systemctl enable ssh
 systemctl start ssh
@@ -754,7 +756,9 @@ EOF
         # 配置防火墙（只有在SSH配置成功后才进行）
         if [ "$ssh_configured" = true ]; then
             log_info "配置防火墙..."
-            ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF'
+            ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF' || {
+                log_warn "防火墙配置失败，但继续执行..."
+            }
 # 安装ufw防火墙（如果未安装）
 apt update
 apt install -y ufw
@@ -842,6 +846,56 @@ show_vm_status() {
     qm list | grep -E "(VMID|k8s)"
 }
 
+# 验证部署结果
+verify_deployment() {
+    log_step "验证部署结果..."
+    
+    local success_count=0
+    local total_count=$VM_COUNT
+    
+    for i in "${!VM_CONFIGS[@]}"; do
+        IFS=':' read -r vm_name cpu_count memory disk_size template_file <<< "${VM_CONFIGS[$i]}"
+        vm_id=$((VM_BASE_ID + i))
+        vm_ip="10.0.0.$((10 + i))"
+        
+        log_info "验证 $vm_name ($vm_ip)..."
+        
+        # 检查虚拟机状态
+        if qm list | grep "$vm_id" | grep -q "running"; then
+            log_success "  ✓ 虚拟机正在运行"
+            
+            # 检查网络连接
+            if ping -c 1 -W 3 $vm_ip > /dev/null 2>&1; then
+                log_success "  ✓ 网络连接正常"
+                
+                # 检查SSH连接
+                if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@$vm_ip "echo 'SSH OK'" > /dev/null 2>&1; then
+                    log_success "  ✓ SSH连接正常"
+                    success_count=$((success_count + 1))
+                else
+                    log_warn "  ⚠ SSH连接失败"
+                fi
+            else
+                log_warn "  ⚠ 网络连接失败"
+            fi
+        else
+            log_error "  ✗ 虚拟机未运行"
+        fi
+        
+        echo ""
+    done
+    
+    log_info "部署验证结果: ${success_count}/${total_count} 个虚拟机配置成功"
+    
+    if [ $success_count -eq $total_count ]; then
+        log_success "所有虚拟机部署成功！"
+        return 0
+    else
+        log_warn "部分虚拟机部署失败，请检查配置"
+        return 1
+    fi
+}
+
 # 检查模板文件
 check_template_files() {
     log_step "检查模板文件..."
@@ -912,6 +966,9 @@ main() {
     
     # 显示虚拟机状态
     show_vm_status
+    
+    # 验证部署结果
+    verify_deployment
     
     log_info "PVE环境准备完成！"
     
