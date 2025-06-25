@@ -31,7 +31,7 @@ log_step() {
 }
 
 # 配置变量
-GITHUB_REPO="your-username/pve-kubesphere"  # 请修改为您的GitHub仓库
+GITHUB_REPO="WinsPan/pve-kubesphere"  # 请修改为您的GitHub仓库
 BRANCH="main"
 INSTALL_DIR="pve-kubesphere"
 BACKUP_DIR="pve-kubesphere-backup-$(date +%Y%m%d-%H%M%S)"
@@ -317,7 +317,7 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         -r|--repo)
-            GITHUB_REPO="$2"
+            GITHUB_REPO="WinsPan/pve-kubesphere"
             shift 2
             ;;
         -b|--branch)

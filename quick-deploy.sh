@@ -15,7 +15,7 @@ echo -e "${GREEN}🚀 PVE KubeSphere 快速部署脚本${NC}"
 echo "=================================="
 
 # 配置变量（请修改为您的GitHub仓库）
-REPO="your-username/pve-kubesphere"
+REPO="WinsPan/pve-kubesphere"
 BRANCH="main"
 
 # 创建临时目录

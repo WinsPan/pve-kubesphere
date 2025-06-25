@@ -36,7 +36,7 @@ PVE主机 (24核48GB+)
 
 1. **克隆仓库**
    ```bash
-   git clone https://github.com/your-username/pve-kubesphere.git
+   git clone https://github.com/WinsPan/pve-kubesphere.git
    cd pve-kubesphere
    ```
 
@@ -55,12 +55,12 @@ PVE主机 (24核48GB+)
 
 #### 完整版远程部署
 ```bash
-curl -fsSL https://raw.githubusercontent.com/your-username/pve-kubesphere/main/remote-deploy.sh | bash
+curl -fsSL https://raw.githubusercontent.com/WinsPan/pve-kubesphere/main/remote-deploy.sh | bash
 ```
 
 #### 快速版远程部署
 ```bash
-curl -fsSL https://raw.githubusercontent.com/your-username/pve-kubesphere/main/quick-deploy.sh | bash
+curl -fsSL https://raw.githubusercontent.com/WinsPan/pve-kubesphere/main/quick-deploy.sh | bash
 ```
 
 ## 📁 文件结构
