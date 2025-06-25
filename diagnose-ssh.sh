@@ -134,6 +134,54 @@ check_vm_console() {
     done
 }
 
+# 检查SSH和防火墙状态
+check_ssh_firewall() {
+    log_step "检查SSH和防火墙状态..."
+    
+    for i in "${!VM_IPS[@]}"; do
+        vm_ip="${VM_IPS[$i]}"
+        vm_name="${VM_NAMES[$i]}"
+        
+        log_info "检查 $vm_name ($vm_ip) 的SSH和防火墙状态..."
+        
+        # 检查SSH连接
+        if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@$vm_ip "echo 'SSH连接成功'" > /dev/null 2>&1; then
+            log_success "  SSH连接正常"
+            
+            # 检查SSH服务状态
+            ssh_status=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@$vm_ip "systemctl is-active ssh" 2>/dev/null || echo "unknown")
+            if [ "$ssh_status" = "active" ]; then
+                log_success "  SSH服务运行中"
+            else
+                log_warn "  SSH服务状态: $ssh_status"
+            fi
+            
+            # 检查防火墙状态
+            ufw_status=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@$vm_ip "ufw status" 2>/dev/null | head -1 || echo "unknown")
+            if echo "$ufw_status" | grep -q "Status: active"; then
+                log_success "  防火墙已启用"
+            else
+                log_warn "  防火墙状态: $ufw_status"
+            fi
+            
+            # 检查关键端口
+            log_info "  检查关键端口..."
+            for port in 22 6443 10250 30880; do
+                if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@$vm_ip "netstat -tlnp | grep :$port" > /dev/null 2>&1; then
+                    log_success "    端口 $port 已监听"
+                else
+                    log_warn "    端口 $port 未监听"
+                fi
+            done
+            
+        else
+            log_error "  SSH连接失败"
+        fi
+        
+        echo ""
+    done
+}
+
 # 重启虚拟机
 restart_vms() {
     log_step "重启虚拟机..."
@@ -167,6 +215,7 @@ show_help() {
     echo "  -s, --status     检查虚拟机状态"
     echo "  -n, --network    检查网络连接"
     echo "  -c, --console    检查虚拟机控制台"
+    echo "  -f, --firewall   检查SSH和防火墙状态"
     echo "  -r, --restart    重启所有虚拟机"
     echo "  -a, --all        执行所有检查"
     echo "  -h, --help       显示此帮助信息"
@@ -174,6 +223,7 @@ show_help() {
     echo "示例:"
     echo "  $0 --status       # 检查虚拟机状态"
     echo "  $0 --network      # 检查网络连接"
+    echo "  $0 --firewall     # 检查SSH和防火墙"
     echo "  $0 --all          # 执行所有检查"
 }
 
@@ -205,6 +255,10 @@ main() {
                 check_vm_console
                 shift
                 ;;
+            -f|--firewall)
+                check_ssh_firewall
+                shift
+                ;;
             -r|--restart)
                 restart_vms
                 shift
@@ -215,6 +269,8 @@ main() {
                 check_network_connectivity
                 echo ""
                 check_vm_console
+                echo ""
+                check_ssh_firewall
                 shift
                 ;;
             -h|--help)
