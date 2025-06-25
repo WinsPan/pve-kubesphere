@@ -29,6 +29,10 @@ log_step() {
     echo -e "${BLUE}[STEP]${NC} $1"
 }
 
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
 # 配置变量
 PVE_HOST="10.0.0.1"  # 请修改为您的PVE主机IP
 PVE_USER="root"
@@ -376,20 +380,90 @@ wait_for_vms() {
     for i in "${!VM_CONFIGS[@]}"; do
         IFS=':' read -r vm_name cpu_count memory disk_size template_file <<< "${VM_CONFIGS[$i]}"
         vm_ip="10.0.0.$((10 + i))"
+        vm_id=$((VM_BASE_ID + i))
         
         log_info "等待虚拟机 $vm_name ($vm_ip) 启动..."
         
+        # 检查虚拟机状态
+        local vm_status=$(qm list | grep "$vm_id" | awk '{print $3}')
+        log_info "虚拟机 $vm_name 状态: $vm_status"
+        
+        # 等待虚拟机完全启动（最多等待5分钟）
+        local timeout=300
+        local elapsed=0
+        local ssh_timeout=60
+        
+        log_info "等待SSH端口开放 (超时: ${ssh_timeout}秒)..."
+        
         # 等待SSH可用
-        while ! nc -z $vm_ip 22; do
-            log_info "等待SSH端口开放..."
+        while [ $elapsed -lt $ssh_timeout ]; do
+            if nc -z $vm_ip 22 2>/dev/null; then
+                log_success "SSH端口已开放"
+                break
+            fi
+            
+            log_info "等待SSH端口开放... (${elapsed}/${ssh_timeout}秒)"
             sleep 5
+            elapsed=$((elapsed + 5))
         done
         
-        # 等待系统完全启动
-        while ! ssh -o ConnectTimeout=5 -o BatchMode=yes root@$vm_ip "echo 'ready'" > /dev/null 2>&1; do
-            log_info "等待系统完全启动..."
+        if [ $elapsed -ge $ssh_timeout ]; then
+            log_error "SSH端口等待超时，尝试诊断问题..."
+            
+            # 诊断信息
+            log_info "诊断信息："
+            log_info "- 虚拟机状态: $(qm list | grep "$vm_id" | awk '{print $3}')"
+            log_info "- 网络连接测试: $(ping -c 1 $vm_ip 2>/dev/null && echo "成功" || echo "失败")"
+            log_info "- 端口扫描: $(nc -z $vm_ip 22 2>/dev/null && echo "SSH端口开放" || echo "SSH端口关闭")"
+            
+            # 尝试重启虚拟机
+            log_warn "尝试重启虚拟机 $vm_name..."
+            qm stop $vm_id 2>/dev/null || true
             sleep 10
+            qm start $vm_id
+            sleep 30
+            
+            # 再次尝试SSH连接
+            elapsed=0
+            while [ $elapsed -lt $ssh_timeout ]; do
+                if nc -z $vm_ip 22 2>/dev/null; then
+                    log_success "重启后SSH端口已开放"
+                    break
+                fi
+                
+                log_info "重启后等待SSH端口开放... (${elapsed}/${ssh_timeout}秒)"
+                sleep 5
+                elapsed=$((elapsed + 5))
+            done
+            
+            if [ $elapsed -ge $ssh_timeout ]; then
+                log_error "虚拟机 $vm_name SSH连接失败，请手动检查"
+                log_info "手动检查命令："
+                log_info "qm status $vm_id"
+                log_info "qm terminal $vm_id"
+                log_info "ping $vm_ip"
+                continue
+            fi
+        fi
+        
+        # 等待系统完全启动（最多等待3分钟）
+        log_info "等待系统完全启动 (超时: 180秒)..."
+        elapsed=0
+        
+        while [ $elapsed -lt 180 ]; do
+            if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@$vm_ip "echo 'ready'" > /dev/null 2>&1; then
+                log_success "系统完全启动"
+                break
+            fi
+            
+            log_info "等待系统完全启动... (${elapsed}/180秒)"
+            sleep 10
+            elapsed=$((elapsed + 10))
         done
+        
+        if [ $elapsed -ge 180 ]; then
+            log_warn "系统启动等待超时，但SSH已可用"
+        fi
         
         log_info "虚拟机 $vm_name 启动完成"
     done
