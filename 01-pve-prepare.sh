@@ -327,8 +327,19 @@ configure_vm_network() {
         
         log_info "配置虚拟机 $vm_name 网络: $vm_ip"
         
-        # 创建cloud-init配置
-        qm set $vm_id --ide2 $STORAGE_NAME:cloudinit
+        # 检查虚拟机是否存在
+        if ! qm list | grep -q "$vm_id"; then
+            log_error "虚拟机 $vm_name (ID: $vm_id) 不存在，跳过网络配置"
+            continue
+        fi
+        
+        # 创建cloud-init配置（如果不存在）
+        if ! qm config $vm_id | grep -q "ide2"; then
+            log_info "创建cloud-init配置..."
+            qm set $vm_id --ide2 $STORAGE_NAME:cloudinit
+        else
+            log_info "cloud-init配置已存在，跳过创建"
+        fi
         
         # 设置用户和密码
         qm set $vm_id --ciuser root
