@@ -384,6 +384,45 @@ start_vms() {
     done
 }
 
+# 检测虚拟机网络可达性
+check_vm_network() {
+    local vm_ip=$1
+    local vm_name=$2
+    
+    log_info "检测虚拟机 $vm_name ($vm_ip) 网络可达性..."
+    
+    # 方法1：使用ping检测
+    if ping -c 1 -W 3 $vm_ip > /dev/null 2>&1; then
+        log_success "ping检测成功"
+        return 0
+    fi
+    
+    # 方法2：使用nmap检测（如果可用）
+    if command -v nmap > /dev/null 2>&1; then
+        if nmap -sn -n $vm_ip | grep -q "Host is up"; then
+            log_success "nmap检测成功"
+            return 0
+        fi
+    fi
+    
+    # 方法3：使用arp检测
+    if arp -n | grep -q "$vm_ip"; then
+        log_success "ARP检测成功"
+        return 0
+    fi
+    
+    # 方法4：使用traceroute检测（如果可用）
+    if command -v traceroute > /dev/null 2>&1; then
+        if traceroute -n -w 3 -q 1 $vm_ip 2>/dev/null | grep -q "$vm_ip"; then
+            log_success "traceroute检测成功"
+            return 0
+        fi
+    fi
+    
+    log_info "所有网络检测方法都失败"
+    return 1
+}
+
 # 等待虚拟机完全启动并配置服务
 wait_and_configure_vms() {
     log_step "等待虚拟机完全启动并配置服务..."
@@ -405,9 +444,9 @@ wait_and_configure_vms() {
         
         log_info "等待虚拟机网络可达 (超时: ${network_timeout}秒)..."
         
-        # 等待ping通
+        # 等待网络可达
         while [ $elapsed -lt $network_timeout ]; do
-            if ping -c 1 $vm_ip > /dev/null 2>&1; then
+            if check_vm_network $vm_ip $vm_name; then
                 log_success "虚拟机网络可达"
                 break
             fi
@@ -427,7 +466,7 @@ wait_and_configure_vms() {
             # 再次等待网络
             elapsed=0
             while [ $elapsed -lt $network_timeout ]; do
-                if ping -c 1 $vm_ip > /dev/null 2>&1; then
+                if check_vm_network $vm_ip $vm_name; then
                     log_success "重启后虚拟机网络可达"
                     break
                 fi
