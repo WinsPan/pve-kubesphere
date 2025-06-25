@@ -54,7 +54,7 @@ VM_CONFIGS=(
 )
 
 # 网络配置
-GATEWAY="10.0.0.2"
+GATEWAY="10.0.0.1"
 DNS_SERVERS="10.0.0.2,119.29.29.29"
 
 # 检查PVE环境
