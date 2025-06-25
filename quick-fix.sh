@@ -170,7 +170,7 @@ fix_cleanup() {
         log_warn "清理脚本不存在，手动清理..."
         
         # 手动清理虚拟机
-        for vm_id in 100 101 102; do
+        for vm_id in 101 102 103; do
             if qm list | grep -q "$vm_id"; then
                 log_info "删除虚拟机 $vm_id..."
                 qm stop $vm_id 2>/dev/null || true

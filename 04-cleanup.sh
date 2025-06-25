@@ -36,7 +36,8 @@ PVE_USER="root"
 MASTER_IP="10.0.0.10"
 WORKER_IPS=("10.0.0.11" "10.0.0.12")
 ALL_NODES=("$MASTER_IP" "${WORKER_IPS[@]}")
-VM_BASE_ID=100
+VM_BASE_ID=101
+VM_COUNT=3
 
 # 确认清理操作
 confirm_cleanup() {
@@ -242,19 +243,28 @@ cleanup_vms() {
         
         ssh $PVE_USER@$PVE_HOST << EOF
             # 停止虚拟机
-            for i in {100..102}; do
-                if qm status \$i > /dev/null 2>&1; then
-                    log_info "停止虚拟机 \$i"
-                    qm stop \$i
+            for i in {101..103}; do
+                if qm list | grep -q "$i"; then
+                    log_info "停止虚拟机 $i"
+                    qm stop $i 2>/dev/null || true
                     sleep 5
                 fi
             done
             
             # 删除虚拟机
-            for i in {100..102}; do
-                if qm status \$i > /dev/null 2>&1; then
-                    log_info "删除虚拟机 \$i"
-                    qm destroy \$i
+            for i in {101..103}; do
+                if qm list | grep -q "$i"; then
+                    log_info "删除虚拟机 $i..."
+                    qm stop $i 2>/dev/null || true
+                    qm destroy $i 2>/dev/null || true
+                fi
+            done
+            
+            # 删除虚拟机磁盘
+            for i in {101..103}; do
+                if [ -f "/var/lib/vz/images/$i/vm-$i-disk-0.qcow2" ]; then
+                    log_info "删除虚拟机磁盘 $i..."
+                    rm -f /var/lib/vz/images/$i/vm-$i-disk-0.qcow2
                 fi
             done
             
