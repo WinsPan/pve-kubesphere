@@ -469,57 +469,63 @@ generate_deployment_report() {
     log_step "生成部署报告..."
     
     cat > kubesphere-deployment-report.txt << EOF
-# KubeSphere部署完成报告
-# 生成时间: $(date)
+==========================================
+KubeSphere部署完成报告
+==========================================
 
-## 部署概览
-- PVE主机: 10.0.0.1
-- Kubernetes版本: v1.28.0
-- KubeSphere版本: $KUBESPHERE_VERSION
-- 集群节点: 3个 (1个master + 2个worker)
+部署时间: $(date)
+部署节点: $MASTER_IP
+KubeSphere版本: $KUBESPHERE_VERSION
+Kubernetes版本: v1.29.7
+部署方式: 一键部署脚本
 
-## 节点信息
-- Master节点: 10.0.0.10
-- Worker节点1: 10.0.0.11
-- Worker节点2: 10.0.0.12
+节点信息:
+- Master节点: $MASTER_IP
+- Worker节点: ${WORKER_IPS[*]}
 
-## 访问信息
-- KubeSphere控制台: http://10.0.0.10:30880
-- 默认用户名: admin
-- 默认密码: P@88w0rd
+访问信息:
+- KubeSphere控制台: http://$MASTER_IP:30880
+- 用户名: $KUBESPHERE_USER
+- 密码: $KUBESPHERE_PASSWORD
 
-## 已安装组件
-- Kubernetes v1.28.0
-- Calico网络插件
-- OpenEBS本地存储
-- Helm v3.12.0
-- KubeSphere $KUBESPHERE_VERSION
-
-## 常用命令
-- 查看节点: kubectl get nodes
+管理命令:
+- SSH到主节点: ssh root@$MASTER_IP
+- 查看集群: kubectl get nodes
 - 查看pods: kubectl get pods --all-namespaces
-- 查看服务: kubectl get svc --all-namespaces
-- 访问KubeSphere: kubectl port-forward -n kubesphere-system svc/ks-console 30880:80
 
-## 下一步操作
-1. 访问KubeSphere控制台
-2. 配置存储和网络
-3. 部署应用程序
-4. 配置监控和日志
-
-## 故障排除
-- 查看安装日志: kubectl logs -n kubesphere-system \$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath='{.items[0].metadata.name}')
-- 检查节点状态: kubectl describe nodes
-- 检查pod状态: kubectl describe pods -n kubesphere-system
-
-## 备份和恢复
-- 备份etcd: etcdctl snapshot save backup.db
-- 备份配置: kubectl get all --all-namespaces -o yaml > backup.yaml
-
-部署完成！KubeSphere已成功安装在您的PVE环境中。
+==========================================
 EOF
-    
-    log_info "部署报告已生成: kubesphere-deployment-report.txt"
+
+    log_info "部署报告已保存到: kubesphere-deployment-report.txt"
+}
+
+# 显示最终结果
+show_final_result() {
+    log_step "KubeSphere安装完成！"
+    echo "=========================================="
+    echo "🎉 KubeSphere v$KUBESPHERE_VERSION 安装成功！"
+    echo "=========================================="
+    echo ""
+    echo "📋 访问信息："
+    echo "   KubeSphere控制台: http://$MASTER_IP:30880"
+    echo "   用户名: $KUBESPHERE_USER"
+    echo "   密码: $KUBESPHERE_PASSWORD"
+    echo ""
+    echo "🔧 管理命令："
+    echo "   SSH到主节点: ssh root@$MASTER_IP"
+    echo "   查看集群状态: kubectl get nodes"
+    echo "   查看pods: kubectl get pods --all-namespaces"
+    echo ""
+    echo "📚 版本信息："
+    echo "   KubeSphere: v$KUBESPHERE_VERSION"
+    echo "   Kubernetes v1.29.7"
+    echo "   Calico: v$CALICO_VERSION"
+    echo ""
+    echo "⚠️  注意事项："
+    echo "   1. 首次访问可能需要等待几分钟"
+    echo "   2. 建议更改默认密码"
+    echo "   3. 定期备份重要数据"
+    echo "=========================================="
 }
 
 # 主函数
@@ -536,19 +542,7 @@ main() {
     install_tools
     create_sample_app
     generate_deployment_report
-    
-    log_info "KubeSphere安装完成！"
-    log_info ""
-    log_info "=== 访问信息 ==="
-    log_info "控制台地址: http://$MASTER_IP:$KUBESPHERE_PORT"
-    log_info "默认用户名: admin"
-    log_info "默认密码: P@88w0rd"
-    log_info ""
-    log_info "=== 常用命令 ==="
-    log_info "查看安装状态: ssh root@$MASTER_IP 'kubectl get pod -n kubesphere-system'"
-    log_info "查看安装日志: ssh root@$MASTER_IP 'kubectl logs -n kubesphere-system \$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath=\"{.items[0].metadata.name}\") -f'"
-    log_info ""
-    log_info "部署完成！请访问KubeSphere控制台开始使用。"
+    show_final_result
 }
 
 # 执行主函数

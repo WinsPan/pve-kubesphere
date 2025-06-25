@@ -289,8 +289,8 @@ sysctl -p
 
 - **v1.0.0** - 初始版本
   - 支持PVE 7.0+
-  - 支持Kubernetes 1.28.0
-  - 支持KubeSphere 3.4.1
+  - 支持Kubernetes 1.29.7
+  - 支持KubeSphere 4.1.3
 
 ## 许可证
 

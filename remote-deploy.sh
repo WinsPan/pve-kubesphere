@@ -133,7 +133,7 @@ check_configuration() {
 confirm_deployment() {
     log_warn "此部署过程将："
     log_warn "1. 在PVE上创建3个Debian虚拟机 (8核16GB 300GB)"
-    log_warn "2. 安装Kubernetes v1.28.0集群"
+    log_warn "2. 安装Kubernetes v1.29.7集群"
     log_warn "3. 安装KubeSphere v4.1.3"
     log_warn "4. 配置存储和网络"
     log_warn ""
