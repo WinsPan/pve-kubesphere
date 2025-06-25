@@ -688,9 +688,7 @@ wait_and_configure_vms() {
             ssh_configured=true
             
             # 配置SSH服务
-            ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF' || {
-                log_warn "SSH配置失败，但继续执行..."
-            }
+            if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip <<'EOF'
 # 启用SSH服务
 systemctl enable ssh
 systemctl start ssh
@@ -706,6 +704,9 @@ systemctl restart ssh
 # 检查SSH服务状态
 systemctl status ssh --no-pager -l
 EOF
+            then
+                log_warn "SSH配置失败，但继续执行..."
+            fi
         else
             log_info "SSH连接不可用，需要手动配置..."
             log_info "请手动配置SSH服务："
@@ -756,9 +757,7 @@ EOF
         # 配置防火墙（只有在SSH配置成功后才进行）
         if [ "$ssh_configured" = true ]; then
             log_info "配置防火墙..."
-            ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF' || {
-                log_warn "防火墙配置失败，但继续执行..."
-            }
+            if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip <<'EOF'
 # 安装ufw防火墙（如果未安装）
 apt update
 apt install -y ufw
@@ -783,6 +782,9 @@ ufw --force disable
 # 检查防火墙状态
 ufw status verbose
 EOF
+            then
+                log_warn "防火墙配置失败，但继续执行..."
+            fi
         fi
         
         log_success "$vm_name 启动和配置完成"
