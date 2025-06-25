@@ -275,6 +275,7 @@ create_vms() {
         fi
         
         # 创建虚拟机
+        log_info "创建虚拟机基础配置..."
         qm create $vm_id \
             --name $vm_name \
             --memory $memory \
@@ -283,12 +284,24 @@ create_vms() {
             --scsihw virtio-scsi-pci
         
         # 导入磁盘
+        log_info "导入磁盘模板: $template_file"
         qm importdisk $vm_id /var/lib/vz/template/cache/$template_file $STORAGE_NAME
         
-        # 附加磁盘
-        qm set $vm_id --scsi0 $STORAGE_NAME:vm-$vm_id-disk-0
+        # 等待磁盘导入完成
+        log_info "等待磁盘导入完成..."
+        sleep 10
+        
+        # 检查磁盘是否导入成功并附加磁盘
+        log_info "检查并附加磁盘..."
+        if ! qm config $vm_id | grep -q "scsi0"; then
+            log_info "手动附加磁盘..."
+            qm set $vm_id --scsi0 $STORAGE_NAME:vm-$vm_id-disk-0
+        else
+            log_info "磁盘已自动附加"
+        fi
         
         # 设置启动盘
+        log_info "配置启动设备..."
         qm set $vm_id --boot c --bootdisk scsi0
         
         # 设置串行控制台
@@ -304,9 +317,110 @@ create_vms() {
         qm set $vm_id --cpu host
         
         # 设置磁盘大小
+        log_info "调整磁盘大小到 ${disk_size}GB..."
         qm resize $vm_id scsi0 ${disk_size}G
         
-        log_info "虚拟机 $vm_name 创建完成"
+        # 验证虚拟机配置
+        log_info "验证虚拟机配置..."
+        local config_check=0
+        
+        # 检查磁盘配置
+        if qm config $vm_id | grep -q "scsi0"; then
+            log_success "磁盘配置正确"
+            config_check=$((config_check + 1))
+        else
+            log_error "磁盘配置失败"
+        fi
+        
+        # 检查启动配置
+        if qm config $vm_id | grep -q "bootdisk: scsi0"; then
+            log_success "启动配置正确"
+            config_check=$((config_check + 1))
+        else
+            log_error "启动配置失败"
+        fi
+        
+        # 检查网络配置
+        if qm config $vm_id | grep -q "net0"; then
+            log_success "网络配置正确"
+            config_check=$((config_check + 1))
+        else
+            log_error "网络配置失败"
+        fi
+        
+        if [ $config_check -eq 3 ]; then
+            log_success "虚拟机 $vm_name 创建完成，配置验证通过"
+        else
+            log_error "虚拟机 $vm_name 配置验证失败，请检查配置"
+            log_info "虚拟机配置详情："
+            qm config $vm_id
+        fi
+        
+        echo ""
+    done
+}
+
+# 修复虚拟机启动问题
+fix_vm_boot_issues() {
+    log_step "检查并修复虚拟机启动问题..."
+    
+    for i in "${!VM_CONFIGS[@]}"; do
+        IFS=':' read -r vm_name cpu_count memory disk_size template_file <<< "${VM_CONFIGS[$i]}"
+        vm_id=$((VM_BASE_ID + i))
+        
+        log_info "检查虚拟机 $vm_name (ID: $vm_id) 启动配置..."
+        
+        # 检查虚拟机是否存在
+        if ! qm list | grep -q "$vm_id"; then
+            log_warn "虚拟机 $vm_name 不存在，跳过检查"
+            continue
+        fi
+        
+        # 检查虚拟机配置
+        local vm_config=$(qm config $vm_id)
+        local issues_found=false
+        
+        # 检查磁盘配置
+        if ! echo "$vm_config" | grep -q "scsi0"; then
+            log_error "虚拟机 $vm_name 缺少磁盘配置"
+            log_info "尝试修复磁盘配置..."
+            qm set $vm_id --scsi0 $STORAGE_NAME:vm-$vm_id-disk-0
+            issues_found=true
+        fi
+        
+        # 检查启动配置
+        if ! echo "$vm_config" | grep -q "bootdisk: scsi0"; then
+            log_error "虚拟机 $vm_name 启动配置错误"
+            log_info "修复启动配置..."
+            qm set $vm_id --boot c --bootdisk scsi0
+            issues_found=true
+        fi
+        
+        # 检查网络配置
+        if ! echo "$vm_config" | grep -q "net0"; then
+            log_error "虚拟机 $vm_name 缺少网络配置"
+            log_info "添加网络配置..."
+            qm set $vm_id --net0 bridge=$BRIDGE_NAME,model=virtio
+            issues_found=true
+        fi
+        
+        # 检查SCSI控制器
+        if ! echo "$vm_config" | grep -q "scsihw: virtio-scsi-pci"; then
+            log_error "虚拟机 $vm_name 缺少SCSI控制器"
+            log_info "添加SCSI控制器..."
+            qm set $vm_id --scsihw virtio-scsi-pci
+            issues_found=true
+        fi
+        
+        if [ "$issues_found" = true ]; then
+            log_info "虚拟机 $vm_name 配置已修复"
+            log_info "修复后的配置："
+            qm config $vm_id | grep -E "(scsi0|bootdisk|net0|scsihw)"
+        else
+            log_success "虚拟机 $vm_name 配置正常"
+        fi
+        
+        echo ""
     done
 }
 
@@ -691,6 +805,9 @@ main() {
     
     # 创建虚拟机
     create_vms
+    
+    # 修复虚拟机启动问题
+    fix_vm_boot_issues
     
     # 配置虚拟机网络
     configure_vm_network
