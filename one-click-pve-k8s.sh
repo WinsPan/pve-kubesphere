@@ -25,6 +25,16 @@ debug() { echo -e "${BLUE}[DEBUG]${NC} $1"; }
 info() { echo -e "${CYAN}[INFO]${NC} $1"; }
 
 # 配置
+# 使用Debian cloud镜像，支持cloud-init
+CLOUD_IMAGE_URLS=(
+  "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
+  "https://mirrors.ustc.edu.cn/debian-cloud-images/bookworm/latest/debian-12-generic-amd64.qcow2"
+  "https://mirrors.tuna.tsinghua.edu.cn/debian-cloud-images/bookworm/latest/debian-12-generic-amd64.qcow2"
+)
+CLOUD_IMAGE_FILE="debian-12-generic-amd64.qcow2"
+CLOUD_IMAGE_PATH="/var/lib/vz/template/qcow/$CLOUD_IMAGE_FILE"
+
+# 保留原有的ISO配置作为备用方案
 ISO_URLS=(
   "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.11.0-amd64-netinst.iso"
   "https://mirrors.ustc.edu.cn/debian-cd/current/amd64/iso-cd/debian-12.11.0-amd64-netinst.iso"
@@ -520,51 +530,31 @@ wait_for_port() {
 
 # 主部署函数
 deploy_k8s() {
-    # 自动获取最新Debian netinst ISO文件名
-    log "自动获取最新Debian ISO信息..."
-    LATEST_ISO=$(wget -qO- https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/ | grep -oE 'debian-[0-9.]+-amd64-netinst\.iso' | head -n1)
-    if [ -z "$LATEST_ISO" ]; then
-        err "无法自动获取最新Debian ISO文件名，请检查网络或手动指定。"
-        echo -e "\n[解决方法] 请检查网络连接，或手动访问 https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/ 获取最新ISO文件名\n"
-        exit 1
-    fi
-    log "检测到最新Debian ISO: $LATEST_ISO"
-    
-    # 更新ISO文件名为最新版本
-    ISO_FILE="$LATEST_ISO"
-    ISO_PATH="/var/lib/vz/template/iso/$ISO_FILE"
-
-    # 下载ISO，多源重试
-    log "检查Debian ISO..."
-    if [ ! -f "$ISO_PATH" ]; then
-        log "尝试多源下载最新Debian ISO: $ISO_FILE"
-        ISO_OK=0
-        for url in "${ISO_URLS[@]}"; do
-            # 替换URL中的文件名
-            url=$(echo "$url" | sed "s/debian-12.11.0-amd64-netinst.iso/$LATEST_ISO/")
+    # 下载Debian cloud镜像
+    log "检查Debian cloud镜像..."
+    if [ ! -f "$CLOUD_IMAGE_PATH" ]; then
+        log "尝试多源下载Debian cloud镜像: $CLOUD_IMAGE_FILE"
+        IMAGE_OK=0
+        for url in "${CLOUD_IMAGE_URLS[@]}"; do
             log "尝试下载: $url"
-            if wget -O "$ISO_PATH" "$url"; then
-                ISO_OK=1
+            if wget -O "$CLOUD_IMAGE_PATH" "$url"; then
+                IMAGE_OK=1
                 break
             else
                 warn "下载失败: $url"
             fi
         done
-        if [ $ISO_OK -ne 1 ]; then
-            err "ISO下载多次失败，请检查网络或手动下载到 $ISO_PATH"
-            echo -e "\n[手动下载建议] 访问以下任一链接手动下载："
-            for url in "${ISO_URLS[@]}"; do
-                url=$(echo "$url" | sed "s/debian-12.11.0-amd64-netinst.iso/$LATEST_ISO/")
-                echo "  $url"
-            done
-            echo -e "\n下载完成后，将文件重命名为 $ISO_FILE 并放置到 $ISO_PATH\n"
-            exit 1
+        if [ $IMAGE_OK -ne 1 ]; then
+            err "Cloud镜像下载多次失败，尝试使用ISO方式..."
+            # 如果cloud镜像下载失败，回退到ISO方式
+            deploy_with_iso
+            return
         fi
     else
-        log "ISO已存在: $ISO_PATH"
+        log "Cloud镜像已存在: $CLOUD_IMAGE_PATH"
     fi
 
-    # 创建虚拟机
+    # 创建虚拟机（使用cloud镜像）
     for idx in ${!VM_IDS[@]}; do
         id=${VM_IDS[$idx]}
         name=${VM_NAMES[$idx]}
@@ -574,6 +564,8 @@ deploy_k8s() {
             warn "虚拟机 $id 已存在，跳过创建"
             continue
         fi
+        
+        # 使用cloud镜像创建虚拟机
         if ! qm create $id \
             --name $name \
             --memory $VM_MEM \
@@ -582,17 +574,22 @@ deploy_k8s() {
             --scsihw virtio-scsi-pci \
             --serial0 socket \
             --agent 1 \
-            --scsi0 $STORAGE:$VM_DISK; then
+            --scsi0 $STORAGE:$VM_DISK \
+            --import-from $CLOUD_IMAGE_PATH; then
             err "创建虚拟机 $id 失败，请检查PVE资源和配置"
             exit 1
         fi
-        qm set $id --ide2 local:iso/$ISO_FILE,media=cdrom
+        
+        # 配置cloud-init
         qm set $id --ide3 $STORAGE:cloudinit
         qm set $id --ciuser $CLOUDINIT_USER --cipassword $CLOUDINIT_PASS
         qm set $id --ipconfig0 ip=$ip/24,gw=$GATEWAY
         qm set $id --nameserver "$DNS"
-        qm set $id --bootdisk scsi0
         qm set $id --onboot 1
+        
+        # 调整磁盘大小
+        qm resize $id scsi0 ${VM_DISK}G
+        
         log "虚拟机 $id 配置完成"
     done
 
@@ -650,6 +647,249 @@ deploy_k8s() {
         if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 $CLOUDINIT_USER@$ip "$remote_cmd"; then
             err "$name 初始化失败，命令: $remote_cmd"
             echo "[建议] 检查网络、cloud-init、root密码、PVE模板配置等。"
+            exit 1
+        fi
+        log "$name 初始化成功"
+    done
+
+    log "所有虚拟机初始化完成，开始K8S部署..."
+
+    # K8S和KubeSphere自动部署
+    log "\n开始K8S集群和KubeSphere自动部署..."
+
+    # 1. master节点初始化K8S（重试3次）
+    log "[K8S] master节点初始化..."
+    K8S_INIT_OK=0
+    for try in {1..3}; do
+        log "K8S master初始化尝试 $try/3..."
+        remote_cmd="apt-get update -y && apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common && curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/kubernetes-archive-keyring.gpg && echo 'deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main' > /etc/apt/sources.list.d/kubernetes.list && apt-get update -y && apt-get install -y kubelet kubeadm kubectl && swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab && kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=$MASTER_IP --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem && mkdir -p /root/.kube && cp /etc/kubernetes/admin.conf /root/.kube/config && kubectl taint nodes --all node-role.kubernetes.io/control-plane- && kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml && echo 'K8S master初始化完成'"
+        if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "$remote_cmd"; then
+            K8S_INIT_OK=1
+            log "K8S master初始化成功"
+            break
+        fi
+        warn "K8S master初始化失败，重试($try/3)"
+        sleep 30
+    done
+    [ $K8S_INIT_OK -eq 1 ] || { err "K8S master初始化最终失败"; exit 1; }
+
+    # 2. 获取join命令（重试）
+    log "获取K8S join命令..."
+    JOIN_CMD=""
+    for try in {1..10}; do
+        log "获取join命令尝试 $try/10..."
+        JOIN_CMD=$(sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "kubeadm token create --print-join-command" 2>/dev/null || true)
+        if [[ $JOIN_CMD == kubeadm* ]]; then
+            log "成功获取join命令"
+            break
+        fi
+        warn "获取join命令失败，重试($try/10)"
+        sleep 15
+    done
+    if [[ ! $JOIN_CMD == kubeadm* ]]; then
+        err "无法获取K8S join命令，终止"
+        exit 1
+    fi
+
+    # 3. worker节点加入集群（重试）
+    for ip in "${WORKER_IPS[@]}"; do
+        log "[K8S] $ip 加入集群..."
+        JOIN_OK=0
+        for try in {1..3}; do
+            log "$ip 加入集群尝试 $try/3..."
+            remote_cmd="apt-get update -y && apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common && curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/kubernetes-archive-keyring.gpg && echo 'deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main' > /etc/apt/sources.list.d/kubernetes.list && apt-get update -y && apt-get install -y kubelet kubeadm kubectl && swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab && $JOIN_CMD --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem && echo 'K8S worker加入完成'"
+            if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$ip "$remote_cmd"; then
+                JOIN_OK=1
+                log "$ip 加入集群成功"
+                break
+            fi
+            warn "$ip 加入集群失败，重试($try/3)"
+            sleep 30
+        done
+        [ $JOIN_OK -eq 1 ] || { err "$ip 加入集群最终失败"; exit 1; }
+    done
+
+    # 4. 检查K8S集群状态
+    log "[K8S] 检查集群状态..."
+    sleep 30  # 等待集群稳定
+    if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "kubectl get nodes -o wide && kubectl get pods -A"; then
+        err "K8S集群状态异常，请检查deploy.log和K8S安装日志"
+        exit 1
+    fi
+
+    # 5. 安装KubeSphere
+    log "[KubeSphere] master节点安装KubeSphere..."
+    remote_cmd="curl -sfL https://get-ks.ksops.io | sh && ./kk create cluster -f ./config-sample.yaml || ./kk create cluster"
+    if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "$remote_cmd"; then
+        err "KubeSphere安装失败，命令: $remote_cmd"
+        echo "[建议] 检查KubeSphere安装日志、PVE资源、网络等。"
+        exit 1
+    fi
+
+    # 6. 检查KubeSphere端口
+    wait_for_port $MASTER_IP 30880
+    log "KubeSphere控制台: http://$MASTER_IP:30880 (首次访问需等待几分钟)"
+    log "默认用户名: admin，密码: P@88w0rd"
+    log "全部自动化部署完成，详细日志见 $LOGFILE"
+}
+
+# 使用ISO方式的备用部署函数
+deploy_with_iso() {
+    log "使用ISO方式部署（需要手动安装）..."
+    
+    # 自动获取最新Debian netinst ISO文件名
+    log "自动获取最新Debian ISO信息..."
+    LATEST_ISO=$(wget -qO- https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/ | grep -oE 'debian-[0-9.]+-amd64-netinst\.iso' | head -n1)
+    if [ -z "$LATEST_ISO" ]; then
+        err "无法自动获取最新Debian ISO文件名，请检查网络或手动指定。"
+        echo -e "\n[解决方法] 请检查网络连接，或手动访问 https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/ 获取最新ISO文件名\n"
+        exit 1
+    fi
+    log "检测到最新Debian ISO: $LATEST_ISO"
+    
+    # 更新ISO文件名为最新版本
+    ISO_FILE="$LATEST_ISO"
+    ISO_PATH="/var/lib/vz/template/iso/$ISO_FILE"
+
+    # 下载ISO，多源重试
+    log "检查Debian ISO..."
+    if [ ! -f "$ISO_PATH" ]; then
+        log "尝试多源下载最新Debian ISO: $ISO_FILE"
+        ISO_OK=0
+        for url in "${ISO_URLS[@]}"; do
+            # 替换URL中的文件名
+            url=$(echo "$url" | sed "s/debian-12.11.0-amd64-netinst.iso/$LATEST_ISO/")
+            log "尝试下载: $url"
+            if wget -O "$ISO_PATH" "$url"; then
+                ISO_OK=1
+                break
+            else
+                warn "下载失败: $url"
+            fi
+        done
+        if [ $ISO_OK -ne 1 ]; then
+            err "ISO下载多次失败，请检查网络或手动下载到 $ISO_PATH"
+            echo -e "\n[手动下载建议] 访问以下任一链接手动下载："
+            for url in "${ISO_URLS[@]}"; do
+                url=$(echo "$url" | sed "s/debian-12.11.0-amd64-netinst.iso/$LATEST_ISO/")
+                echo "  $url"
+            done
+            echo -e "\n下载完成后，将文件重命名为 $ISO_FILE 并放置到 $ISO_PATH\n"
+            exit 1
+        fi
+    else
+        log "ISO已存在: $ISO_PATH"
+    fi
+
+    # 创建虚拟机（使用ISO）
+    for idx in ${!VM_IDS[@]}; do
+        id=${VM_IDS[$idx]}
+        name=${VM_NAMES[$idx]}
+        ip=${VM_IPS[$idx]}
+        log "处理虚拟机 $name (ID:$id, IP:$ip) ..."
+        if qm list | grep -q " $id "; then
+            warn "虚拟机 $id 已存在，跳过创建"
+            continue
+        fi
+        if ! qm create $id \
+            --name $name \
+            --memory $VM_MEM \
+            --cores $VM_CORES \
+            --net0 virtio,bridge=$BRIDGE \
+            --scsihw virtio-scsi-pci \
+            --serial0 socket \
+            --agent 1 \
+            --scsi0 $STORAGE:$VM_DISK; then
+            err "创建虚拟机 $id 失败，请检查PVE资源和配置"
+            exit 1
+        fi
+        qm set $id --ide2 local:iso/$ISO_FILE,media=cdrom
+        qm set $id --ide3 $STORAGE:cloudinit
+        qm set $id --ciuser $CLOUDINIT_USER --cipassword $CLOUDINIT_PASS
+        qm set $id --ipconfig0 ip=$ip/24,gw=$GATEWAY
+        qm set $id --nameserver "$DNS"
+        qm set $id --bootdisk scsi0
+        qm set $id --onboot 1
+        log "虚拟机 $id 配置完成"
+    done
+
+    # 启动虚拟机
+    log "批量启动虚拟机..."
+    for id in "${VM_IDS[@]}"; do
+        status=$(qm list | awk -v id="$id" '$1==id{print $3}')
+        if [ "$status" = "running" ]; then
+            warn "虚拟机 $id 已在运行，跳过"
+        else
+            log "启动虚拟机 $id ..."
+            if ! qm start $id; then
+                err "启动虚拟机 $id 失败，请检查PVE资源和配置"
+                exit 1
+            fi
+            log "虚拟机 $id 启动成功，等待5秒..."
+            sleep 5
+        fi
+    done
+
+    warn "注意：使用ISO方式需要手动完成Debian安装"
+    warn "请在虚拟机控制台中完成以下步骤："
+    warn "1. 选择语言和键盘布局"
+    warn "2. 配置网络（使用DHCP或手动设置IP）"
+    warn "3. 设置主机名"
+    warn "4. 设置root密码为: $CLOUDINIT_PASS"
+    warn "5. 创建用户（可选）"
+    warn "6. 分区磁盘（建议使用整个磁盘）"
+    warn "7. 安装基本系统"
+    warn "8. 选择软件包（建议选择SSH服务器）"
+    warn "9. 完成安装并重启"
+    warn ""
+    warn "安装完成后，请手动重启虚拟机，然后脚本将继续执行"
+    
+    # 等待用户确认
+    read -p "完成手动安装后，按回车键继续..."
+    
+    # 继续执行后续步骤
+    deploy_k8s_continue
+}
+
+# 继续K8S部署（用于ISO方式）
+deploy_k8s_continue() {
+    # 显示虚拟机状态
+    log "当前虚拟机状态："
+    qm list | grep -E "(VMID|101|102|103)"
+
+    # 等待所有虚拟机SSH可用
+    log "开始等待所有虚拟机SSH可用..."
+    for idx in ${!VM_IDS[@]}; do
+        ip=${VM_IPS[$idx]}
+        name=${VM_NAMES[$idx]}
+        log "等待 $name ($ip) SSH可用..."
+        if ! wait_for_ssh $ip; then
+            err "等待 $name SSH失败，终止脚本"
+            exit 1
+        fi
+        log "虚拟机 $name ($ip) SSH已就绪"
+    done
+
+    # SSH初始化
+    log "批量SSH初始化..."
+    for idx in ${!VM_IDS[@]}; do
+        name=${VM_NAMES[$idx]}
+        ip=${VM_IPS[$idx]}
+        log "初始化 $name ($ip) ..."
+        
+        # 先测试SSH连接
+        log "测试 $name SSH连接..."
+        if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $CLOUDINIT_USER@$ip "echo 'SSH连接测试成功'"; then
+            err "$name SSH连接失败，请检查：\n- 虚拟机是否正常启动\n- root密码是否正确\n- 网络是否连通"
+            exit 1
+        fi
+        
+        # 执行初始化命令
+        remote_cmd="hostnamectl set-hostname $name && apt-get update -y && apt-get install -y vim curl wget net-tools lsb-release sudo openssh-server && echo '初始化完成: $name'"
+        log "执行初始化命令: $remote_cmd"
+        if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 $CLOUDINIT_USER@$ip "$remote_cmd"; then
+            err "$name 初始化失败，命令: $remote_cmd"
+            echo "[建议] 检查网络、root密码、PVE模板配置等。"
             exit 1
         fi
         log "$name 初始化成功"
