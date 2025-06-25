@@ -568,7 +568,7 @@ deploy_k8s() {
             warn "虚拟机 $id 已存在，跳过创建"
             continue
         fi
-        log "使用cloud镜像创建虚拟机 $id..."
+        log "创建空虚拟机 $id..."
         if ! qm create $id \
             --name $name \
             --memory $VM_MEM \
@@ -576,10 +576,18 @@ deploy_k8s() {
             --net0 virtio,bridge=$BRIDGE \
             --scsihw virtio-scsi-pci \
             --serial0 socket \
-            --agent 1 \
-            --scsi0 $STORAGE:$VM_DISK \
-            --import-from $CLOUD_IMAGE_PATH; then
+            --agent 1; then
             err "创建虚拟机 $id 失败，请检查PVE资源和配置"
+            exit 1
+        fi
+        log "导入cloud镜像到 $id..."
+        if ! qm importdisk $id "$CLOUD_IMAGE_PATH" $STORAGE; then
+            err "导入cloud镜像到 $id 失败，请检查镜像和存储"
+            exit 1
+        fi
+        log "关联scsi0磁盘..."
+        if ! qm set $id --scsi0 $STORAGE:vm-${id}-disk-0; then
+            err "设置scsi0磁盘失败"
             exit 1
         fi
         log "配置cloud-init..."
@@ -587,6 +595,7 @@ deploy_k8s() {
         qm set $id --ciuser $CLOUDINIT_USER --cipassword $CLOUDINIT_PASS
         qm set $id --ipconfig0 ip=$ip/24,gw=$GATEWAY
         qm set $id --nameserver "$DNS"
+        qm set $id --boot order=scsi0
         qm set $id --onboot 1
         log "调整磁盘大小到 ${VM_DISK}G..."
         qm resize $id scsi0 ${VM_DISK}G
