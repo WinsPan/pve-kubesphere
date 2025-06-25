@@ -84,21 +84,6 @@ check_pve_environment() {
         exit 1
     fi
     
-    # 检查磁盘空间
-    log_info "检查磁盘空间..."
-    local available_space=$(df -BG /var/lib/vz | awk 'NR==2 {print $4}' | sed 's/G//')
-    local required_space=$((VM_COUNT * VM_DISK_SIZE + 50))  # 每个VM + 50GB缓冲
-    
-    log_info "可用空间: ${available_space}GB"
-    log_info "需要空间: ${required_space}GB"
-    
-    if [ "$available_space" -lt "$required_space" ]; then
-        log_error "磁盘空间不足！需要至少 ${required_space}GB，但只有 ${available_space}GB"
-        log_info "建议清理磁盘空间或减少虚拟机磁盘大小"
-        exit 1
-    fi
-    
-    log_info "磁盘空间检查通过"
     log_info "PVE环境检查通过"
 }
 
