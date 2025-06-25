@@ -3,7 +3,8 @@
 # PVE环境准备脚本
 # 在PVE主机上创建KubeSphere所需的虚拟机
 
-set -e
+# 错误处理：遇到错误时退出，但允许某些命令失败
+set -euo pipefail
 
 # 颜色定义
 RED='\033[0;31m'
@@ -83,7 +84,63 @@ check_pve_environment() {
         exit 1
     fi
     
+    # 检查磁盘空间
+    log_info "检查磁盘空间..."
+    local available_space=$(df -BG /var/lib/vz | awk 'NR==2 {print $4}' | sed 's/G//')
+    local required_space=$((VM_COUNT * VM_DISK_SIZE + 50))  # 每个VM + 50GB缓冲
+    
+    log_info "可用空间: ${available_space}GB"
+    log_info "需要空间: ${required_space}GB"
+    
+    if [ "$available_space" -lt "$required_space" ]; then
+        log_error "磁盘空间不足！需要至少 ${required_space}GB，但只有 ${available_space}GB"
+        log_info "建议清理磁盘空间或减少虚拟机磁盘大小"
+        exit 1
+    fi
+    
+    log_info "磁盘空间检查通过"
     log_info "PVE环境检查通过"
+}
+
+# 检查系统资源
+check_system_resources() {
+    log_step "检查系统资源..."
+    
+    # 检查CPU核心数
+    local cpu_cores=$(nproc)
+    local required_cores=$((VM_COUNT * VM_CORES + 4))  # 每个VM + 4核给宿主机
+    
+    log_info "系统CPU核心数: ${cpu_cores}"
+    log_info "需要CPU核心数: ${required_cores}"
+    
+    if [ "$cpu_cores" -lt "$required_cores" ]; then
+        log_warn "CPU核心数不足！建议至少 ${required_cores} 核，但只有 ${cpu_cores} 核"
+        log_info "可能会影响虚拟机性能"
+    else
+        log_info "CPU资源检查通过"
+    fi
+    
+    # 检查内存
+    local total_memory=$(free -m | awk 'NR==2{print $2}')
+    local required_memory=$((VM_COUNT * VM_MEMORY / 1024 + 8192))  # 每个VM + 8GB给宿主机
+    
+    log_info "系统总内存: ${total_memory}MB"
+    log_info "需要内存: ${required_memory}MB"
+    
+    if [ "$total_memory" -lt "$required_memory" ]; then
+        log_warn "内存不足！建议至少 ${required_memory}MB，但只有 ${total_memory}MB"
+        log_info "可能会影响虚拟机性能或导致启动失败"
+    else
+        log_info "内存资源检查通过"
+    fi
+    
+    # 检查可用内存
+    local available_memory=$(free -m | awk 'NR==2{print $7}')
+    log_info "可用内存: ${available_memory}MB"
+    
+    if [ "$available_memory" -lt "$((VM_COUNT * VM_MEMORY / 1024))" ]; then
+        log_warn "可用内存不足！建议清理内存或减少虚拟机内存配置"
+    fi
 }
 
 # 测试网络连接
@@ -728,6 +785,29 @@ EOF
     done
 }
 
+# 清理临时文件
+cleanup_temp_files() {
+    log_step "清理临时文件..."
+    
+    # 清理下载缓存
+    if [ -d "/var/lib/vz/template/cache" ]; then
+        log_info "清理模板下载缓存..."
+        find /var/lib/vz/template/cache -name "*.tmp" -delete 2>/dev/null || true
+        find /var/lib/vz/template/cache -name "*.part" -delete 2>/dev/null || true
+    fi
+    
+    # 清理系统临时文件
+    log_info "清理系统临时文件..."
+    rm -rf /tmp/*.tmp 2>/dev/null || true
+    rm -rf /tmp/*.log 2>/dev/null || true
+    
+    # 清理日志文件（保留最近7天）
+    log_info "清理旧日志文件..."
+    journalctl --vacuum-time=7d 2>/dev/null || true
+    
+    log_info "临时文件清理完成"
+}
+
 # 生成主机列表文件
 generate_hosts_file() {
     log_step "生成主机列表文件..."
@@ -794,8 +874,14 @@ main() {
     # 检查PVE环境
     check_pve_environment
     
+    # 检查系统资源
+    check_system_resources
+    
     # 测试网络连接
-    test_network_connectivity
+    test_network_connectivity || {
+        log_warn "网络连接测试失败，但继续执行..."
+        log_info "如果后续下载失败，请检查网络配置"
+    }
     
     # 下载Debian模板
     download_debian_template
@@ -817,6 +903,9 @@ main() {
     
     # 等待虚拟机完全启动并配置服务
     wait_and_configure_vms
+    
+    # 清理临时文件
+    cleanup_temp_files
     
     # 生成主机列表文件
     generate_hosts_file
