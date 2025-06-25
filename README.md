@@ -201,66 +201,73 @@ kubectl cluster-info
 
 ### 常见问题
 
-1. **PVE连接失败**
-   - 检查网络连接
-   - 确认PVE主机IP地址
-   - 验证SSH密钥配置
+#### 1. 网络连接问题
+如果遇到网络连接问题，请运行网络诊断脚本：
+```bash
+./test-network.sh
+```
 
-2. **虚拟机创建失败**
-   - 检查PVE主机资源
-   - 确认存储空间充足
-   - 验证网络配置
+#### 2. 下载Debian模板失败
+如果自动下载失败，请手动下载：
+```bash
+# 在PVE主机上执行
+cd /var/lib/vz/template/cache
+wget https://mirrors.ustc.edu.cn/proxmox/images/system/debian-12-standard_12.2-1_amd64.tar.zst
+```
 
-3. **Kubernetes安装失败**
-   - 检查网络连通性
-   - 确认防火墙设置
-   - 查看详细错误日志
+#### 3. 虚拟机创建失败
+检查存储空间和网络配置：
+```bash
+# 检查存储空间
+df -h
+pvesm status
 
-4. **KubeSphere无法访问**
-   - 等待服务完全启动
-   - 检查端口是否开放
-   - 验证DNS解析
+# 检查网络配置
+ip addr show
+brctl show
+```
 
-### 日志文件
+### 详细故障排除
 
-- **部署日志**: `deployment-*.log`
-- **Kubernetes日志**: `/var/log/kubernetes/`
-- **KubeSphere日志**: `/var/log/kubesphere/`
+请参考 [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) 获取详细的故障排除指南。
 
 ### 获取帮助
 
-```bash
-# 查看脚本帮助
-./remote-deploy.sh --help
+1. **查看日志**
+   ```bash
+   # 启用详细输出
+   bash -x ./01-pve-prepare.sh
+   
+   # 查看系统日志
+   journalctl -f
+   ```
 
-# 检查系统状态
-./CHECK-REPORT.md
+2. **生成诊断报告**
+   ```bash
+   ./test-network.sh
+   ```
 
-# 查看配置总结
-cat CONFIG-SUMMARY.md
-```
+3. **清理并重新开始**
+   ```bash
+   ./04-cleanup.sh
+   ./01-pve-prepare.sh
+   ```
 
 ## 📚 相关文档
 
-- [KubeSphere官方文档](https://kubesphere.io/docs/)
-- [Kubernetes官方文档](https://kubernetes.io/docs/)
-- [Proxmox VE文档](https://pve.proxmox.com/wiki/Main_Page)
+- [快速开始指南](./QUICK-START.md)
+- [KubeSphere详细说明](./README-KubeSphere.md)
+- [配置总结](./CONFIG-SUMMARY.md)
+- [资源要求](./RESOURCE-REQUIREMENTS.md)
+- [故障排除指南](./TROUBLESHOOTING.md)
 
 ## 🤝 贡献
 
-欢迎提交Issue和Pull Request来改进这个项目！
+欢迎提交Issue和Pull Request！
 
-### 贡献指南
+## �� 许可证
 
-1. Fork本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 打开Pull Request
-
-## 📄 许可证
-
-本项目采用MIT许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
+本项目采用MIT许可证。
 
 ## 🙏 致谢
 
