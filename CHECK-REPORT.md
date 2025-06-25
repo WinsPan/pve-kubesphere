@@ -14,7 +14,7 @@ $(date)
 
 ### 2. 版本配置检查
 - ✅ KubeSphere版本: v4.1.3 (已更新)
-- ✅ Kubernetes版本: v1.28.0
+- ✅ Kubernetes版本: v1.29.7
 - ✅ 所有脚本中的版本配置一致
 
 ### 3. IP地址配置检查
@@ -66,7 +66,7 @@ $(date)
 - 网络CIDR: 10.0.0.0/24
 
 ### 版本配置
-- Kubernetes: v1.28.0
+- Kubernetes: v1.29.7
 - KubeSphere: v4.1.3
 - Calico: v3.26.0
 - Helm: v3.12.0

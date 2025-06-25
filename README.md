@@ -108,7 +108,7 @@ pve-kubesphere/
 | `MASTER_IP` | 10.0.0.10 | Master节点IP |
 | `WORKER_IPS` | 10.0.0.11,10.0.0.12 | Worker节点IP列表 |
 | `KUBESPHERE_VERSION` | v4.1.3 | KubeSphere版本 |
-| `K8S_VERSION` | v1.28.0 | Kubernetes版本 |
+| `K8S_VERSION` | v1.29.7 | Kubernetes版本 |
 
 ### 修改配置
 
