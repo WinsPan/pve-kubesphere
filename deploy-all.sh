@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # PVE KubeSphere 一键部署脚本
-# 作者：AI Assistant
-# 日期：$(date +%Y-%m-%d)
+# 在PVE宿主机上直接执行，无需SSH连接
 
 set -e
 
@@ -36,19 +35,19 @@ MASTER_IP="10.0.0.10"
 WORKER_IPS=("10.0.0.11" "10.0.0.12")
 KUBESPHERE_VERSION="v4.1.3"
 
-# 检查脚本文件是否存在
+# 检查脚本文件
 check_scripts() {
     log_step "检查脚本文件..."
     
-    local scripts=(
+    local required_scripts=(
         "01-pve-prepare.sh"
         "02-k8s-install.sh"
         "03-kubesphere-install.sh"
     )
     
-    for script in "${scripts[@]}"; do
+    for script in "${required_scripts[@]}"; do
         if [ ! -f "$script" ]; then
-            log_error "脚本文件 $script 不存在"
+            log_error "缺少必要脚本: $script"
             exit 1
         fi
         
@@ -59,6 +58,35 @@ check_scripts() {
     done
     
     log_info "所有脚本文件检查完成"
+}
+
+# 检查PVE环境
+check_pve_environment() {
+    log_step "检查PVE环境..."
+    
+    # 检查是否在PVE环境中
+    if ! command -v pveversion &> /dev/null; then
+        log_error "此脚本需要在PVE环境中运行"
+        exit 1
+    fi
+    
+    # 检查PVE版本
+    PVE_VERSION=$(pveversion -v | head -1)
+    log_info "PVE版本: $PVE_VERSION"
+    
+    # 检查存储
+    if ! pvesm status | grep -q "local-lvm"; then
+        log_error "存储 local-lvm 不存在"
+        exit 1
+    fi
+    
+    # 检查网络桥接
+    if ! ip link show | grep -q "vmbr0"; then
+        log_error "网络桥接 vmbr0 不存在"
+        exit 1
+    fi
+    
+    log_info "PVE环境检查通过"
 }
 
 # 显示部署信息
@@ -80,8 +108,8 @@ show_deployment_info() {
 # 确认部署
 confirm_deployment() {
     log_warn "此部署过程将："
-    log_warn "1. 在PVE上创建3个Debian虚拟机"
-    log_warn "2. 安装Kubernetes v1.28.0集群"
+    log_warn "1. 在PVE上创建3个Debian虚拟机 (8核16GB 300GB)"
+    log_warn "2. 安装Kubernetes v1.29.7集群"
     log_warn "3. 安装KubeSphere $KUBESPHERE_VERSION"
     log_warn "4. 配置存储和网络"
     log_warn ""
@@ -247,6 +275,9 @@ main() {
     # 检查脚本文件
     check_scripts
     
+    # 检查PVE环境
+    check_pve_environment
+    
     # 显示部署信息
     show_deployment_info
     
@@ -258,30 +289,23 @@ main() {
     
     # 第一步：PVE环境准备
     if ! execute_step1; then
-        handle_error "1" $?
+        handle_error 1 $?
     fi
-    
-    # 等待虚拟机完全启动
-    log_info "等待虚拟机完全启动..."
-    sleep 60
     
     # 第二步：Kubernetes安装
     if ! execute_step2; then
-        handle_error "2" $?
+        handle_error 2 $?
     fi
-    
-    # 等待Kubernetes就绪
-    log_info "等待Kubernetes集群就绪..."
-    sleep 30
     
     # 第三步：KubeSphere安装
     if ! execute_step3; then
-        handle_error "3" $?
+        handle_error 3 $?
     fi
     
     # 验证部署结果
     if ! verify_deployment; then
-        handle_error "验证" $?
+        log_error "部署验证失败"
+        handle_error 4 $?
     fi
     
     # 计算部署时间
@@ -297,9 +321,6 @@ main() {
     
     log_info "部署完成！"
 }
-
-# 信号处理
-trap 'log_error "部署被中断"; exit 1' INT TERM
 
 # 执行主函数
 main "$@" 
