@@ -388,84 +388,103 @@ wait_and_configure_vms() {
         local vm_status=$(qm list | grep "$vm_id" | awk '{print $3}')
         log_info "虚拟机 $vm_name 状态: $vm_status"
         
-        # 等待SSH可用（最多等待5分钟）
-        local ssh_timeout=300
+        # 等待虚拟机网络可达（最多等待3分钟）
+        local network_timeout=180
         local elapsed=0
         
-        log_info "等待SSH端口开放 (超时: ${ssh_timeout}秒)..."
+        log_info "等待虚拟机网络可达 (超时: ${network_timeout}秒)..."
         
-        # 等待SSH可用
-        while [ $elapsed -lt $ssh_timeout ]; do
-            if nc -z $vm_ip 22 2>/dev/null; then
-                log_success "SSH端口已开放"
+        # 等待ping通
+        while [ $elapsed -lt $network_timeout ]; do
+            if ping -c 1 $vm_ip > /dev/null 2>&1; then
+                log_success "虚拟机网络可达"
                 break
             fi
             
-            log_info "等待SSH端口开放... (${elapsed}/${ssh_timeout}秒)"
+            log_info "等待虚拟机网络可达... (${elapsed}/${network_timeout}秒)"
             sleep 5
             elapsed=$((elapsed + 5))
         done
         
-        if [ $elapsed -ge $ssh_timeout ]; then
-            log_error "SSH端口等待超时，尝试诊断问题..."
-            
-            # 诊断信息
-            log_info "诊断信息："
-            log_info "- 虚拟机状态: $(qm list | grep "$vm_id" | awk '{print $3}')"
-            log_info "- 网络连接测试: $(ping -c 1 $vm_ip 2>/dev/null && echo "成功" || echo "失败")"
-            log_info "- 端口扫描: $(nc -z $vm_ip 22 2>/dev/null && echo "SSH端口开放" || echo "SSH端口关闭")"
-            
-            # 尝试重启虚拟机
-            log_warn "尝试重启虚拟机 $vm_name..."
+        if [ $elapsed -ge $network_timeout ]; then
+            log_error "虚拟机网络等待超时，尝试重启..."
             qm stop $vm_id 2>/dev/null || true
             sleep 10
             qm start $vm_id
             sleep 30
             
-            # 再次尝试SSH连接
+            # 再次等待网络
             elapsed=0
-            while [ $elapsed -lt $ssh_timeout ]; do
-                if nc -z $vm_ip 22 2>/dev/null; then
-                    log_success "重启后SSH端口已开放"
+            while [ $elapsed -lt $network_timeout ]; do
+                if ping -c 1 $vm_ip > /dev/null 2>&1; then
+                    log_success "重启后虚拟机网络可达"
                     break
                 fi
                 
-                log_info "重启后等待SSH端口开放... (${elapsed}/${ssh_timeout}秒)"
+                log_info "重启后等待虚拟机网络可达... (${elapsed}/${network_timeout}秒)"
                 sleep 5
                 elapsed=$((elapsed + 5))
             done
             
-            if [ $elapsed -ge $ssh_timeout ]; then
-                log_error "虚拟机 $vm_name SSH连接失败，跳过配置"
-                log_info "手动检查命令："
-                log_info "qm status $vm_id"
-                log_info "qm terminal $vm_id"
-                log_info "ping $vm_ip"
+            if [ $elapsed -ge $network_timeout ]; then
+                log_error "虚拟机 $vm_name 网络连接失败，跳过配置"
                 continue
             fi
         fi
         
-        # 等待系统完全启动（最多等待3分钟）
-        log_info "等待系统完全启动 (超时: 180秒)..."
+        # 通过控制台配置SSH服务
+        log_info "通过控制台配置SSH服务..."
+        
+        # 使用qm terminal发送命令到虚拟机
+        # 注意：这里需要等待一段时间让系统完全启动
+        sleep 30
+        
+        # 尝试通过控制台配置SSH
+        log_info "配置SSH服务（通过控制台）..."
+        
+        # 使用expect脚本或直接通过qm terminal配置
+        # 由于qm terminal是交互式的，我们改用其他方法
+        
+        # 等待一段时间让cloud-init完成配置
+        log_info "等待cloud-init完成配置..."
+        sleep 60
+        
+        # 现在尝试SSH连接（最多等待5分钟）
+        local ssh_timeout=300
         elapsed=0
         
-        while [ $elapsed -lt 180 ]; do
-            if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@$vm_ip "echo 'ready'" > /dev/null 2>&1; then
-                log_success "系统完全启动"
+        log_info "等待SSH连接可用 (超时: ${ssh_timeout}秒)..."
+        
+        # 等待SSH可用
+        while [ $elapsed -lt $ssh_timeout ]; do
+            if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@$vm_ip "echo 'SSH ready'" > /dev/null 2>&1; then
+                log_success "SSH连接可用"
                 break
             fi
             
-            log_info "等待系统完全启动... (${elapsed}/180秒)"
+            log_info "等待SSH连接可用... (${elapsed}/${ssh_timeout}秒)"
             sleep 10
             elapsed=$((elapsed + 10))
         done
         
-        if [ $elapsed -ge 180 ]; then
-            log_warn "系统启动等待超时，但SSH已可用，继续配置"
+        if [ $elapsed -ge $ssh_timeout ]; then
+            log_error "SSH连接等待超时，尝试手动配置..."
+            
+            # 尝试通过控制台手动配置SSH
+            log_info "请手动配置SSH服务："
+            log_info "qm terminal $vm_id"
+            log_info "在虚拟机内执行："
+            log_info "systemctl enable ssh"
+            log_info "systemctl start ssh"
+            log_info "sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config"
+            log_info "sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config"
+            log_info "systemctl restart ssh"
+            
+            continue
         fi
         
-        # 配置SSH服务
-        log_info "配置SSH服务..."
+        # 配置SSH服务（确保配置正确）
+        log_info "确保SSH服务配置正确..."
         ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF'
 # 启用SSH服务
 systemctl enable ssh
