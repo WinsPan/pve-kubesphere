@@ -52,25 +52,81 @@ DNS="10.0.0.2 119.29.29.29"
 MASTER_IP="10.0.0.10"
 WORKER_IPS=("10.0.0.11" "10.0.0.12")
 
-# 显示菜单
+# 修正已存在虚拟机的cloud-init配置
+fix_existing_vms() {
+    log "修正已存在虚拟机的cloud-init配置..."
+    
+    # 确保cloud-init自定义配置存在
+    log "确保cloud-init自定义配置存在..."
+    mkdir -p /var/lib/vz/snippets
+    CLOUDINIT_CUSTOM_USERCFG="/var/lib/vz/snippets/debian-root.yaml"
+    cat > "$CLOUDINIT_CUSTOM_USERCFG" <<EOF
+#cloud-config
+disable_root: false
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  list: |
+    root:$CLOUDINIT_PASS
+EOF
+    
+    for idx in ${!VM_IDS[@]}; do
+        id=${VM_IDS[$idx]}
+        name=${VM_NAMES[$idx]}
+        ip=${VM_IPS[$idx]}
+        if qm list | grep -q " $id "; then
+            log "修正虚拟机 $id 的cloud-init配置..."
+            # 停止虚拟机（如果正在运行）
+            if qm status $id | grep -q "running"; then
+                log "停止虚拟机 $id..."
+                qm stop $id
+                sleep 3
+            fi
+            # 更新cloud-init配置
+            qm set $id --ciuser root --cipassword $CLOUDINIT_PASS
+            qm set $id --ipconfig0 ip=$ip/24,gw=$GATEWAY
+            qm set $id --nameserver "$DNS"
+            qm set $id --cicustom "user=local:snippets/debian-root.yaml"
+            log "虚拟机 $id 配置已修正"
+        fi
+    done
+}
+
+# 主菜单
 show_menu() {
     clear
-    echo "=========================================="
-    echo "    PVE K8S+KubeSphere 一键部署脚本"
-    echo "=========================================="
-    echo ""
-    echo "请选择要执行的操作："
-    echo ""
-    echo -e "  ${GREEN}1${NC}) 部署K8S+KubeSphere集群"
-    echo -e "  ${GREEN}2${NC}) 诊断系统状态"
-    echo -e "  ${GREEN}3${NC}) 清理虚拟机资源"
-    echo -e "  ${GREEN}4${NC}) 查看部署信息"
-    echo -e "  ${GREEN}5${NC}) 检查依赖环境"
-    echo -e "  ${GREEN}0${NC}) 退出"
-    echo ""
-    echo "=========================================="
-    echo ""
+    echo -e "${CYAN}================================${NC}"
+    echo -e "${CYAN}  PVE K8S+KubeSphere 部署工具${NC}"
+    echo -e "${CYAN}================================${NC}"
+    echo -e "${YELLOW}1.${NC} 诊断PVE环境"
+    echo -e "${YELLOW}2.${NC} 下载Debian Cloud镜像"
+    echo -e "${YELLOW}3.${NC} 创建并启动虚拟机"
+    echo -e "${YELLOW}4.${NC} 修正已存在虚拟机配置"
+    echo -e "${YELLOW}5.${NC} 部署K8S集群"
+    echo -e "${YELLOW}6.${NC} 部署KubeSphere"
+    echo -e "${YELLOW}7.${NC} 清理所有资源"
+    echo -e "${YELLOW}8.${NC} 一键全自动部署"
+    echo -e "${YELLOW}0.${NC} 退出"
+    echo -e "${CYAN}================================${NC}"
 }
+
+# 主循环
+while true; do
+    show_menu
+    read -p "请选择操作 [0-8]: " choice
+    case $choice in
+        1) diagnose_pve ;;
+        2) download_cloud_image ;;
+        3) create_and_start_vms ;;
+        4) fix_existing_vms ;;
+        5) deploy_k8s ;;
+        6) deploy_kubesphere ;;
+        7) cleanup_all ;;
+        8) auto_deploy_all ;;
+        0) log "退出程序"; exit 0 ;;
+        *) echo -e "${RED}无效选择，请重新输入${NC}"; sleep 2 ;;
+    esac
+done
 
 # 清理虚拟机资源
 clean_vms() {
@@ -267,59 +323,17 @@ handle_args() {
 interactive_menu() {
     while true; do
         show_menu
-        read -p "请输入选项 (0-5): " choice
+        read -p "请输入选项 (0-8): " choice
         
         case $choice in
-            1)
-                echo ""
-                log "选择: 部署K8S+KubeSphere集群"
-                echo ""
-                read -p "确认开始部署吗？(y/N): " confirm
-                if [[ $confirm =~ ^[Yy]$ ]]; then
-                    DIAGNOSE_MODE=false
-                    LOGFILE="deploy.log"
-                    exec > >(tee -a "$LOGFILE") 2>&1
-                    trap 'err "脚本被中断或发生致命错误。请检查$LOGFILE，必要时清理部分资源后重试。"; exit 1' INT TERM
-                    check_dependencies
-                    deploy_k8s
-                    break
-                else
-                    log "取消部署"
-                    read -p "按回车键继续..."
-                fi
-                ;;
-            2)
-                echo ""
-                log "选择: 诊断系统状态"
-                echo ""
-                DIAGNOSE_MODE=true
-                LOGFILE="diagnose.log"
-                exec > >(tee -a "$LOGFILE") 2>&1
-                trap 'err "脚本被中断或发生致命错误。请检查$LOGFILE，必要时清理部分资源后重试。"; exit 1' INT TERM
-                diagnose_system
-                read -p "按回车键继续..."
-                ;;
-            3)
-                echo ""
-                log "选择: 清理虚拟机资源"
-                echo ""
-                clean_vms
-                read -p "按回车键继续..."
-                ;;
-            4)
-                echo ""
-                log "选择: 查看部署信息"
-                echo ""
-                show_info
-                read -p "按回车键继续..."
-                ;;
-            5)
-                echo ""
-                log "选择: 检查依赖环境"
-                echo ""
-                check_environment
-                read -p "按回车键继续..."
-                ;;
+            1) diagnose_pve ;;
+            2) download_cloud_image ;;
+            3) create_and_start_vms ;;
+            4) fix_existing_vms ;;
+            5) deploy_k8s ;;
+            6) deploy_kubesphere ;;
+            7) cleanup_all ;;
+            8) auto_deploy_all ;;
             0)
                 echo ""
                 log "退出程序"
@@ -558,6 +572,20 @@ deploy_k8s() {
         exit 1
     fi
 
+    # 保证cloud-init自定义配置存在
+    log "确保cloud-init自定义配置存在..."
+    mkdir -p /var/lib/vz/snippets
+    CLOUDINIT_CUSTOM_USERCFG="/var/lib/vz/snippets/debian-root.yaml"
+    cat > "$CLOUDINIT_CUSTOM_USERCFG" <<EOF
+    #cloud-config
+    disable_root: false
+    ssh_pwauth: true
+    chpasswd:
+      expire: false
+      list: |
+        root:$CLOUDINIT_PASS
+    EOF
+
     # 创建虚拟机（使用cloud镜像）
     for idx in ${!VM_IDS[@]}; do
         id=${VM_IDS[$idx]}
@@ -592,11 +620,12 @@ deploy_k8s() {
         fi
         log "配置cloud-init..."
         qm set $id --ide3 $STORAGE:cloudinit
-        qm set $id --ciuser $CLOUDINIT_USER --cipassword $CLOUDINIT_PASS
+        qm set $id --ciuser root --cipassword $CLOUDINIT_PASS
         qm set $id --ipconfig0 ip=$ip/24,gw=$GATEWAY
         qm set $id --nameserver "$DNS"
         qm set $id --boot order=scsi0
         qm set $id --onboot 1
+        qm set $id --cicustom "user=local:snippets/debian-root.yaml"
         log "调整磁盘大小到 ${VM_DISK}G..."
         qm resize $id scsi0 ${VM_DISK}G
         log "虚拟机 $id 配置完成"
