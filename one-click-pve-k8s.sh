@@ -52,6 +52,143 @@ DNS="10.0.0.2 119.29.29.29"
 MASTER_IP="10.0.0.10"
 WORKER_IPS=("10.0.0.11" "10.0.0.12")
 
+# 诊断PVE环境
+diagnose_pve() {
+    log "开始诊断PVE环境..."
+    diagnose_system
+    return $?
+}
+
+# 下载Debian Cloud镜像
+download_cloud_image() {
+    log "开始下载Debian Cloud镜像..."
+    
+    # 确保目录存在
+    log "确保存储目录存在..."
+    mkdir -p /var/lib/vz/template/qcow
+    
+    # 下载Debian cloud镜像
+    log "检查Debian cloud镜像..."
+    if [ ! -f "$CLOUD_IMAGE_PATH" ]; then
+        log "尝试多源下载Debian cloud镜像: $CLOUD_IMAGE_FILE"
+        IMAGE_OK=0
+        for url in "${CLOUD_IMAGE_URLS[@]}"; do
+            log "尝试下载: $url"
+            if wget --timeout=30 --tries=3 -O "$CLOUD_IMAGE_PATH" "$url" 2>/dev/null; then
+                IMAGE_OK=1
+                log "Cloud镜像下载成功"
+                break
+            else
+                warn "下载失败: $url"
+                rm -f "$CLOUD_IMAGE_PATH"
+            fi
+        done
+        if [ $IMAGE_OK -ne 1 ]; then
+            err "Cloud镜像下载多次失败，无法继续！"
+            return 1
+        fi
+    else
+        log "Cloud镜像已存在: $CLOUD_IMAGE_PATH"
+    fi
+
+    # 验证镜像文件
+    if [ ! -f "$CLOUD_IMAGE_PATH" ] || [ ! -s "$CLOUD_IMAGE_PATH" ]; then
+        err "Cloud镜像文件无效或为空！"
+        return 1
+    fi
+    
+    log "Debian Cloud镜像下载/检查完成"
+    return 0
+}
+
+# 创建并启动虚拟机
+create_and_start_vms() {
+    log "开始创建并启动虚拟机..."
+    
+    # 保证cloud-init自定义配置存在
+    log "确保cloud-init自定义配置存在..."
+    mkdir -p /var/lib/vz/snippets
+    CLOUDINIT_CUSTOM_USERCFG="/var/lib/vz/snippets/debian-root.yaml"
+    cat > "$CLOUDINIT_CUSTOM_USERCFG" <<EOF
+#cloud-config
+disable_root: false
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  list: |
+    root:$CLOUDINIT_PASS
+EOF
+
+    # 创建虚拟机（使用cloud镜像）
+    for idx in ${!VM_IDS[@]}; do
+        id=${VM_IDS[$idx]}
+        name=${VM_NAMES[$idx]}
+        ip=${VM_IPS[$idx]}
+        log "处理虚拟机 $name (ID:$id, IP:$ip) ..."
+        if qm list | grep -q " $id "; then
+            warn "虚拟机 $id 已存在，跳过创建"
+            continue
+        fi
+        log "创建空虚拟机 $id..."
+        if ! qm create $id \
+            --name $name \
+            --memory $VM_MEM \
+            --cores $VM_CORES \
+            --net0 virtio,bridge=$BRIDGE \
+            --scsihw virtio-scsi-pci \
+            --serial0 socket \
+            --agent 1; then
+            err "创建虚拟机 $id 失败，请检查PVE资源和配置"
+            return 1
+        fi
+        log "导入cloud镜像到 $id..."
+        if ! qm importdisk $id "$CLOUD_IMAGE_PATH" $STORAGE; then
+            err "导入cloud镜像到 $id 失败，请检查镜像和存储"
+            return 1
+        fi
+        log "关联scsi0磁盘..."
+        if ! qm set $id --scsi0 $STORAGE:vm-${id}-disk-0; then
+            err "设置scsi0磁盘失败"
+            return 1
+        fi
+        log "配置cloud-init..."
+        qm set $id --ide3 $STORAGE:cloudinit
+        qm set $id --ciuser root --cipassword $CLOUDINIT_PASS
+        qm set $id --ipconfig0 ip=$ip/24,gw=$GATEWAY
+        qm set $id --nameserver "$DNS"
+        qm set $id --boot order=scsi0
+        qm set $id --onboot 1
+        qm set $id --cicustom "user=local:snippets/debian-root.yaml"
+        log "调整磁盘大小到 ${VM_DISK}G..."
+        qm resize $id scsi0 ${VM_DISK}G
+        log "虚拟机 $id 配置完成"
+    done
+
+    # 启动虚拟机
+    log "批量启动虚拟机..."
+    for id in "${VM_IDS[@]}"; do
+        status=$(qm list | awk -v id="$id" '$1==id{print $3}')
+        if [ "$status" = "running" ]; then
+            warn "虚拟机 $id 已在运行，跳过"
+        else
+            log "启动虚拟机 $id ..."
+            if ! qm start $id; then
+                err "启动虚拟机 $id 失败，请检查PVE资源和配置"
+                return 1
+            fi
+            log "虚拟机 $id 启动成功，等待5秒..."
+            sleep 5
+        fi
+    done
+
+    # 显示虚拟机状态
+    log "当前虚拟机状态："
+    qm list | grep -E "(VMID|101|102|103)"
+    
+    log "虚拟机创建和启动完成"
+    return 0
+}
+
 # 修正已存在虚拟机的cloud-init配置
 fix_existing_vms() {
     log "修正已存在虚拟机的cloud-init配置..."
@@ -507,7 +644,7 @@ wait_for_port() {
     exit 1
 }
 
-# 主部署函数
+# 部署K8S集群
 deploy_k8s() {
     log "开始部署K8S集群..."
     
@@ -614,6 +751,72 @@ deploy_k8s() {
     return 0
 }
 
+# 部署KubeSphere
+deploy_kubesphere() {
+    log "开始部署KubeSphere..."
+    
+    # 检查K8S集群状态
+    log "检查K8S集群状态..."
+    if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "kubectl get nodes" 2>/dev/null; then
+        err "K8S集群未就绪，请先部署K8S集群"
+        return 1
+    fi
+    
+    # 安装KubeSphere
+    log "在master节点安装KubeSphere..."
+    remote_cmd="curl -sfL https://get-ks.ksops.io | sh && ./kk create cluster -f ./config-sample.yaml || ./kk create cluster"
+    if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "$remote_cmd" 2>/dev/null; then
+        err "KubeSphere安装失败，命令: $remote_cmd"
+        echo "[建议] 检查KubeSphere安装日志、PVE资源、网络等。"
+        return 1
+    fi
+    
+    # 检查KubeSphere端口
+    log "等待KubeSphere服务启动..."
+    if ! wait_for_port $MASTER_IP 30880; then
+        err "KubeSphere服务启动失败"
+        return 1
+    fi
+    
+    log "KubeSphere部署完成！"
+    log "KubeSphere控制台: http://$MASTER_IP:30880"
+    log "默认用户名: admin，密码: P@88w0rd"
+    return 0
+}
+
+# 清理所有资源
+cleanup_all() {
+    log "清理所有资源..."
+    echo ""
+    read -p "确认要清理所有虚拟机资源吗？(y/N): " confirm
+    if [[ ! $confirm =~ ^[Yy]$ ]]; then
+        log "取消清理"
+        return
+    fi
+    
+    # 停止并删除虚拟机
+    for id in "${VM_IDS[@]}"; do
+        if qm list | grep -q " $id "; then
+            log "停止虚拟机 $id..."
+            qm stop $id 2>/dev/null || true
+            sleep 2
+            log "删除虚拟机 $id..."
+            qm destroy $id 2>/dev/null || true
+            log "虚拟机 $id 已删除"
+        else
+            warn "虚拟机 $id 不存在，跳过"
+        fi
+    done
+    
+    # 清理镜像文件
+    if [ -f "$CLOUD_IMAGE_PATH" ]; then
+        log "删除cloud镜像文件..."
+        rm -f "$CLOUD_IMAGE_PATH"
+    fi
+    
+    log "清理完成"
+}
+
 # 一键全自动部署
 auto_deploy_all() {
     log "开始一键全自动部署..."
@@ -692,72 +895,6 @@ auto_deploy_all() {
     echo -e "${CYAN}部署日志：${NC} $LOGFILE"
 }
 
-# 部署KubeSphere
-deploy_kubesphere() {
-    log "开始部署KubeSphere..."
-    
-    # 检查K8S集群状态
-    log "检查K8S集群状态..."
-    if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "kubectl get nodes" 2>/dev/null; then
-        err "K8S集群未就绪，请先部署K8S集群"
-        return 1
-    fi
-    
-    # 安装KubeSphere
-    log "在master节点安装KubeSphere..."
-    remote_cmd="curl -sfL https://get-ks.ksops.io | sh && ./kk create cluster -f ./config-sample.yaml || ./kk create cluster"
-    if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "$remote_cmd" 2>/dev/null; then
-        err "KubeSphere安装失败，命令: $remote_cmd"
-        echo "[建议] 检查KubeSphere安装日志、PVE资源、网络等。"
-        return 1
-    fi
-    
-    # 检查KubeSphere端口
-    log "等待KubeSphere服务启动..."
-    if ! wait_for_port $MASTER_IP 30880; then
-        err "KubeSphere服务启动失败"
-        return 1
-    fi
-    
-    log "KubeSphere部署完成！"
-    log "KubeSphere控制台: http://$MASTER_IP:30880"
-    log "默认用户名: admin，密码: P@88w0rd"
-    return 0
-}
-
-# 清理所有资源
-cleanup_all() {
-    log "清理所有资源..."
-    echo ""
-    read -p "确认要清理所有虚拟机资源吗？(y/N): " confirm
-    if [[ ! $confirm =~ ^[Yy]$ ]]; then
-        log "取消清理"
-        return
-    fi
-    
-    # 停止并删除虚拟机
-    for id in "${VM_IDS[@]}"; do
-        if qm list | grep -q " $id "; then
-            log "停止虚拟机 $id..."
-            qm stop $id 2>/dev/null || true
-            sleep 2
-            log "删除虚拟机 $id..."
-            qm destroy $id 2>/dev/null || true
-            log "虚拟机 $id 已删除"
-        else
-            warn "虚拟机 $id 不存在，跳过"
-        fi
-    done
-    
-    # 清理镜像文件
-    if [ -f "$CLOUD_IMAGE_PATH" ]; then
-        log "删除cloud镜像文件..."
-        rm -f "$CLOUD_IMAGE_PATH"
-    fi
-    
-    log "清理完成"
-}
-
 # 主程序
 main() {
     # 处理命令行参数
@@ -785,141 +922,4 @@ main() {
 }
 
 # 运行主程序
-main "$@"
-
-# 诊断PVE环境
-diagnose_pve() {
-    log "开始诊断PVE环境..."
-    diagnose_system
-    return $?
-}
-
-# 下载Debian Cloud镜像
-download_cloud_image() {
-    log "开始下载Debian Cloud镜像..."
-    
-    # 确保目录存在
-    log "确保存储目录存在..."
-    mkdir -p /var/lib/vz/template/qcow
-    
-    # 下载Debian cloud镜像
-    log "检查Debian cloud镜像..."
-    if [ ! -f "$CLOUD_IMAGE_PATH" ]; then
-        log "尝试多源下载Debian cloud镜像: $CLOUD_IMAGE_FILE"
-        IMAGE_OK=0
-        for url in "${CLOUD_IMAGE_URLS[@]}"; do
-            log "尝试下载: $url"
-            if wget --timeout=30 --tries=3 -O "$CLOUD_IMAGE_PATH" "$url" 2>/dev/null; then
-                IMAGE_OK=1
-                log "Cloud镜像下载成功"
-                break
-            else
-                warn "下载失败: $url"
-                rm -f "$CLOUD_IMAGE_PATH"
-            fi
-        done
-        if [ $IMAGE_OK -ne 1 ]; then
-            err "Cloud镜像下载多次失败，无法继续！"
-            return 1
-        fi
-    else
-        log "Cloud镜像已存在: $CLOUD_IMAGE_PATH"
-    fi
-
-    # 验证镜像文件
-    if [ ! -f "$CLOUD_IMAGE_PATH" ] || [ ! -s "$CLOUD_IMAGE_PATH" ]; then
-        err "Cloud镜像文件无效或为空！"
-        return 1
-    fi
-    
-    log "Debian Cloud镜像下载/检查完成"
-    return 0
-}
-
-# 创建并启动虚拟机
-create_and_start_vms() {
-    log "开始创建并启动虚拟机..."
-    
-    # 保证cloud-init自定义配置存在
-    log "确保cloud-init自定义配置存在..."
-    mkdir -p /var/lib/vz/snippets
-    CLOUDINIT_CUSTOM_USERCFG="/var/lib/vz/snippets/debian-root.yaml"
-    cat > "$CLOUDINIT_CUSTOM_USERCFG" <<EOF
-#cloud-config
-disable_root: false
-ssh_pwauth: true
-chpasswd:
-  expire: false
-  list: |
-    root:$CLOUDINIT_PASS
-EOF
-
-    # 创建虚拟机（使用cloud镜像）
-    for idx in ${!VM_IDS[@]}; do
-        id=${VM_IDS[$idx]}
-        name=${VM_NAMES[$idx]}
-        ip=${VM_IPS[$idx]}
-        log "处理虚拟机 $name (ID:$id, IP:$ip) ..."
-        if qm list | grep -q " $id "; then
-            warn "虚拟机 $id 已存在，跳过创建"
-            continue
-        fi
-        log "创建空虚拟机 $id..."
-        if ! qm create $id \
-            --name $name \
-            --memory $VM_MEM \
-            --cores $VM_CORES \
-            --net0 virtio,bridge=$BRIDGE \
-            --scsihw virtio-scsi-pci \
-            --serial0 socket \
-            --agent 1; then
-            err "创建虚拟机 $id 失败，请检查PVE资源和配置"
-            return 1
-        fi
-        log "导入cloud镜像到 $id..."
-        if ! qm importdisk $id "$CLOUD_IMAGE_PATH" $STORAGE; then
-            err "导入cloud镜像到 $id 失败，请检查镜像和存储"
-            return 1
-        fi
-        log "关联scsi0磁盘..."
-        if ! qm set $id --scsi0 $STORAGE:vm-${id}-disk-0; then
-            err "设置scsi0磁盘失败"
-            return 1
-        fi
-        log "配置cloud-init..."
-        qm set $id --ide3 $STORAGE:cloudinit
-        qm set $id --ciuser root --cipassword $CLOUDINIT_PASS
-        qm set $id --ipconfig0 ip=$ip/24,gw=$GATEWAY
-        qm set $id --nameserver "$DNS"
-        qm set $id --boot order=scsi0
-        qm set $id --onboot 1
-        qm set $id --cicustom "user=local:snippets/debian-root.yaml"
-        log "调整磁盘大小到 ${VM_DISK}G..."
-        qm resize $id scsi0 ${VM_DISK}G
-        log "虚拟机 $id 配置完成"
-    done
-
-    # 启动虚拟机
-    log "批量启动虚拟机..."
-    for id in "${VM_IDS[@]}"; do
-        status=$(qm list | awk -v id="$id" '$1==id{print $3}')
-        if [ "$status" = "running" ]; then
-            warn "虚拟机 $id 已在运行，跳过"
-        else
-            log "启动虚拟机 $id ..."
-            if ! qm start $id; then
-                err "启动虚拟机 $id 失败，请检查PVE资源和配置"
-                return 1
-            fi
-            log "虚拟机 $id 启动成功，等待5秒..."
-            sleep 5
-        fi
-    done
-
-    # 显示虚拟机状态
-    log "当前虚拟机状态："
-    qm list | grep -E "(VMID|101|102|103)"
-    
-    log "虚拟机创建和启动完成"
-    return 0
-} 
+main "$@" 
