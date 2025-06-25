@@ -331,15 +331,31 @@ create_vms() {
         
         # 等待磁盘导入完成
         log_info "等待磁盘导入完成..."
-        sleep 10
+        sleep 15
         
         # 检查磁盘是否导入成功并附加磁盘
         log_info "检查并附加磁盘..."
-        if ! qm config $vm_id | grep -q "scsi0"; then
-            log_info "手动附加磁盘..."
+        local disk_attached=false
+        local retry_count=0
+        
+        while [ $retry_count -lt 3 ] && [ "$disk_attached" = false ]; do
+            if qm config $vm_id | grep -q "scsi0"; then
+                log_info "磁盘已自动附加"
+                disk_attached=true
+            else
+                log_info "手动附加磁盘 (尝试 $((retry_count + 1))/3)..."
+                qm set $vm_id --scsi0 $STORAGE_NAME:vm-$vm_id-disk-0
+                sleep 5
+                retry_count=$((retry_count + 1))
+            fi
+        done
+        
+        if [ "$disk_attached" = false ]; then
+            log_error "磁盘附加失败，尝试其他方法..."
+            # 尝试使用不同的磁盘名称
+            qm set $vm_id --scsi0 $STORAGE_NAME:vm-$vm_id-disk-1 2>/dev/null || true
+            sleep 3
             qm set $vm_id --scsi0 $STORAGE_NAME:vm-$vm_id-disk-0
-        else
-            log_info "磁盘已自动附加"
         fi
         
         # 设置启动盘
@@ -361,6 +377,13 @@ create_vms() {
         # 设置磁盘大小
         log_info "调整磁盘大小到 ${disk_size}GB..."
         qm resize $vm_id scsi0 ${disk_size}G
+        
+        # 强制重新配置启动设备
+        log_info "强制重新配置启动设备..."
+        qm set $vm_id --delete scsi0 2>/dev/null || true
+        sleep 2
+        qm set $vm_id --scsi0 $STORAGE_NAME:vm-$vm_id-disk-0
+        qm set $vm_id --boot c --bootdisk scsi0
         
         # 验证虚拟机配置
         log_info "验证虚拟机配置..."
@@ -454,10 +477,24 @@ fix_vm_boot_issues() {
             issues_found=true
         fi
         
+        # 强制修复启动设备（如果虚拟机无法启动）
+        log_info "强制修复启动设备配置..."
+        qm set $vm_id --delete scsi0 2>/dev/null || true
+        sleep 2
+        qm set $vm_id --scsi0 $STORAGE_NAME:vm-$vm_id-disk-0
+        qm set $vm_id --boot c --bootdisk scsi0
+        
+        # 设置BIOS启动顺序
+        qm set $vm_id --bios ovmf 2>/dev/null || true
+        qm set $vm_id --efidisk0 $STORAGE_NAME:1 2>/dev/null || true
+        
+        # 确保启动设备正确
+        qm set $vm_id --boot order=scsi0
+        
         if [ "$issues_found" = true ]; then
             log_info "虚拟机 $vm_name 配置已修复"
             log_info "修复后的配置："
-            qm config $vm_id | grep -E "(scsi0|bootdisk|net0|scsihw)"
+            qm config $vm_id | grep -E "(scsi0|bootdisk|net0|scsihw|boot)"
         else
             log_success "虚拟机 $vm_name 配置正常"
         fi
