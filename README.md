@@ -104,7 +104,7 @@ pve-kubesphere/
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `PVE_HOST` | 192.168.1.100 | PVE主机IP地址 |
+| `PVE_HOST` | 10.0.0.1 | PVE主机IP地址 |
 | `MASTER_IP` | 10.0.0.10 | Master节点IP |
 | `WORKER_IPS` | 10.0.0.11,10.0.0.12 | Worker节点IP列表 |
 | `KUBESPHERE_VERSION` | v4.1.3 | KubeSphere版本 |
@@ -120,7 +120,7 @@ pve-kubesphere/
 2. **修改网络配置**
    ```bash
    # 修改PVE主机IP
-   PVE_HOST="192.168.1.100"
+   PVE_HOST="10.0.0.1"
    
    # 修改节点IP
    MASTER_IP="10.0.0.10"
