@@ -230,7 +230,7 @@ create_minimal_template() {
         --name temp-debian \
         --memory 1024 \
         --cores 1 \
-        --net0 name=net0,bridge=$BRIDGE_NAME,model=virtio \
+        --net0 bridge=$BRIDGE_NAME,model=virtio \
         --scsihw virtio-scsi-pci \
         --ide2 $STORAGE_NAME:cloudinit
     
@@ -275,7 +275,7 @@ create_vms() {
             --name $vm_name \
             --memory $memory \
             --cores $cpu_count \
-            --net0 name=net0,bridge=$BRIDGE_NAME,model=virtio \
+            --net0 bridge=$BRIDGE_NAME,model=virtio \
             --scsihw virtio-scsi-pci
         
         # 导入磁盘
