@@ -150,7 +150,7 @@ for idx in ${!VM_IDS[@]}; do
   qm set $id --ciuser $CLOUDINIT_USER --cipassword $CLOUDINIT_PASS
   qm set $id --ipconfig0 ip=$ip/24,gw=$GATEWAY
   qm set $id --nameserver "$DNS"
-  qm set $id --boot order=ide2,scsi0
+  qm set $id --bootdisk scsi0
   qm set $id --onboot 1
 done
 
