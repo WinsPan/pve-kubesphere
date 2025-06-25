@@ -140,15 +140,11 @@ for idx in ${!VM_IDS[@]}; do
     --net0 virtio,bridge=$BRIDGE \
     --scsihw virtio-scsi-pci \
     --serial0 socket \
-    --agent 1; then
+    --agent 1 \
+    --scsi0 $STORAGE:$VM_DISK; then
     err "创建虚拟机 $id 失败，请检查PVE资源和配置"
     exit 1
   fi
-  if ! qm disk create $id $VM_DISK --storage $STORAGE --scsi0; then
-    err "创建磁盘失败 $id，请检查存储空间"
-    exit 1
-  fi
-  qm set $id --scsi0 $STORAGE:vm-$id-disk-0
   qm set $id --ide2 local:iso/$ISO_FILE,media=cdrom
   qm set $id --ide3 $STORAGE:cloudinit
   qm set $id --ciuser $CLOUDINIT_USER --cipassword $CLOUDINIT_PASS
