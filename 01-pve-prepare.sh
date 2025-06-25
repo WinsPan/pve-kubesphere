@@ -432,60 +432,42 @@ wait_and_configure_vms() {
             fi
         fi
         
-        # 通过控制台配置SSH服务
-        log_info "通过控制台配置SSH服务..."
-        
-        # 使用qm terminal发送命令到虚拟机
-        # 注意：这里需要等待一段时间让系统完全启动
-        sleep 30
-        
-        # 尝试通过控制台配置SSH
-        log_info "配置SSH服务（通过控制台）..."
-        
-        # 使用expect脚本或直接通过qm terminal配置
-        # 由于qm terminal是交互式的，我们改用其他方法
-        
-        # 等待一段时间让cloud-init完成配置
-        log_info "等待cloud-init完成配置..."
-        sleep 60
-        
-        # 现在尝试SSH连接（最多等待5分钟）
-        local ssh_timeout=300
+        # 等待cloud-init完成配置（最多等待2分钟）
+        log_info "等待cloud-init完成配置 (超时: 120秒)..."
         elapsed=0
         
-        log_info "等待SSH连接可用 (超时: ${ssh_timeout}秒)..."
-        
-        # 等待SSH可用
-        while [ $elapsed -lt $ssh_timeout ]; do
-            if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@$vm_ip "echo 'SSH ready'" > /dev/null 2>&1; then
-                log_success "SSH连接可用"
-                break
+        while [ $elapsed -lt 120 ]; do
+            # 检查cloud-init是否完成
+            if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@$vm_ip "cloud-init status" > /dev/null 2>&1; then
+                cloud_status=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@$vm_ip "cloud-init status" 2>/dev/null | head -1)
+                if echo "$cloud_status" | grep -q "done"; then
+                    log_success "cloud-init配置完成"
+                    break
+                fi
             fi
             
-            log_info "等待SSH连接可用... (${elapsed}/${ssh_timeout}秒)"
+            log_info "等待cloud-init完成配置... (${elapsed}/120秒)"
             sleep 10
             elapsed=$((elapsed + 10))
         done
         
-        if [ $elapsed -ge $ssh_timeout ]; then
-            log_error "SSH连接等待超时，尝试手动配置..."
-            
-            # 尝试通过控制台手动配置SSH
-            log_info "请手动配置SSH服务："
-            log_info "qm terminal $vm_id"
-            log_info "在虚拟机内执行："
-            log_info "systemctl enable ssh"
-            log_info "systemctl start ssh"
-            log_info "sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config"
-            log_info "sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config"
-            log_info "systemctl restart ssh"
-            
-            continue
+        if [ $elapsed -ge 120 ]; then
+            log_warn "cloud-init等待超时，继续尝试配置SSH"
         fi
         
-        # 配置SSH服务（确保配置正确）
-        log_info "确保SSH服务配置正确..."
-        ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF'
+        # 配置SSH服务
+        log_info "配置SSH服务..."
+        
+        # 尝试通过SSH配置（如果SSH已经可用）
+        local ssh_configured=false
+        
+        # 先尝试SSH连接（短时间测试）
+        if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@$vm_ip "echo 'SSH test'" > /dev/null 2>&1; then
+            log_info "SSH连接可用，直接配置..."
+            ssh_configured=true
+            
+            # 配置SSH服务
+            ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF'
 # 启用SSH服务
 systemctl enable ssh
 systemctl start ssh
@@ -501,10 +483,57 @@ systemctl restart ssh
 # 检查SSH服务状态
 systemctl status ssh --no-pager -l
 EOF
+        else
+            log_info "SSH连接不可用，需要手动配置..."
+            log_info "请手动配置SSH服务："
+            log_info "qm terminal $vm_id"
+            log_info "在虚拟机内执行以下命令："
+            echo ""
+            echo "=========================================="
+            echo "手动SSH配置命令："
+            echo "=========================================="
+            echo "systemctl enable ssh"
+            echo "systemctl start ssh"
+            echo "sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config"
+            echo "sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config"
+            echo "systemctl restart ssh"
+            echo "=========================================="
+            echo ""
+            
+            # 等待用户手动配置
+            read -p "配置完成后按回车继续，或输入 'skip' 跳过此虚拟机: " -r
+            if [[ $REPLY =~ ^[Ss]kip$ ]]; then
+                log_warn "跳过 $vm_name 的配置"
+                continue
+            fi
+            
+            # 测试SSH连接
+            log_info "测试SSH连接..."
+            local ssh_test_timeout=60
+            elapsed=0
+            
+            while [ $elapsed -lt $ssh_test_timeout ]; do
+                if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@$vm_ip "echo 'SSH ready'" > /dev/null 2>&1; then
+                    log_success "SSH连接成功"
+                    ssh_configured=true
+                    break
+                fi
+                
+                log_info "等待SSH连接... (${elapsed}/${ssh_test_timeout}秒)"
+                sleep 5
+                elapsed=$((elapsed + 5))
+            done
+            
+            if [ "$ssh_configured" = false ]; then
+                log_error "SSH连接失败，跳过防火墙配置"
+                continue
+            fi
+        fi
         
-        # 配置防火墙
-        log_info "配置防火墙..."
-        ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF'
+        # 配置防火墙（只有在SSH配置成功后才进行）
+        if [ "$ssh_configured" = true ]; then
+            log_info "配置防火墙..."
+            ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF'
 # 安装ufw防火墙（如果未安装）
 apt update
 apt install -y ufw
@@ -529,6 +558,7 @@ ufw --force disable
 # 检查防火墙状态
 ufw status verbose
 EOF
+        fi
         
         log_success "$vm_name 启动和配置完成"
     done
