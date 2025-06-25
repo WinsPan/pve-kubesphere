@@ -528,34 +528,16 @@ ufw --force reset
 # 允许SSH连接
 ufw allow ssh
 
-# 允许Kubernetes相关端口
-ufw allow 6443/tcp  # Kubernetes API
-ufw allow 2379:2380/tcp  # etcd
-ufw allow 10250/tcp  # Kubelet
-ufw allow 10251/tcp  # kube-scheduler
-ufw allow 10252/tcp  # kube-controller-manager
-ufw allow 10255/tcp  # Kubelet read-only
-ufw allow 179/tcp  # Calico BGP
-ufw allow 4789/udp  # Calico VXLAN
-ufw allow 5473/tcp  # Calico Typha
-ufw allow 9099/tcp  # Calico Felix
-ufw allow 9099/udp  # Calico Felix
+# 允许内网全开放 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+ufw allow from 10.0.0.0/8
+ufw allow from 172.16.0.0/12
+ufw allow from 192.168.0.0/16
 
-# 允许KubeSphere相关端口
-ufw allow 30880/tcp  # KubeSphere Console
-ufw allow 30180/tcp  # KubeSphere API
-ufw allow 30280/tcp  # KubeSphere Gateway
+# 允许所有出站连接
+ufw allow out
 
-# 允许其他必要端口
-ufw allow 80/tcp   # HTTP
-ufw allow 443/tcp  # HTTPS
-ufw allow 53/tcp   # DNS
-ufw allow 53/udp   # DNS
-ufw allow 67/udp   # DHCP
-ufw allow 68/udp   # DHCP
-
-# 启用防火墙
-ufw --force enable
+# 关闭防火墙（内网环境）
+ufw --force disable
 
 # 检查防火墙状态
 ufw status verbose

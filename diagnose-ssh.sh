@@ -158,8 +158,10 @@ check_ssh_firewall() {
             
             # 检查防火墙状态
             ufw_status=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@$vm_ip "ufw status" 2>/dev/null | head -1 || echo "unknown")
-            if echo "$ufw_status" | grep -q "Status: active"; then
-                log_success "  防火墙已启用"
+            if echo "$ufw_status" | grep -q "Status: inactive"; then
+                log_success "  防火墙已关闭（内网环境）"
+            elif echo "$ufw_status" | grep -q "Status: active"; then
+                log_warn "  防火墙已启用"
             else
                 log_warn "  防火墙状态: $ufw_status"
             fi
