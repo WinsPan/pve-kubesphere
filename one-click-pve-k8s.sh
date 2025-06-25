@@ -52,6 +52,139 @@ DNS="10.0.0.2 119.29.29.29"
 MASTER_IP="10.0.0.10"
 WORKER_IPS=("10.0.0.11" "10.0.0.12")
 
+# 诊断函数
+diagnose_system() {
+    echo "=========================================="
+    echo "PVE虚拟机诊断报告"
+    echo "=========================================="
+
+    # 1. 检查PVE命令可用性
+    log "1. 检查PVE环境..."
+    if command -v qm &>/dev/null; then
+        log "qm命令可用"
+    else
+        err "qm命令不可用，请确保在PVE环境中运行"
+        return 1
+    fi
+
+    # 2. 检查虚拟机状态
+    log "2. 检查虚拟机状态..."
+    echo "当前所有虚拟机列表："
+    qm list
+
+    echo ""
+    echo "目标虚拟机状态："
+    for idx in ${!VM_IDS[@]}; do
+        id=${VM_IDS[$idx]}
+        name=${VM_NAMES[$idx]}
+        ip=${VM_IPS[$idx]}
+        
+        if qm list | grep -q " $id "; then
+            status=$(qm list | awk -v id="$id" '$1==id{print $3}')
+            log "虚拟机 $id ($name): $status"
+            
+            # 检查虚拟机详细信息
+            echo "  详细信息："
+            qm config $id | grep -E "(memory|cpu|net|scsi|ide)" || true
+            
+            # 如果虚拟机正在运行，检查网络接口
+            if [ "$status" = "running" ]; then
+                echo "  网络接口："
+                qm guest cmd $id network-get-interfaces 2>/dev/null || echo "    无法获取网络接口信息"
+            fi
+        else
+            err "虚拟机 $id ($name) 不存在"
+        fi
+        echo ""
+    done
+
+    # 3. 检查网络连接
+    log "3. 检查网络连接..."
+    for idx in ${!VM_IDS[@]}; do
+        id=${VM_IDS[$idx]}
+        name=${VM_NAMES[$idx]}
+        ip=${VM_IPS[$idx]}
+        
+        echo "检查 $name ($ip):"
+        
+        # Ping测试
+        if ping -c 1 -W 2 $ip &>/dev/null; then
+            log "  Ping成功"
+        else
+            err "  Ping失败"
+        fi
+        
+        # SSH端口测试
+        if nc -z $ip 22 &>/dev/null; then
+            log "  SSH端口(22)开放"
+        else
+            err "  SSH端口(22)未开放"
+        fi
+        
+        # 尝试SSH连接
+        if command -v sshpass &>/dev/null; then
+            if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 $CLOUDINIT_USER@$ip "echo 'SSH连接成功'" &>/dev/null; then
+                log "  SSH连接成功"
+                
+                # 获取系统信息
+                echo "  系统信息："
+                sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$ip "hostname && cat /etc/os-release | grep PRETTY_NAME && uname -a" 2>/dev/null || echo "    无法获取系统信息"
+            else
+                err "  SSH连接失败"
+            fi
+        else
+            warn "  sshpass未安装，跳过SSH连接测试"
+        fi
+        echo ""
+    done
+
+    # 4. 检查PVE网络配置
+    log "4. 检查PVE网络配置..."
+    echo "网络接口："
+    ip addr show | grep -E "(vmbr|eth)" || true
+
+    echo ""
+    echo "路由表："
+    ip route show | head -10
+
+    # 5. 检查存储
+    log "5. 检查存储..."
+    echo "存储信息："
+    pvesm status 2>/dev/null || echo "无法获取存储信息"
+
+    # 6. 检查系统资源
+    log "6. 检查系统资源..."
+    echo "内存使用："
+    free -h
+
+    echo ""
+    echo "磁盘使用："
+    df -h
+
+    echo ""
+    echo "CPU信息："
+    nproc
+    lscpu | grep "Model name" | head -1
+
+    echo ""
+    echo "=========================================="
+    echo "诊断完成"
+    echo "=========================================="
+
+    # 7. 提供建议
+    echo ""
+    echo "常见问题解决方案："
+    echo "1. 如果虚拟机无法启动：检查PVE资源是否充足"
+    echo "2. 如果网络不通：检查vmbr0配置和防火墙设置"
+    echo "3. 如果SSH连接失败：检查cloud-init配置和root密码"
+    echo "4. 如果虚拟机已存在但状态异常：尝试重启虚拟机"
+    echo ""
+    echo "重启虚拟机的命令："
+    for id in "${VM_IDS[@]}"; do
+        echo "  qm stop $id && qm start $id"
+    done
+}
+
 # 诊断PVE环境
 diagnose_pve() {
     log "开始诊断PVE环境..."
@@ -247,24 +380,6 @@ show_menu() {
     echo -e "${CYAN}================================${NC}"
 }
 
-# 主循环
-while true; do
-    show_menu
-    read -p "请选择操作 [0-8]: " choice
-    case $choice in
-        1) diagnose_pve ;;
-        2) download_cloud_image ;;
-        3) create_and_start_vms ;;
-        4) fix_existing_vms ;;
-        5) deploy_k8s ;;
-        6) deploy_kubesphere ;;
-        7) cleanup_all ;;
-        8) auto_deploy_all ;;
-        0) log "退出程序"; exit 0 ;;
-        *) echo -e "${RED}无效选择，请重新输入${NC}"; sleep 2 ;;
-    esac
-done
-
 # 清理虚拟机资源
 clean_vms() {
     echo "=========================================="
@@ -353,240 +468,6 @@ show_info() {
     
     echo ""
     echo "=========================================="
-}
-
-# 检查依赖环境
-check_environment() {
-    echo "=========================================="
-    echo "检查依赖环境"
-    echo "=========================================="
-    
-    log "检查PVE环境..."
-    if command -v qm &>/dev/null; then
-        log "✓ qm命令可用"
-    else
-        err "✗ qm命令不可用，请确保在PVE环境中运行"
-        return 1
-    fi
-    
-    log "检查依赖工具..."
-    local missing_deps=()
-    for cmd in wget sshpass nc; do
-        if command -v $cmd &>/dev/null; then
-            log "✓ $cmd 已安装"
-        else
-            err "✗ $cmd 未安装"
-            missing_deps+=($cmd)
-        fi
-    done
-    
-    if [ ${#missing_deps[@]} -gt 0 ]; then
-        echo ""
-        warn "缺少以下依赖工具："
-        for dep in "${missing_deps[@]}"; do
-            echo "  - $dep"
-        done
-        echo ""
-        echo "安装命令："
-        echo "  apt update && apt install -y ${missing_deps[*]}"
-        return 1
-    fi
-    
-    log "检查系统资源..."
-    echo ""
-    echo "内存使用情况："
-    free -h
-    
-    echo ""
-    echo "磁盘使用情况："
-    df -h | head -5
-    
-    echo ""
-    echo "CPU信息："
-    echo "  核心数: $(nproc)"
-    lscpu | grep "Model name" | head -1
-    
-    log "环境检查完成"
-    echo "=========================================="
-}
-
-# 处理命令行参数
-handle_args() {
-    case "$1" in
-        "deploy")
-            DIAGNOSE_MODE=false
-            LOGFILE="deploy.log"
-            exec > >(tee -a "$LOGFILE") 2>&1
-            trap 'err "脚本被中断或发生致命错误。请检查$LOGFILE，必要时清理部分资源后重试。"; exit 1' INT TERM
-            check_dependencies
-            deploy_k8s
-            ;;
-        "diagnose")
-            DIAGNOSE_MODE=true
-            LOGFILE="diagnose.log"
-            exec > >(tee -a "$LOGFILE") 2>&1
-            trap 'err "脚本被中断或发生致命错误。请检查$LOGFILE，必要时清理部分资源后重试。"; exit 1' INT TERM
-            diagnose_system
-            ;;
-        "clean")
-            clean_vms
-            ;;
-        "info")
-            show_info
-            ;;
-        "check")
-            check_environment
-            ;;
-        "")
-            # 无参数，显示菜单
-            ;;
-        *)
-            echo "用法: $0 [deploy|diagnose|clean|info|check]"
-            echo ""
-            echo "选项："
-            echo "  deploy   直接部署K8S+KubeSphere"
-            echo "  diagnose 诊断系统状态"
-            echo "  clean    清理虚拟机资源"
-            echo "  info     查看部署信息"
-            echo "  check    检查依赖环境"
-            echo ""
-            echo "无参数时显示交互式菜单"
-            exit 1
-            ;;
-    esac
-}
-
-# 诊断函数
-diagnose_system() {
-    echo "=========================================="
-    echo "PVE虚拟机诊断报告"
-    echo "=========================================="
-
-    # 1. 检查PVE命令可用性
-    log "1. 检查PVE环境..."
-    if command -v qm &>/dev/null; then
-        log "qm命令可用"
-    else
-        err "qm命令不可用，请确保在PVE环境中运行"
-        return 1
-    fi
-
-    # 2. 检查虚拟机状态
-    log "2. 检查虚拟机状态..."
-    echo "当前所有虚拟机列表："
-    qm list
-
-    echo ""
-    echo "目标虚拟机状态："
-    for idx in ${!VM_IDS[@]}; do
-        id=${VM_IDS[$idx]}
-        name=${VM_NAMES[$idx]}
-        ip=${VM_IPS[$idx]}
-        
-        if qm list | grep -q " $id "; then
-            status=$(qm list | awk -v id="$id" '$1==id{print $3}')
-            log "虚拟机 $id ($name): $status"
-            
-            # 检查虚拟机详细信息
-            echo "  详细信息："
-            qm config $id | grep -E "(memory|cpu|net|scsi|ide)" || true
-            
-            # 如果虚拟机正在运行，检查网络接口
-            if [ "$status" = "running" ]; then
-                echo "  网络接口："
-                qm guest cmd $id network-get-interfaces 2>/dev/null || echo "    无法获取网络接口信息"
-            fi
-        else
-            err "虚拟机 $id ($name) 不存在"
-        fi
-        echo ""
-    done
-
-    # 3. 检查网络连接
-    log "3. 检查网络连接..."
-    for idx in ${!VM_IDS[@]}; do
-        id=${VM_IDS[$idx]}
-        name=${VM_NAMES[$idx]}
-        ip=${VM_IPS[$idx]}
-        
-        echo "检查 $name ($ip):"
-        
-        # Ping测试
-        if ping -c 1 -W 2 $ip &>/dev/null; then
-            log "  Ping成功"
-        else
-            err "  Ping失败"
-        fi
-        
-        # SSH端口测试
-        if nc -z $ip 22 &>/dev/null; then
-            log "  SSH端口(22)开放"
-        else
-            err "  SSH端口(22)未开放"
-        fi
-        
-        # 尝试SSH连接
-        if command -v sshpass &>/dev/null; then
-            if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 $CLOUDINIT_USER@$ip "echo 'SSH连接成功'" &>/dev/null; then
-                log "  SSH连接成功"
-                
-                # 获取系统信息
-                echo "  系统信息："
-                sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$ip "hostname && cat /etc/os-release | grep PRETTY_NAME && uname -a" 2>/dev/null || echo "    无法获取系统信息"
-            else
-                err "  SSH连接失败"
-            fi
-        else
-            warn "  sshpass未安装，跳过SSH连接测试"
-        fi
-        echo ""
-    done
-
-    # 4. 检查PVE网络配置
-    log "4. 检查PVE网络配置..."
-    echo "网络接口："
-    ip addr show | grep -E "(vmbr|eth)" || true
-
-    echo ""
-    echo "路由表："
-    ip route show | head -10
-
-    # 5. 检查存储
-    log "5. 检查存储..."
-    echo "存储信息："
-    pvesm status 2>/dev/null || echo "无法获取存储信息"
-
-    # 6. 检查系统资源
-    log "6. 检查系统资源..."
-    echo "内存使用："
-    free -h
-
-    echo ""
-    echo "磁盘使用："
-    df -h
-
-    echo ""
-    echo "CPU信息："
-    nproc
-    lscpu | grep "Model name" | head -1
-
-    echo ""
-    echo "=========================================="
-    echo "诊断完成"
-    echo "=========================================="
-
-    # 7. 提供建议
-    echo ""
-    echo "常见问题解决方案："
-    echo "1. 如果虚拟机无法启动：检查PVE资源是否充足"
-    echo "2. 如果网络不通：检查vmbr0配置和防火墙设置"
-    echo "3. 如果SSH连接失败：检查cloud-init配置和root密码"
-    echo "4. 如果虚拟机已存在但状态异常：尝试重启虚拟机"
-    echo ""
-    echo "重启虚拟机的命令："
-    for id in "${VM_IDS[@]}"; do
-        echo "  qm stop $id && qm start $id"
-    done
 }
 
 # 检查依赖
