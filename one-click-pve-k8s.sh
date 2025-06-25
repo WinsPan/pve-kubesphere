@@ -778,9 +778,6 @@ auto_deploy_all() {
 
 # 主程序
 main() {
-    # 处理命令行参数
-    handle_args "$1"
-    
     # 如果没有命令行参数，显示交互式菜单
     if [ -z "$1" ]; then
         while true; do
@@ -799,6 +796,21 @@ main() {
                 *) echo -e "${RED}无效选择，请重新输入${NC}"; sleep 2 ;;
             esac
         done
+    else
+        # 如果有命令行参数，显示帮助信息
+        echo "用法: $0"
+        echo ""
+        echo "无参数时显示交互式菜单"
+        echo "支持的功能："
+        echo "  1. 诊断PVE环境"
+        echo "  2. 下载Debian Cloud镜像"
+        echo "  3. 创建并启动虚拟机"
+        echo "  4. 修正已存在虚拟机配置"
+        echo "  5. 部署K8S集群"
+        echo "  6. 部署KubeSphere"
+        echo "  7. 清理所有资源"
+        echo "  8. 一键全自动部署"
+        exit 1
     fi
 }
 
