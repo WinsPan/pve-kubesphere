@@ -54,8 +54,8 @@ VM_CONFIGS=(
 )
 
 # 网络配置
-GATEWAY="10.0.0.1"
-DNS_SERVERS="8.8.8.8,8.8.4.4"
+GATEWAY="10.0.0.2"
+DNS_SERVERS="10.0.0.2,119.29.29.29"
 
 # 检查PVE环境
 check_pve_environment() {
@@ -469,6 +469,102 @@ wait_for_vms() {
     done
 }
 
+# 配置虚拟机SSH和防火墙
+configure_vm_services() {
+    log_step "配置虚拟机SSH和防火墙..."
+    
+    for i in "${!VM_CONFIGS[@]}"; do
+        IFS=':' read -r vm_name cpu_count memory disk_size template_file <<< "${VM_CONFIGS[$i]}"
+        vm_ip="10.0.0.$((10 + i))"
+        vm_id=$((VM_BASE_ID + i))
+        
+        log_info "配置 $vm_name ($vm_ip) 的SSH和防火墙..."
+        
+        # 等待SSH连接可用
+        local retry_count=0
+        while [ $retry_count -lt 30 ]; do
+            if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no root@$vm_ip "echo 'SSH ready'" > /dev/null 2>&1; then
+                break
+            fi
+            log_info "等待SSH连接... (${retry_count}/30)"
+            sleep 10
+            retry_count=$((retry_count + 1))
+        done
+        
+        if [ $retry_count -ge 30 ]; then
+            log_error "无法连接到 $vm_name，跳过配置"
+            continue
+        fi
+        
+        # 配置SSH服务
+        log_info "配置SSH服务..."
+        ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF'
+# 启用SSH服务
+systemctl enable ssh
+systemctl start ssh
+
+# 配置SSH允许root登录和密码认证
+sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+# 重启SSH服务
+systemctl restart ssh
+
+# 检查SSH服务状态
+systemctl status ssh --no-pager -l
+EOF
+        
+        # 配置防火墙
+        log_info "配置防火墙..."
+        ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no root@$vm_ip << 'EOF'
+# 安装ufw防火墙（如果未安装）
+apt update
+apt install -y ufw
+
+# 配置防火墙规则
+ufw --force reset
+
+# 允许SSH连接
+ufw allow ssh
+
+# 允许Kubernetes相关端口
+ufw allow 6443/tcp  # Kubernetes API
+ufw allow 2379:2380/tcp  # etcd
+ufw allow 10250/tcp  # Kubelet
+ufw allow 10251/tcp  # kube-scheduler
+ufw allow 10252/tcp  # kube-controller-manager
+ufw allow 10255/tcp  # Kubelet read-only
+ufw allow 179/tcp  # Calico BGP
+ufw allow 4789/udp  # Calico VXLAN
+ufw allow 5473/tcp  # Calico Typha
+ufw allow 9099/tcp  # Calico Felix
+ufw allow 9099/udp  # Calico Felix
+
+# 允许KubeSphere相关端口
+ufw allow 30880/tcp  # KubeSphere Console
+ufw allow 30180/tcp  # KubeSphere API
+ufw allow 30280/tcp  # KubeSphere Gateway
+
+# 允许其他必要端口
+ufw allow 80/tcp   # HTTP
+ufw allow 443/tcp  # HTTPS
+ufw allow 53/tcp   # DNS
+ufw allow 53/udp   # DNS
+ufw allow 67/udp   # DHCP
+ufw allow 68/udp   # DHCP
+
+# 启用防火墙
+ufw --force enable
+
+# 检查防火墙状态
+ufw status verbose
+EOF
+        
+        log_success "$vm_name SSH和防火墙配置完成"
+    done
+}
+
 # 生成主机列表文件
 generate_hosts_file() {
     log_step "生成主机列表文件..."
@@ -555,6 +651,9 @@ main() {
     
     # 等待虚拟机完全启动
     wait_for_vms
+    
+    # 配置虚拟机SSH和防火墙
+    configure_vm_services
     
     # 生成主机列表文件
     generate_hosts_file
