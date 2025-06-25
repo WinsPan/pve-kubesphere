@@ -4,13 +4,18 @@
 
 本脚本可在Proxmox VE（PVE）环境下，一键完成如下操作：
 
-- 自动下载Debian 12.2官方ISO
+- **自动获取并下载最新Debian官方ISO**（无需手动维护版本号）
 - 自动创建3台KVM虚拟机（cloud-init无人值守，静态IP，root/kubesphere123）
 - 自动批量启动、检测、SSH初始化
 - 自动在master节点初始化Kubernetes集群（kubeadm+calico网络）
 - 自动将worker节点加入集群
 - 自动在master节点安装KubeSphere（官方一键脚本）
 - 全流程日志输出，遇到错误友好提示，所有日志保存在`deploy.log`
+
+**🎉 新特性：自动适配最新Debian ISO**
+- 脚本启动时自动从Debian官网获取最新的netinst ISO文件名
+- 支持多镜像源自动重试下载（官方+中科大+清华镜像）
+- 无需手动更新脚本中的Debian版本号，始终保持最新
 
 ---
 
@@ -30,6 +35,8 @@
 
 ## 使用方法
 
+### 本地PVE主机直接运行
+
 1. **上传脚本到PVE主机任意目录**
 2. **赋予执行权限**
    ```bash
@@ -40,6 +47,28 @@
    ./one-click-pve-k8s.sh
    ```
 4. **全程无需人工干预，所有日志自动保存到 `deploy.log`**
+
+### 远程PVE主机运行（推荐）
+
+假设PVE主机IP为10.0.0.100，用户名为root：
+
+1. **上传脚本到远程PVE主机**
+   ```bash
+   scp one-click-pve-k8s.sh root@10.0.0.100:/root/
+   ```
+2. **远程连接PVE主机**
+   ```bash
+   ssh root@10.0.0.100
+   ```
+3. **赋予执行权限并运行**
+   ```bash
+   chmod +x one-click-pve-k8s.sh
+   ./one-click-pve-k8s.sh
+   ```
+4. **所有日志自动保存到 `deploy.log`，可用SCP下载回本地查看**
+   ```bash
+   scp root@10.0.0.100:/root/deploy.log ./
+   ```
 
 ---
 
@@ -69,6 +98,8 @@
   检查PVE主机网络、虚拟机网络桥接、外网访问等。
 - **KubeSphere首次访问慢**  
   安装后首次访问需等待几分钟，耐心等待页面加载。
+- **ISO下载失败**  
+  脚本会自动尝试多个镜像源，全部失败时会给出手动下载链接和建议。
 
 ---
 

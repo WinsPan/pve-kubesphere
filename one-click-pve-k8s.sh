@@ -1,13 +1,15 @@
 #!/bin/bash
 
-# 极简一键PVE K8S+KubeSphere全自动部署脚本（增强健壮性版）
-# 功能：自动下载Debian ISO，创建3台KVM虚拟机（cloud-init无人值守），批量启动、检测、SSH初始化，自动K8S集群安装，自动KubeSphere部署
-# 默认参数：local-lvm, vmbr0, 3台8核16G 300G, Debian 12.2, root/kubesphere123
+# 极简一键PVE K8S+KubeSphere全自动部署脚本（异常处理增强版）
+# 功能：自动下载最新Debian ISO，创建3台KVM虚拟机（cloud-init无人值守），批量启动、检测、SSH初始化，自动K8S集群安装，自动KubeSphere部署
+# 默认参数：local-lvm, vmbr0, 3台8核16G 300G, 最新Debian, root/kubesphere123
 
 set -e
 
 LOGFILE="deploy.log"
 exec > >(tee -a "$LOGFILE") 2>&1
+
+trap 'err "脚本被中断或发生致命错误。请检查deploy.log，必要时清理部分资源后重试。"; exit 1' INT TERM
 
 # 颜色
 GREEN='\033[0;32m'
@@ -18,9 +20,23 @@ log() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# 自动获取最新Debian netinst ISO文件名
+log "自动获取最新Debian ISO信息..."
+LATEST_ISO=$(wget -qO- https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/ | grep -oE 'debian-[0-9.]+-amd64-netinst\.iso' | head -n1)
+if [ -z "$LATEST_ISO" ]; then
+  err "无法自动获取最新Debian ISO文件名，请检查网络或手动指定。"
+  echo -e "\n[解决方法] 请检查网络连接，或手动访问 https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/ 获取最新ISO文件名\n"
+  exit 1
+fi
+log "检测到最新Debian ISO: $LATEST_ISO"
+
 # 配置
-ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.2.0-amd64-netinst.iso"
-ISO_FILE="debian-12.2.0-amd64-netinst.iso"
+ISO_URLS=(
+  "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/$LATEST_ISO"
+  "https://mirrors.ustc.edu.cn/debian-cd/current/amd64/iso-cd/$LATEST_ISO"
+  "https://mirrors.tuna.tsinghua.edu.cn/debian-cd/current/amd64/iso-cd/$LATEST_ISO"
+)
+ISO_FILE="$LATEST_ISO"
 ISO_PATH="/var/lib/vz/template/iso/$ISO_FILE"
 STORAGE="local-lvm"
 BRIDGE="vmbr0"
@@ -42,6 +58,7 @@ WORKER_IPS=("10.0.0.11" "10.0.0.12")
 for cmd in qm wget sshpass nc; do
   if ! command -v $cmd &>/dev/null; then
     err "缺少依赖: $cmd，请先安装！"
+    echo -e "\n[解决方法] 运行: apt update && apt install -y $cmd\n"
     exit 1
   fi
 done
@@ -58,7 +75,7 @@ wait_for_ssh() {
     ((try++))
     log "等待 $ip SSH可用... ($try/$max_try)"
   done
-  err "$ip SSH不可用，终止"
+  err "$ip SSH不可用，可能原因：\n- 虚拟机未获取到IP\n- cloud-init未生效或root密码未设置\n- 网络未通或防火墙阻断"
   exit 1
 }
 
@@ -75,15 +92,33 @@ wait_for_port() {
     ((try++))
     log "等待 $ip:$port 可用... ($try/$max_try)"
   done
-  err "$ip:$port 未开放，终止"
+  err "$ip:$port 未开放，可能原因：\n- KubeSphere服务未启动或安装失败\n- 网络/防火墙阻断\n- 资源不足导致服务未正常运行"
   exit 1
 }
 
-# 下载ISO
+# 下载ISO，多源重试
 log "检查Debian ISO..."
 if [ ! -f "$ISO_PATH" ]; then
-  log "下载Debian 12.2 ISO..."
-  wget -O "$ISO_PATH" "$ISO_URL" || { err "ISO下载失败"; exit 1; }
+  log "尝试多源下载最新Debian ISO: $ISO_FILE"
+  ISO_OK=0
+  for url in "${ISO_URLS[@]}"; do
+    log "尝试下载: $url"
+    if wget -O "$ISO_PATH" "$url"; then
+      ISO_OK=1
+      break
+    else
+      warn "下载失败: $url"
+    fi
+  done
+  if [ $ISO_OK -ne 1 ]; then
+    err "ISO下载多次失败，请检查网络或手动下载到 $ISO_PATH"
+    echo -e "\n[手动下载建议] 访问以下任一链接手动下载："
+    for url in "${ISO_URLS[@]}"; do
+      echo "  $url"
+    done
+    echo -e "\n下载完成后，将文件重命名为 $ISO_FILE 并放置到 $ISO_PATH\n"
+    exit 1
+  fi
 else
   log "ISO已存在: $ISO_PATH"
 fi
@@ -98,15 +133,21 @@ for idx in ${!VM_IDS[@]}; do
     warn "虚拟机 $id 已存在，跳过创建"
     continue
   fi
-  qm create $id \
+  if ! qm create $id \
     --name $name \
     --memory $VM_MEM \
     --cores $VM_CORES \
     --net0 virtio,bridge=$BRIDGE \
     --scsihw virtio-scsi-pci \
     --serial0 socket \
-    --agent 1 || { err "创建虚拟机 $id 失败"; exit 1; }
-  qm disk create $id $VM_DISK --storage $STORAGE --scsi0 || { err "创建磁盘失败 $id"; exit 1; }
+    --agent 1; then
+    err "创建虚拟机 $id 失败，请检查PVE资源和配置"
+    exit 1
+  fi
+  if ! qm disk create $id $VM_DISK --storage $STORAGE --scsi0; then
+    err "创建磁盘失败 $id，请检查存储空间"
+    exit 1
+  fi
   qm set $id --scsi0 $STORAGE:vm-$id-disk-0
   qm set $id --ide2 local:iso/$ISO_FILE,media=cdrom
   qm set $id --ide3 $STORAGE:cloudinit
@@ -125,7 +166,10 @@ for id in "${VM_IDS[@]}"; do
     warn "虚拟机 $id 已在运行，跳过"
   else
     log "启动虚拟机 $id ..."
-    qm start $id || { err "启动虚拟机 $id 失败"; exit 1; }
+    if ! qm start $id; then
+      err "启动虚拟机 $id 失败，请检查PVE资源和配置"
+      exit 1
+    fi
     sleep 5
   fi
 done
@@ -143,11 +187,12 @@ for idx in ${!VM_IDS[@]}; do
   name=${VM_NAMES[$idx]}
   ip=${VM_IPS[$idx]}
   log "初始化 $name ($ip) ..."
-  sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $CLOUDINIT_USER@$ip \
-    "hostnamectl set-hostname $name && \
-     apt-get update -y && \
-     apt-get install -y vim curl wget net-tools lsb-release sudo openssh-server && \
-     echo '初始化完成: $name'" || { err "$name 初始化失败"; exit 1; }
+  remote_cmd="hostnamectl set-hostname $name && apt-get update -y && apt-get install -y vim curl wget net-tools lsb-release sudo openssh-server && echo '初始化完成: $name'"
+  if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $CLOUDINIT_USER@$ip "$remote_cmd"; then
+    err "$name 初始化失败，命令: $remote_cmd"
+    echo "[建议] 检查网络、cloud-init、root密码、PVE模板配置等。"
+    exit 1
+  fi
   log "$name 初始化成功"
 done
 
@@ -158,21 +203,12 @@ log "\n开始K8S集群和KubeSphere自动部署..."
 log "[K8S] master节点初始化..."
 K8S_INIT_OK=0
 for try in {1..3}; do
-  sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "\
-    apt-get update -y && \
-    apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common && \
-    curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | apt-key add - && \
-    echo 'deb https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main' > /etc/apt/sources.list.d/kubernetes.list && \
-    apt-get update -y && \
-    apt-get install -y kubelet kubeadm kubectl && \
-    swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab && \
-    kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=$MASTER_IP --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem && \
-    mkdir -p /root/.kube && \
-    cp /etc/kubernetes/admin.conf /root/.kube/config && \
-    kubectl taint nodes --all node-role.kubernetes.io/control-plane- && \
-    kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml && \
-    echo 'K8S master初始化完成'" && K8S_INIT_OK=1 && break
-  warn "K8S master初始化失败，重试($try/3)"
+  remote_cmd="apt-get update -y && apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common && curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | apt-key add - && echo 'deb https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main' > /etc/apt/sources.list.d/kubernetes.list && apt-get update -y && apt-get install -y kubelet kubeadm kubectl && swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab && kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=$MASTER_IP --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem && mkdir -p /root/.kube && cp /etc/kubernetes/admin.conf /root/.kube/config && kubectl taint nodes --all node-role.kubernetes.io/control-plane- && kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml && echo 'K8S master初始化完成'"
+  if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "$remote_cmd"; then
+    K8S_INIT_OK=1
+    break
+  fi
+  warn "K8S master初始化失败，重试($try/3)，命令: $remote_cmd"
   sleep 20
 done
 [ $K8S_INIT_OK -eq 1 ] || { err "K8S master初始化最终失败"; exit 1; }
@@ -197,17 +233,12 @@ for ip in "${WORKER_IPS[@]}"; do
   log "[K8S] $ip 加入集群..."
   JOIN_OK=0
   for try in {1..3}; do
-    sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$ip "\
-      apt-get update -y && \
-      apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common && \
-      curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | apt-key add - && \
-      echo 'deb https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main' > /etc/apt/sources.list.d/kubernetes.list && \
-      apt-get update -y && \
-      apt-get install -y kubelet kubeadm kubectl && \
-      swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab && \
-      $JOIN_CMD --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem && \
-      echo 'K8S worker加入完成'" && JOIN_OK=1 && break
-    warn "$ip 加入集群失败，重试($try/3)"
+    remote_cmd="apt-get update -y && apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common && curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | apt-key add - && echo 'deb https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main' > /etc/apt/sources.list.d/kubernetes.list && apt-get update -y && apt-get install -y kubelet kubeadm kubectl && swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab && $JOIN_CMD --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem && echo 'K8S worker加入完成'"
+    if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$ip "$remote_cmd"; then
+      JOIN_OK=1
+      break
+    fi
+    warn "$ip 加入集群失败，重试($try/3)，命令: $remote_cmd"
     sleep 20
   done
   [ $JOIN_OK -eq 1 ] || { err "$ip 加入集群最终失败"; exit 1; }
@@ -215,13 +246,19 @@ done
 
 # 4. 检查K8S集群状态
 log "[K8S] 检查集群状态..."
-sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "kubectl get nodes -o wide && kubectl get pods -A"
+if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "kubectl get nodes -o wide && kubectl get pods -A"; then
+  err "K8S集群状态异常，请检查deploy.log和K8S安装日志"
+  exit 1
+fi
 
 # 5. 安装KubeSphere
 log "[KubeSphere] master节点安装KubeSphere..."
-sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "\
-  curl -sfL https://get-ks.ksops.io | sh && \
-  ./kk create cluster -f ./config-sample.yaml || ./kk create cluster"
+remote_cmd="curl -sfL https://get-ks.ksops.io | sh && ./kk create cluster -f ./config-sample.yaml || ./kk create cluster"
+if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "$remote_cmd"; then
+  err "KubeSphere安装失败，命令: $remote_cmd"
+  echo "[建议] 检查KubeSphere安装日志、PVE资源、网络等。"
+  exit 1
+fi
 
 # 6. 检查KubeSphere端口
 wait_for_port $MASTER_IP 30880
