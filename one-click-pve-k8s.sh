@@ -1236,10 +1236,6 @@ echo "[KubeSphere] 安装完成" | tee -a /root/kubesphere-install.log'
         return 1
     fi
     
-    # 等待KubeSphere服务启动（增加等待时间）
-    log "等待KubeSphere服务启动..."
-    log "注意：KubeSphere安装可能需要10-30分钟，请耐心等待..."
-    
     # 检查安装状态
     log "检查KubeSphere安装状态..."
     sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "
@@ -1267,6 +1263,63 @@ echo "[KubeSphere] 安装完成" | tee -a /root/kubesphere-install.log'
     log "默认用户名: admin"
     log "默认密码: P@88w0rd"
     
+    # 询问用户是否要等待安装完成
+    echo ""
+    read -p "是否要等待KubeSphere安装完成？(y/N): " wait_install
+    if [[ $wait_install =~ ^[Yy]$ ]]; then
+        log "等待KubeSphere安装完成..."
+        log "这可能需要10-30分钟，请耐心等待..."
+        
+        # 等待安装完成的循环
+        INSTALL_TIMEOUT=1800  # 30分钟超时
+        INSTALL_START=$(date +%s)
+        INSTALL_SUCCESS=false
+        
+        while [ $(($(date +%s) - INSTALL_START)) -lt $INSTALL_TIMEOUT ]; do
+            # 检查KubeSphere服务是否可用
+            if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "kubectl get svc -n kubesphere-system ks-console 2>/dev/null | grep -q NodePort"; then
+                log "KubeSphere控制台服务已创建"
+                if nc -z $MASTER_IP 30880 2>/dev/null; then
+                    log "KubeSphere控制台端口30880已开放"
+                    INSTALL_SUCCESS=true
+                    break
+                fi
+            fi
+            
+            # 显示安装进度
+            log "检查安装进度... ($(($(date +%s) - INSTALL_START))/1800秒)"
+            sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "
+                echo '=== 安装状态 ==='
+                kubectl get pod -n kubesphere-system 2>/dev/null | head -5 || echo 'kubesphere-system命名空间不存在'
+                echo ''
+                echo '=== 最新日志 ==='
+                INSTALLER_POD=\$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo '')
+                if [ -n \"\$INSTALLER_POD\" ]; then
+                    kubectl logs -n kubesphere-system \$INSTALLER_POD --tail=5 2>/dev/null || echo '无法获取安装日志'
+                fi
+            " || true
+            
+            sleep 60  # 每分钟检查一次
+        done
+        
+        if [ "$INSTALL_SUCCESS" = true ]; then
+            log "🎉 KubeSphere安装完成！"
+            log "KubeSphere控制台: http://$MASTER_IP:30880"
+            log "默认用户名: admin"
+            log "默认密码: P@88w0rd"
+        else
+            warn "KubeSphere安装超时，但安装可能仍在进行中"
+            log "请手动检查安装状态："
+            log "ssh root@$MASTER_IP"
+            log "kubectl get pod -n kubesphere-system"
+            log "kubectl logs -n kubesphere-system \$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath='{.items[0].metadata.name}') -f"
+        fi
+    else
+        log "KubeSphere安装命令已执行，请手动监控安装进度"
+    fi
+    
+    echo ""
+    read -p "按回车键返回主菜单..."
     return 0
 }
 
