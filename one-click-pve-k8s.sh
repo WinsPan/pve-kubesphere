@@ -671,11 +671,21 @@ deploy_k8s() {
             
             # 尝试SSH连接，增加详细输出
             log "尝试SSH连接到 $ip (用户: $CLOUDINIT_USER, 密码: $CLOUDINIT_PASS)"
-            if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o UserKnownHostsFile=/dev/null -v $CLOUDINIT_USER@$ip "echo 'SSH连接测试成功'" 2>&1 | tee /tmp/ssh_debug.log; then
-                SSH_OK=1
-                log "$name SSH连接成功"
-                break
+            if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=yes $CLOUDINIT_USER@$ip "echo 'SSH连接测试成功'" 2>&1 | tee /tmp/ssh_debug.log; then
+                # 检查是否真的连接成功（没有Permission denied等错误）
+                if grep -q "Permission denied\|Authentication failed" /tmp/ssh_debug.log; then
+                    warn "SSH连接失败：认证失败"
+                    SSH_OK=0
+                else
+                    SSH_OK=1
+                    log "$name SSH连接成功"
+                    break
+                fi
             else
+                SSH_OK=0
+            fi
+            
+            if [ $SSH_OK -eq 0 ]; then
                 warn "SSH连接失败，可能原因："
                 warn "  - cloud-init未生效，root密码未设置"
                 warn "  - 密码不正确"
@@ -685,7 +695,7 @@ deploy_k8s() {
                 # 显示SSH调试信息
                 if [ -f /tmp/ssh_debug.log ]; then
                     log "SSH调试信息:"
-                    tail -5 /tmp/ssh_debug.log | sed 's/^/    /'
+                    tail -10 /tmp/ssh_debug.log | sed 's/^/    /'
                 fi
                 
                 if [ $ssh_try -lt 10 ]; then
@@ -716,10 +726,13 @@ deploy_k8s() {
             # 再次尝试SSH连接
             log "重新尝试SSH连接..."
             for retry in {1..5}; do
-                if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "echo 'SSH连接测试成功'" 2>/dev/null; then
-                    SSH_OK=1
-                    log "$name SSH连接成功（重置后）"
-                    break
+                if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=yes $CLOUDINIT_USER@$ip "echo 'SSH连接测试成功'" 2>&1 | tee /tmp/ssh_retry.log; then
+                    # 检查是否真的连接成功
+                    if ! grep -q "Permission denied\|Authentication failed" /tmp/ssh_retry.log; then
+                        SSH_OK=1
+                        log "$name SSH连接成功（重置后）"
+                        break
+                    fi
                 fi
                 warn "重置后SSH连接仍然失败，重试 $retry/5"
                 sleep 10
