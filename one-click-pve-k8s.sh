@@ -876,18 +876,22 @@ deploy_k8s() {
         ssh-keygen -R "$ip" 2>/dev/null
         remote_cmd='set -e
 '\
-'echo "[K8S] 步骤0: 安装containerd并设置内核参数..." | tee -a /root/k8s-init.log
+'echo "[K8S] 步骤0: 加载br_netfilter并设置内核参数..." | tee -a /root/k8s-init.log
+modprobe br_netfilter
+ echo "br_netfilter" > /etc/modules-load.d/br_netfilter.conf
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+sysctl --system 2>&1 | tee -a /root/k8s-init.log
+'\
+'echo "[K8S] 步骤0.5: 安装containerd..." | tee -a /root/k8s-init.log
 apt-get update 2>&1 | tee -a /root/k8s-init.log
 apt-get install -y containerd 2>&1 | tee -a /root/k8s-init.log
 mkdir -p /etc/containerd
 containerd config default > /etc/containerd/config.toml
 systemctl restart containerd
 systemctl enable containerd
-cat <<EOF | tee /etc/sysctl.d/k8s.conf
-net.bridge.bridge-nf-call-iptables = 1
-net.ipv4.ip_forward = 1
-EOF
-sysctl --system 2>&1 | tee -a /root/k8s-init.log
 '\
 'echo "[K8S] 步骤1: apt-get update..." | tee -a /root/k8s-init.log
 apt-get update -y 2>&1 | tee -a /root/k8s-init.log
