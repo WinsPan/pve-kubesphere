@@ -874,27 +874,20 @@ deploy_k8s() {
         
         # 执行初始化命令
         ssh-keygen -R "$ip" 2>/dev/null
-        remote_cmd="hostnamectl set-hostname $name && apt-get update -y && apt-get install -y vim curl wget net-tools lsb-release sudo openssh-server && echo '初始化完成: $name'"
-        log "执行初始化命令: $remote_cmd"
-        if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "$remote_cmd" 2>/dev/null; then
-            err "$name 初始化失败，命令: $remote_cmd"
-            echo "[建议] 检查网络、cloud-init、root密码、PVE模板配置等。"
-            return 1
-        fi
-        log "$name 初始化成功"
-    done
-
-    log "所有虚拟机初始化完成，开始K8S部署..."
-
-    # K8S集群部署
-    log "\n开始K8S集群部署..."
-
-    # 1. master节点初始化K8S（分步详细日志）
-    ssh-keygen -R "$MASTER_IP" 2>/dev/null
-    for try in {1..3}; do
-        ssh-keygen -R "$MASTER_IP" 2>/dev/null
-        log "K8S master初始化尝试 $try/3..."
         remote_cmd='set -e
+'\
+'echo "[K8S] 步骤0: 安装containerd并设置内核参数..." | tee -a /root/k8s-init.log
+apt-get update 2>&1 | tee -a /root/k8s-init.log
+apt-get install -y containerd 2>&1 | tee -a /root/k8s-init.log
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+systemctl restart containerd
+systemctl enable containerd
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+sysctl --system 2>&1 | tee -a /root/k8s-init.log
 '\
 'echo "[K8S] 步骤1: apt-get update..." | tee -a /root/k8s-init.log
 apt-get update -y 2>&1 | tee -a /root/k8s-init.log
@@ -923,6 +916,9 @@ cp /etc/kubernetes/admin.conf /root/.kube/config
 '\
 'echo "[K8S] 步骤8: 去除master污点..." | tee -a /root/k8s-init.log
 kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>&1 | tee -a /root/k8s-init.log
+'\
+'echo "[K8S] 步骤9: 安装Calico网络..." | tee -a /root/k8s-init.log
+kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml 2>&1 | tee -a /root/k8s-init.log
 '\
 'echo "[K8S] master初始化完成" | tee -a /root/k8s-init.log
 '
