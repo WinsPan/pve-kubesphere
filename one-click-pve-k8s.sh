@@ -128,7 +128,7 @@ diagnose_system() {
                 
                 # 获取系统信息
                 echo "  系统信息："
-                sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$ip "hostname && cat /etc/os-release | grep PRETTY_NAME && uname -a" 2>/dev/null || echo "    无法获取系统信息"
+                sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOINIT_USER@$ip "hostname && cat /etc/os-release | grep PRETTY_NAME && uname -a" 2>/dev/null || echo "    无法获取系统信息"
             else
                 err "  SSH连接失败"
             fi
@@ -248,12 +248,10 @@ create_and_start_vms() {
 #cloud-config
 disable_root: false
 ssh_pwauth: true
-ssh_enable: true
 users:
   - name: root
     lock_passwd: false
     shell: /bin/bash
-    hashed_passwd: $(openssl passwd -6 -salt xyz $CLOUDINIT_PASS)
 chpasswd:
   expire: false
   list: |
@@ -264,11 +262,36 @@ packages:
   - curl
   - wget
   - net-tools
+bootcmd:
+  - echo "DEBUG: cloud-init starting..." > /root/debug.log
 runcmd:
   - systemctl enable ssh
   - systemctl start ssh
   - echo "root:$CLOUDINIT_PASS" | chpasswd
-  - echo "Cloud-init配置完成"
+  - cloud-init status --long >> /root/debug.log
+  - journalctl -u cloud-init >> /root/debug.log
+  - systemctl status ssh >> /root/debug.log
+  - ip a >> /root/debug.log
+  - echo "Cloud-init配置完成" >> /root/debug.log
+EOF
+
+    # 同时创建一个简化版本作为备用
+    cat > "/var/lib/vz/snippets/debian-simple.yaml" <<EOF
+#cloud-config
+disable_root: false
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  list: |
+    root:$CLOUDINIT_PASS
+bootcmd:
+  - echo "DEBUG: simple cloud-init starting..." > /root/debug.log
+runcmd:
+  - systemctl enable ssh
+  - systemctl start ssh
+  - echo "root:$CLOUDINIT_PASS" | chpasswd
+  - cloud-init status --long >> /root/debug.log
+  - echo "Simple cloud-init配置完成" >> /root/debug.log
 EOF
 
     log "Cloud-init配置文件内容:"
@@ -358,12 +381,10 @@ fix_existing_vms() {
 #cloud-config
 disable_root: false
 ssh_pwauth: true
-ssh_enable: true
 users:
   - name: root
     lock_passwd: false
     shell: /bin/bash
-    hashed_passwd: $(openssl passwd -6 -salt xyz $CLOUDINIT_PASS)
 chpasswd:
   expire: false
   list: |
@@ -374,11 +395,17 @@ packages:
   - curl
   - wget
   - net-tools
+bootcmd:
+  - echo "DEBUG: cloud-init starting..." > /root/debug.log
 runcmd:
   - systemctl enable ssh
   - systemctl start ssh
   - echo "root:$CLOUDINIT_PASS" | chpasswd
-  - echo "Cloud-init配置完成"
+  - cloud-init status --long >> /root/debug.log
+  - journalctl -u cloud-init >> /root/debug.log
+  - systemctl status ssh >> /root/debug.log
+  - ip a >> /root/debug.log
+  - echo "Cloud-init配置完成" >> /root/debug.log
 EOF
 
     log "Cloud-init配置文件内容:"
@@ -404,6 +431,96 @@ EOF
             log "虚拟机 $id 配置已修正"
         fi
     done
+}
+
+# 诊断单个虚拟机的cloud-init状态
+diagnose_vm_cloudinit() {
+    local vm_id=$1
+    local vm_name=$2
+    local vm_ip=$3
+    
+    log "诊断虚拟机 $vm_name (ID: $vm_id, IP: $vm_ip) 的cloud-init状态..."
+    
+    echo ""
+    echo "${CYAN}=== 虚拟机 $vm_name 诊断信息 ===${NC}"
+    
+    # 检查虚拟机状态
+    if qm list | grep -q " $vm_id "; then
+        status=$(qm list | awk -v id="$vm_id" '$1==id{print $3}')
+        echo "虚拟机状态: $status"
+        
+        if [ "$status" = "running" ]; then
+            echo ""
+            echo "${YELLOW}请手动执行以下诊断命令：${NC}"
+            echo "1. 进入虚拟机控制台:"
+            echo "   qm terminal $vm_id"
+            echo ""
+            echo "2. 在虚拟机内执行以下命令："
+            echo "   # 检查cloud-init状态"
+            echo "   cloud-init status --long"
+            echo ""
+            echo "   # 检查SSH服务状态"
+            echo "   systemctl status ssh"
+            echo ""
+            echo "   # 检查网络配置"
+            echo "   ip a"
+            echo ""
+            echo "   # 检查debug日志"
+            echo "   cat /root/debug.log"
+            echo ""
+            echo "   # 尝试root登录"
+            echo "   su - root"
+            echo "   密码: $CLOUDINIT_PASS"
+            echo ""
+            echo "   # 检查cloud-init日志"
+            echo "   journalctl -u cloud-init"
+            echo ""
+            echo "   # 检查SSH配置"
+            echo "   cat /etc/ssh/sshd_config | grep -E '(PasswordAuthentication|PermitRootLogin)'"
+            echo ""
+            echo "   # 测试网络连通性"
+            echo "   ping -c 3 $GATEWAY"
+            echo ""
+        else
+            echo "虚拟机未运行，请先启动: qm start $vm_id"
+        fi
+    else
+        echo "虚拟机不存在"
+    fi
+    
+    echo ""
+    echo "${CYAN}=== 网络连通性测试 ===${NC}"
+    if ping -c 1 -W 2 $vm_ip &>/dev/null; then
+        echo "✓ Ping $vm_ip 成功"
+        if nc -z $vm_ip 22 &>/dev/null; then
+            echo "✓ SSH端口22开放"
+        else
+            echo "✗ SSH端口22未开放"
+        fi
+    else
+        echo "✗ Ping $vm_ip 失败"
+    fi
+    
+    echo ""
+    echo "${CYAN}=== Cloud-init配置检查 ===${NC}"
+    qm config $vm_id | grep -E "(ciuser|cipassword|ipconfig|cicustom)" | sed 's/^/  /'
+    
+    echo ""
+    echo "${CYAN}=== 建议的解决步骤 ===${NC}"
+    echo "1. 如果cloud-init未生效，尝试重置："
+    echo "   qm stop $vm_id"
+    echo "   qm set $vm_id --ciuser root --cipassword $CLOUDINIT_PASS"
+    echo "   qm start $vm_id"
+    echo ""
+    echo "2. 如果SSH服务未启动，手动启动："
+    echo "   qm terminal $vm_id"
+    echo "   systemctl enable ssh"
+    echo "   systemctl start ssh"
+    echo ""
+    echo "3. 如果密码不正确，手动重置："
+    echo "   qm terminal $vm_id"
+    echo "   echo 'root:$CLOUDINIT_PASS' | chpasswd"
+    echo ""
 }
 
 # 诊断cloud-init配置
@@ -482,6 +599,7 @@ show_menu() {
     echo -e "${YELLOW}7.${NC} 清理所有资源"
     echo -e "${YELLOW}8.${NC} 一键全自动部署"
     echo -e "${YELLOW}9.${NC} 诊断Cloud-init配置"
+    echo -e "${YELLOW}10.${NC} 诊断单个虚拟机"
     echo -e "${YELLOW}0.${NC} 退出"
     echo -e "${CYAN}================================${NC}"
 }
@@ -690,21 +808,70 @@ deploy_k8s() {
             fi
             
             if [ $SSH_OK -eq 0 ]; then
-                warn "SSH连接失败，可能原因："
-                warn "  - cloud-init未生效，root密码未设置"
-                warn "  - 密码不正确"
-                warn "  - SSH服务未完全启动"
-                warn "  - 网络配置问题"
+                err "$name SSH连接最终失败，尝试诊断cloud-init状态..."
                 
-                # 显示SSH调试信息
-                if [ -f /tmp/ssh_debug.log ]; then
-                    log "SSH调试信息:"
-                    tail -10 /tmp/ssh_debug.log | sed 's/^/    /'
-                fi
+                # 尝试通过qm terminal诊断
+                log "通过qm terminal诊断虚拟机状态..."
+                log "请手动执行以下命令诊断："
+                log "qm terminal ${VM_IDS[$idx]}"
+                log "然后在虚拟机内执行："
+                log "  - 检查cloud-init状态: cloud-init status --long"
+                log "  - 检查SSH服务: systemctl status ssh"
+                log "  - 检查网络: ip a"
+                log "  - 检查debug日志: cat /root/debug.log"
+                log "  - 尝试登录: su - root (密码: $CLOUDINIT_PASS)"
                 
-                if [ $ssh_try -lt 10 ]; then
-                    log "等待15秒后重试..."
+                # 尝试使用简化配置
+                log "停止虚拟机 ${VM_IDS[$idx]}..."
+                qm stop ${VM_IDS[$idx]} 2>/dev/null || true
+                sleep 5
+                
+                log "切换到简化cloud-init配置..."
+                qm set ${VM_IDS[$idx]} --ciuser root --cipassword $CLOUDINIT_PASS
+                qm set ${VM_IDS[$idx]} --ipconfig0 ip=$ip/24,gw=$GATEWAY
+                qm set ${VM_IDS[$idx]} --nameserver "$DNS"
+                qm set ${VM_IDS[$idx]} --cicustom "user=local:snippets/debian-simple.yaml"
+                
+                log "重新启动虚拟机 ${VM_IDS[$idx]}..."
+                qm start ${VM_IDS[$idx]}
+                sleep 45  # 给更多时间让cloud-init生效
+                
+                # 再次尝试SSH连接
+                log "重新尝试SSH连接（简化配置）..."
+                for retry in {1..5}; do
+                    if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=yes $CLOUDINIT_USER@$ip "echo 'SSH连接测试成功'" 2>&1 | tee /tmp/ssh_simple.log; then
+                        if ! grep -q "Permission denied\|Authentication failed" /tmp/ssh_simple.log; then
+                            SSH_OK=1
+                            log "$name SSH连接成功（简化配置）"
+                            break
+                        fi
+                    fi
+                    warn "简化配置后SSH连接仍然失败，重试 $retry/5"
                     sleep 15
+                done
+                
+                if [ $SSH_OK -eq 0 ]; then
+                    err "$name SSH连接最终失败，请检查："
+                    err "  1. 虚拟机是否正常启动: qm status ${VM_IDS[$idx]}"
+                    err "  2. cloud-init是否生效: qm config ${VM_IDS[$idx]} | grep cicustom"
+                    err "  3. 网络是否连通: ping $ip"
+                    err "  4. SSH端口是否开放: nc -z $ip 22"
+                    err "  5. 尝试手动SSH: sshpass -p '$CLOUDINIT_PASS' ssh root@$ip"
+                    err ""
+                    err "手动诊断步骤："
+                    err "  1. 进入虚拟机: qm terminal ${VM_IDS[$idx]}"
+                    err "  2. 检查cloud-init: cloud-init status --long"
+                    err "  3. 检查SSH服务: systemctl status ssh"
+                    err "  4. 检查网络: ip a"
+                    err "  5. 查看debug日志: cat /root/debug.log"
+                    err "  6. 尝试root登录: su - root (密码: $CLOUDINIT_PASS)"
+                    err ""
+                    err "如果问题持续，可以尝试手动重置密码："
+                    err "  1. 停止虚拟机: qm stop ${VM_IDS[$idx]}"
+                    err "  2. 重置cloud-init: qm set ${VM_IDS[$idx]} --ciuser root --cipassword $CLOUDINIT_PASS"
+                    err "  3. 启动虚拟机: qm start ${VM_IDS[$idx]}"
+                    err "  4. 等待2-3分钟后重试SSH连接"
+                    return 1
                 fi
             fi
         done
@@ -716,6 +883,14 @@ deploy_k8s() {
             err "  3. 网络是否连通: ping $ip"
             err "  4. SSH端口是否开放: nc -z $ip 22"
             err "  5. 尝试手动SSH: sshpass -p '$CLOUDINIT_PASS' ssh root@$ip"
+            err ""
+            err "手动诊断步骤："
+            err "  1. 进入虚拟机: qm terminal ${VM_IDS[$idx]}"
+            err "  2. 检查cloud-init: cloud-init status --long"
+            err "  3. 检查SSH服务: systemctl status ssh"
+            err "  4. 检查网络: ip a"
+            err "  5. 查看debug日志: cat /root/debug.log"
+            err "  6. 尝试root登录: su - root (密码: $CLOUDINIT_PASS)"
             err ""
             err "如果问题持续，可以尝试手动重置密码："
             err "  1. 停止虚拟机: qm stop ${VM_IDS[$idx]}"
@@ -955,7 +1130,7 @@ main() {
     if [ -z "$1" ]; then
         while true; do
             show_menu
-            read -p "请选择操作 [0-9]: " choice
+            read -p "请选择操作 [0-10]: " choice
             case $choice in
                 1) diagnose_pve ;;
                 2) download_cloud_image ;;
@@ -966,6 +1141,24 @@ main() {
                 7) cleanup_all ;;
                 8) auto_deploy_all ;;
                 9) diagnose_cloudinit ;;
+                10) 
+                     echo ""
+                     echo "选择要诊断的虚拟机："
+                     for idx in ${!VM_IDS[@]}; do
+                         echo "  $((idx+1)). ${VM_NAMES[$idx]} (ID: ${VM_IDS[$idx]}, IP: ${VM_IPS[$idx]})"
+                     done
+                     echo ""
+                     read -p "请选择虚拟机 [1-${#VM_IDS[@]}]: " vm_choice
+                     if [[ $vm_choice =~ ^[0-9]+$ ]] && [ $vm_choice -ge 1 ] && [ $vm_choice -le ${#VM_IDS[@]} ]; then
+                         idx=$((vm_choice-1))
+                         diagnose_vm_cloudinit ${VM_IDS[$idx]} ${VM_NAMES[$idx]} ${VM_IPS[$idx]}
+                         echo ""
+                         read -p "按回车键继续..."
+                     else
+                         echo "无效选择"
+                         sleep 2
+                     fi
+                     ;;
                 0) log "退出程序"; exit 0 ;;
                 *) echo -e "${RED}无效选择，请重新输入${NC}"; sleep 2 ;;
             esac
@@ -985,6 +1178,7 @@ main() {
         echo "  7. 清理所有资源"
         echo "  8. 一键全自动部署"
         echo "  9. 诊断Cloud-init配置"
+        echo "  10. 诊断单个虚拟机"
         exit 1
     fi
 }
