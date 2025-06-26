@@ -887,21 +887,54 @@ deploy_k8s() {
     # K8S集群部署
     log "\n开始K8S集群部署..."
 
-    # 1. master节点初始化K8S（重试3次）
-    log "[K8S] master节点初始化..."
+    # 1. master节点初始化K8S（分步详细日志）
+    log "[K8S] master节点初始化(详细日志)..."
     K8S_INIT_OK=0
     for try in {1..3}; do
         log "K8S master初始化尝试 $try/3..."
-        remote_cmd="apt-get update -y && apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common && curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/kubernetes-archive-keyring.gpg && echo 'deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main' > /etc/apt/sources.list.d/kubernetes.list && apt-get update -y && apt-get install -y kubelet kubeadm kubectl && swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab && kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=$MASTER_IP --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem && mkdir -p /root/.kube && cp /etc/kubernetes/admin.conf /root/.kube/config && kubectl taint nodes --all node-role.kubernetes.io/control-plane- && kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml && echo 'K8S master初始化完成'"
-        if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "$remote_cmd" 2>/dev/null; then
-            K8S_INIT_OK=1
-            log "K8S master初始化成功"
-            break
-        fi
-        warn "K8S master初始化失败，重试($try/3)"
-        sleep 30
-    done
-    [ $K8S_INIT_OK -eq 1 ] || { err "K8S master初始化最终失败"; return 1; }
+        remote_cmd='set -e
+'\
+'echo "[K8S] 步骤1: apt-get update..." | tee -a /root/k8s-init.log
+apt-get update -y 2>&1 | tee -a /root/k8s-init.log
+'\
+'echo "[K8S] 步骤2: 安装依赖..." | tee -a /root/k8s-init.log
+apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common 2>&1 | tee -a /root/k8s-init.log
+'\
+'echo "[K8S] 步骤3: 添加K8S源..." | tee -a /root/k8s-init.log
+curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/kubernetes-archive-keyring.gpg 2>&1 | tee -a /root/k8s-init.log
+echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+apt-get update -y 2>&1 | tee -a /root/k8s-init.log
+'\
+'echo "[K8S] 步骤4: 安装K8S组件..." | tee -a /root/k8s-init.log
+apt-get install -y kubelet kubeadm kubectl 2>&1 | tee -a /root/k8s-init.log
+'\
+'echo "[K8S] 步骤5: 关闭swap..." | tee -a /root/k8s-init.log
+swapoff -a 2>&1 | tee -a /root/k8s-init.log
+sed -i "/ swap / s/^/#/" /etc/fstab
+'\
+'echo "[K8S] 步骤6: kubeadm init..." | tee -a /root/k8s-init.log
+kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=$MASTER_IP --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem 2>&1 | tee -a /root/k8s-init.log
+'\
+'echo "[K8S] 步骤7: 配置kubectl..." | tee -a /root/k8s-init.log
+mkdir -p /root/.kube
+cp /etc/kubernetes/admin.conf /root/.kube/config
+'\
+'echo "[K8S] 步骤8: 去除master污点..." | tee -a /root/k8s-init.log
+kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>&1 | tee -a /root/k8s-init.log
+'\
+'echo "[K8S] master初始化完成" | tee -a /root/k8s-init.log
+'
+            if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "bash -c '$remote_cmd'"; then
+                K8S_INIT_OK=1
+                log "K8S master初始化成功"
+                break
+            fi
+            warn "K8S master初始化失败，重试($try/3)"
+            log "[K8S] 收集诊断日志..."
+            sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "tail -n 50 /root/k8s-init.log || true; tail -n 50 /var/log/syslog || true; journalctl -xe --no-pager | tail -n 50 || true; dmesg | tail -n 30 || true" || true
+            sleep 30
+        done
+        [ $K8S_INIT_OK -eq 1 ] || { err "K8S master初始化最终失败，请查看 /root/k8s-init.log 及上方诊断信息"; return 1; }
 
     # 2. 获取join命令（重试）
     log "获取K8S join命令..."
