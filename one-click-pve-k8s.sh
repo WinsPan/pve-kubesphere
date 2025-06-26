@@ -1124,9 +1124,144 @@ deploy_kubesphere() {
     fi
     # 安装KubeSphere最新版
     log "在master节点安装KubeSphere（最新版）..."
-    remote_cmd='cd /root || cd ~
-curl -sfL https://get-kk.kubesphere.io | VERSION=latest sh -
-./kk create cluster -f config-sample.yaml || ./kk create cluster'
+    remote_cmd='set -e
+cd /root || cd ~
+echo "[KubeSphere] 开始安装KubeSphere..." | tee -a /root/kubesphere-install.log
+
+# 方法1: 尝试手动下载kubekey
+echo "[KubeSphere] 方法1: 手动下载kubekey..." | tee -a /root/kubesphere-install.log
+mkdir -p /root/kubekey
+cd /root/kubekey
+
+# 尝试多个下载源
+KUBEKEY_DOWNLOADED=0
+
+# 尝试从GitHub下载最新版本
+echo "[KubeSphere] 尝试从GitHub下载kubekey..." | tee -a /root/kubesphere-install.log
+if curl -L -o kubekey.tar.gz "https://github.com/kubesphere/kubekey/releases/latest/download/kubekey-linux-amd64.tar.gz" 2>/dev/null; then
+    tar -xzf kubekey.tar.gz
+    chmod +x kubekey
+    KUBEKEY_DOWNLOADED=1
+    echo "[KubeSphere] 从GitHub下载成功" | tee -a /root/kubesphere-install.log
+fi
+
+# 如果GitHub下载失败，尝试指定版本
+if [ $KUBEKEY_DOWNLOADED -eq 0 ]; then
+    echo "[KubeSphere] 尝试下载指定版本v3.0.13..." | tee -a /root/kubesphere-install.log
+    if curl -L -o kubekey.tar.gz "https://github.com/kubesphere/kubekey/releases/download/v3.0.13/kubekey-linux-amd64.tar.gz" 2>/dev/null; then
+        tar -xzf kubekey.tar.gz
+        chmod +x kubekey
+        KUBEKEY_DOWNLOADED=1
+        echo "[KubeSphere] 指定版本下载成功" | tee -a /root/kubesphere-install.log
+    fi
+fi
+
+# 如果还是失败，尝试使用官方安装脚本
+if [ $KUBEKEY_DOWNLOADED -eq 0 ]; then
+    echo "[KubeSphere] 尝试使用官方安装脚本..." | tee -a /root/kubesphere-install.log
+    if curl -sfL https://get-kk.kubesphere.io | VERSION=v3.0.13 sh -; then
+        KUBEKEY_DOWNLOADED=1
+        echo "[KubeSphere] 官方脚本安装成功" | tee -a /root/kubesphere-install.log
+    fi
+fi
+
+# 如果所有方法都失败，尝试使用kubectl直接安装
+if [ $KUBEKEY_DOWNLOADED -eq 0 ]; then
+    echo "[KubeSphere] 所有kubekey下载方法失败，尝试使用kubectl直接安装..." | tee -a /root/kubesphere-install.log
+    
+    # 安装KubeSphere Core
+    kubectl apply -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml
+    kubectl apply -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml
+    
+    echo "[KubeSphere] kubectl安装命令已执行，等待安装完成..." | tee -a /root/kubesphere-install.log
+    echo "[KubeSphere] 可以通过以下命令查看安装进度:" | tee -a /root/kubesphere-install.log
+    echo "kubectl logs -n kubesphere-system $(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath="{.items[0].metadata.name}") -f" | tee -a /root/kubesphere-install.log
+    
+    # 等待一段时间让安装开始
+    sleep 30
+    
+    # 检查安装状态
+    kubectl get pod -n kubesphere-system 2>/dev/null || echo "kubesphere-system命名空间不存在，安装可能还在进行中"
+    
+    echo "[KubeSphere] 安装命令已执行，请等待安装完成" | tee -a /root/kubesphere-install.log
+    echo "[KubeSphere] 安装完成后，可以通过以下地址访问:" | tee -a /root/kubesphere-install.log
+    echo "http://$MASTER_IP:30880" | tee -a /root/kubesphere-install.log
+    echo "用户名: admin" | tee -a /root/kubesphere-install.log
+    echo "密码: P@88w0rd" | tee -a /root/kubesphere-install.log
+    
+    return 0
+fi
+
+# 如果kubekey下载成功，使用kubekey安装
+if [ $KUBEKEY_DOWNLOADED -eq 1 ]; then
+    echo "[KubeSphere] 使用kubekey安装KubeSphere..." | tee -a /root/kubesphere-install.log
+    
+    # 创建配置文件
+    cat > config-sample.yaml << EOF
+apiVersion: kubekey.kubesphere.io/v1alpha2
+kind: Cluster
+metadata:
+  name: sample
+spec:
+  hosts:
+  - {name: master, address: $MASTER_IP, internalAddress: $MASTER_IP, user: root, password: $CLOUDINIT_PASS}
+  - {name: worker1, address: ${WORKER_IPS[0]}, internalAddress: ${WORKER_IPS[0]}, user: root, password: $CLOUDINIT_PASS}
+  - {name: worker2, address: ${WORKER_IPS[1]}, internalAddress: ${WORKER_IPS[1]}, user: root, password: $CLOUDINIT_PASS}
+  roleGroups:
+    etcd:
+    - master
+    control-plane:
+    - master
+    worker:
+    - worker1
+    - worker2
+  controlPlaneEndpoint:
+    domain: lb.kubesphere.local
+    address: $MASTER_IP
+    port: 6443
+  kubernetes:
+    version: v1.28.2
+    clusterName: cluster.local
+    autoRenewCerts: true
+    containerManager: containerd
+  network:
+    plugin: calico
+    kubePodsCIDR: 10.233.64.0/18
+    kubeServiceCIDR: 10.233.0.0/18
+    multusCNI:
+      enabled: false
+  storage:
+    defaultStorageClass: openebs-hostpath
+    openebs:
+      basePath: /var/openebs/local
+  addons:
+  - name: metrics-server
+    enabled: true
+  - name: kubesphere
+    enabled: true
+    namespace: kubesphere-system
+    version: v3.4.1
+EOF
+
+    echo "[KubeSphere] 配置文件已创建，开始安装..." | tee -a /root/kubesphere-install.log
+    
+    # 执行安装
+    if ./kubekey create cluster -f config-sample.yaml; then
+        echo "[KubeSphere] kubekey安装成功" | tee -a /root/kubesphere-install.log
+    else
+        echo "[KubeSphere] kubekey安装失败，尝试简化安装..." | tee -a /root/kubesphere-install.log
+        # 尝试简化安装
+        if ./kubekey create cluster; then
+            echo "[KubeSphere] kubekey简化安装成功" | tee -a /root/kubesphere-install.log
+        else
+            echo "[KubeSphere] kubekey安装失败" | tee -a /root/kubesphere-install.log
+            return 1
+        fi
+    fi
+fi
+
+echo "[KubeSphere] 安装完成" | tee -a /root/kubesphere-install.log'
+    
     if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "$remote_cmd" 2>/dev/null; then
         err "KubeSphere安装失败，命令: $remote_cmd"
         echo "[建议] 检查KubeSphere安装日志、PVE资源、网络等。"
