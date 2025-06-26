@@ -238,19 +238,39 @@ download_cloud_image() {
 create_and_start_vms() {
     log "开始创建并启动虚拟机..."
     
-    # 保证cloud-init自定义配置存在
+    # 确保cloud-init自定义配置存在
     log "确保cloud-init自定义配置存在..."
     mkdir -p /var/lib/vz/snippets
     CLOUDINIT_CUSTOM_USERCFG="/var/lib/vz/snippets/debian-root.yaml"
+    
+    # 创建更完整的cloud-init配置
     cat > "$CLOUDINIT_CUSTOM_USERCFG" <<EOF
 #cloud-config
 disable_root: false
 ssh_pwauth: true
+ssh_enable: true
+users:
+  - name: root
+    lock_passwd: false
+    shell: /bin/bash
 chpasswd:
   expire: false
   list: |
     root:$CLOUDINIT_PASS
+ssh_authorized_keys: []
+packages:
+  - openssh-server
+  - curl
+  - wget
+  - net-tools
+runcmd:
+  - systemctl enable ssh
+  - systemctl start ssh
+  - echo "Cloud-init配置完成"
 EOF
+
+    log "Cloud-init配置文件内容:"
+    cat "$CLOUDINIT_CUSTOM_USERCFG"
 
     # 创建虚拟机（使用cloud镜像）
     for idx in ${!VM_IDS[@]}; do
@@ -330,16 +350,36 @@ fix_existing_vms() {
     log "确保cloud-init自定义配置存在..."
     mkdir -p /var/lib/vz/snippets
     CLOUDINIT_CUSTOM_USERCFG="/var/lib/vz/snippets/debian-root.yaml"
+    
+    # 创建更完整的cloud-init配置
     cat > "$CLOUDINIT_CUSTOM_USERCFG" <<EOF
 #cloud-config
 disable_root: false
 ssh_pwauth: true
+ssh_enable: true
+users:
+  - name: root
+    lock_passwd: false
+    shell: /bin/bash
 chpasswd:
   expire: false
   list: |
     root:$CLOUDINIT_PASS
+ssh_authorized_keys: []
+packages:
+  - openssh-server
+  - curl
+  - wget
+  - net-tools
+runcmd:
+  - systemctl enable ssh
+  - systemctl start ssh
+  - echo "Cloud-init配置完成"
 EOF
-    
+
+    log "Cloud-init配置文件内容:"
+    cat "$CLOUDINIT_CUSTOM_USERCFG"
+
     for idx in ${!VM_IDS[@]}; do
         id=${VM_IDS[$idx]}
         name=${VM_NAMES[$idx]}
@@ -362,6 +402,67 @@ EOF
     done
 }
 
+# 诊断cloud-init配置
+diagnose_cloudinit() {
+    log "诊断cloud-init配置..."
+    
+    echo ""
+    echo "${CYAN}=== Cloud-init配置诊断 ===${NC}"
+    
+    # 检查配置文件
+    if [ -f "$CLOUDINIT_CUSTOM_USERCFG" ]; then
+        echo "✓ Cloud-init配置文件存在: $CLOUDINIT_CUSTOM_USERCFG"
+        echo "配置文件内容:"
+        cat "$CLOUDINIT_CUSTOM_USERCFG"
+    else
+        echo "✗ Cloud-init配置文件不存在: $CLOUDINIT_CUSTOM_USERCFG"
+        echo "建议运行选项4: 修正已存在虚拟机配置"
+    fi
+    
+    echo ""
+    echo "${CYAN}=== 虚拟机状态检查 ===${NC}"
+    for idx in ${!VM_IDS[@]}; do
+        id=${VM_IDS[$idx]}
+        name=${VM_NAMES[$idx]}
+        ip=${VM_IPS[$idx]}
+        
+        echo "虚拟机 $name (ID: $id, IP: $ip):"
+        
+        # 检查虚拟机状态
+        if qm list | grep -q " $id "; then
+            status=$(qm list | awk -v id="$id" '$1==id{print $3}')
+            echo "  状态: $status"
+            
+            # 检查cloud-init配置
+            echo "  Cloud-init配置:"
+            qm config $id | grep -E "(ciuser|cipassword|ipconfig|cicustom)" | sed 's/^/    /'
+            
+            # 检查网络连通性
+            if ping -c 1 -W 2 $ip &>/dev/null; then
+                echo "  网络: ✓ 可达"
+                if nc -z $ip 22 &>/dev/null; then
+                    echo "  SSH: ✓ 端口开放"
+                else
+                    echo "  SSH: ✗ 端口未开放"
+                fi
+            else
+                echo "  网络: ✗ 不可达"
+            fi
+        else
+            echo "  ✗ 虚拟机不存在"
+        fi
+        echo ""
+    done
+    
+    echo "${CYAN}=== 手动测试SSH连接 ===${NC}"
+    echo "如果SSH连接失败，请手动测试："
+    for idx in ${!VM_IDS[@]}; do
+        ip=${VM_IPS[$idx]}
+        echo "sshpass -p '$CLOUDINIT_PASS' ssh -o StrictHostKeyChecking=no root@$ip"
+    done
+    echo ""
+}
+
 # 主菜单
 show_menu() {
     clear
@@ -376,6 +477,7 @@ show_menu() {
     echo -e "${YELLOW}6.${NC} 部署KubeSphere"
     echo -e "${YELLOW}7.${NC} 清理所有资源"
     echo -e "${YELLOW}8.${NC} 一键全自动部署"
+    echo -e "${YELLOW}9.${NC} 诊断Cloud-init配置"
     echo -e "${YELLOW}0.${NC} 退出"
     echo -e "${CYAN}================================${NC}"
 }
@@ -548,14 +650,96 @@ deploy_k8s() {
         name=${VM_NAMES[$idx]}
         ip=${VM_IPS[$idx]}
         log "初始化 $name ($ip) ..."
-        log "测试 $name SSH连接..."
-        if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $CLOUDINIT_USER@$ip "echo 'SSH连接测试成功'" 2>/dev/null; then
-            err "$name SSH连接失败，请检查：\n- 虚拟机是否正常启动\n- cloud-init是否生效\n- root密码是否正确\n- 网络是否连通"
-            return 1
+        
+        # 增加SSH连接重试机制
+        SSH_OK=0
+        for ssh_try in {1..10}; do
+            log "测试 $name SSH连接... (尝试 $ssh_try/10)"
+            
+            # 先测试基本连接
+            if ! ping -c 1 -W 2 $ip &>/dev/null; then
+                warn "Ping $ip 失败，跳过SSH测试"
+                break
+            fi
+            
+            # 测试SSH端口
+            if ! nc -z $ip 22 &>/dev/null; then
+                warn "SSH端口22未开放，等待10秒后重试..."
+                sleep 10
+                continue
+            fi
+            
+            # 尝试SSH连接，增加详细输出
+            log "尝试SSH连接到 $ip (用户: $CLOUDINIT_USER, 密码: $CLOUDINIT_PASS)"
+            if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o UserKnownHostsFile=/dev/null -v $CLOUDINIT_USER@$ip "echo 'SSH连接测试成功'" 2>&1 | tee /tmp/ssh_debug.log; then
+                SSH_OK=1
+                log "$name SSH连接成功"
+                break
+            else
+                warn "SSH连接失败，可能原因："
+                warn "  - cloud-init未生效，root密码未设置"
+                warn "  - 密码不正确"
+                warn "  - SSH服务未完全启动"
+                warn "  - 网络配置问题"
+                
+                # 显示SSH调试信息
+                if [ -f /tmp/ssh_debug.log ]; then
+                    log "SSH调试信息:"
+                    tail -5 /tmp/ssh_debug.log | sed 's/^/    /'
+                fi
+                
+                if [ $ssh_try -lt 10 ]; then
+                    log "等待15秒后重试..."
+                    sleep 15
+                fi
+            fi
+        done
+        
+        if [ $SSH_OK -eq 0 ]; then
+            err "$name SSH连接最终失败，尝试重置cloud-init..."
+            
+            # 尝试重置cloud-init
+            log "停止虚拟机 ${VM_IDS[$idx]}..."
+            qm stop ${VM_IDS[$idx]} 2>/dev/null || true
+            sleep 5
+            
+            log "重置cloud-init配置..."
+            qm set ${VM_IDS[$idx]} --ciuser root --cipassword $CLOUDINIT_PASS
+            qm set ${VM_IDS[$idx]} --ipconfig0 ip=$ip/24,gw=$GATEWAY
+            qm set ${VM_IDS[$idx]} --nameserver "$DNS"
+            qm set ${VM_IDS[$idx]} --cicustom "user=local:snippets/debian-root.yaml"
+            
+            log "重新启动虚拟机 ${VM_IDS[$idx]}..."
+            qm start ${VM_IDS[$idx]}
+            sleep 30
+            
+            # 再次尝试SSH连接
+            log "重新尝试SSH连接..."
+            for retry in {1..5}; do
+                if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "echo 'SSH连接测试成功'" 2>/dev/null; then
+                    SSH_OK=1
+                    log "$name SSH连接成功（重置后）"
+                    break
+                fi
+                warn "重置后SSH连接仍然失败，重试 $retry/5"
+                sleep 10
+            done
+            
+            if [ $SSH_OK -eq 0 ]; then
+                err "$name SSH连接最终失败，请检查："
+                err "  1. 虚拟机是否正常启动: qm status ${VM_IDS[$idx]}"
+                err "  2. cloud-init是否生效: qm config ${VM_IDS[$idx]} | grep cicustom"
+                err "  3. 网络是否连通: ping $ip"
+                err "  4. SSH端口是否开放: nc -z $ip 22"
+                err "  5. 尝试手动SSH: sshpass -p '$CLOUDINIT_PASS' ssh root@$ip"
+                return 1
+            fi
         fi
+        
+        # 执行初始化命令
         remote_cmd="hostnamectl set-hostname $name && apt-get update -y && apt-get install -y vim curl wget net-tools lsb-release sudo openssh-server && echo '初始化完成: $name'"
         log "执行初始化命令: $remote_cmd"
-        if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 $CLOUDINIT_USER@$ip "$remote_cmd" 2>/dev/null; then
+        if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "$remote_cmd" 2>/dev/null; then
             err "$name 初始化失败，命令: $remote_cmd"
             echo "[建议] 检查网络、cloud-init、root密码、PVE模板配置等。"
             return 1
@@ -782,7 +966,7 @@ main() {
     if [ -z "$1" ]; then
         while true; do
             show_menu
-            read -p "请选择操作 [0-8]: " choice
+            read -p "请选择操作 [0-9]: " choice
             case $choice in
                 1) diagnose_pve ;;
                 2) download_cloud_image ;;
@@ -792,6 +976,7 @@ main() {
                 6) deploy_kubesphere ;;
                 7) cleanup_all ;;
                 8) auto_deploy_all ;;
+                9) diagnose_cloudinit ;;
                 0) log "退出程序"; exit 0 ;;
                 *) echo -e "${RED}无效选择，请重新输入${NC}"; sleep 2 ;;
             esac
@@ -810,6 +995,7 @@ main() {
         echo "  6. 部署KubeSphere"
         echo "  7. 清理所有资源"
         echo "  8. 一键全自动部署"
+        echo "  9. 诊断Cloud-init配置"
         exit 1
     fi
 }
