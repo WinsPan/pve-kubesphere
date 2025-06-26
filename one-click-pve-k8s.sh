@@ -872,9 +872,14 @@ deploy_k8s() {
             err "  4. 等待2-3分钟后重试SSH连接"
             return 1
         fi
-        
-        # 执行初始化命令
-        ssh-keygen -R "$ip" 2>/dev/null
+    done
+
+    # 1. K8S master初始化（重试）
+    log "[K8S] master节点初始化..."
+    K8S_INIT_OK=0
+    for try in {1..3}; do
+        log "K8S master初始化尝试 $try/3..."
+        ssh-keygen -R "$MASTER_IP" 2>/dev/null
         remote_cmd='set -e
 '\
 'echo "[K8S] 步骤0: 加载br_netfilter并设置内核参数..." | tee -a /root/k8s-init.log
@@ -927,18 +932,18 @@ kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml 2>&1 | tee
 '\
 'echo "[K8S] master初始化完成" | tee -a /root/k8s-init.log
 '
-            if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "bash -c '$remote_cmd'"; then
-                K8S_INIT_OK=1
-                log "K8S master初始化成功"
-                break
-            fi
-            warn "K8S master初始化失败，重试($try/3)"
-            log "[K8S] 收集诊断日志..."
-            ssh-keygen -R "$MASTER_IP" 2>/dev/null
-            sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "tail -n 50 /root/k8s-init.log || true; tail -n 50 /var/log/syslog || true; journalctl -xe --no-pager | tail -n 50 || true; dmesg | tail -n 30 || true" || true
-            sleep 30
-        done
-        [ $K8S_INIT_OK -eq 1 ] || { err "K8S master初始化最终失败，请查看 /root/k8s-init.log 及上方诊断信息"; return 1; }
+        if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "bash -c '$remote_cmd'"; then
+            K8S_INIT_OK=1
+            log "K8S master初始化成功"
+            break
+        fi
+        warn "K8S master初始化失败，重试($try/3)"
+        log "[K8S] 收集诊断日志..."
+        ssh-keygen -R "$MASTER_IP" 2>/dev/null
+        sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "tail -n 50 /root/k8s-init.log || true; tail -n 50 /var/log/syslog || true; journalctl -xe --no-pager | tail -n 50 || true; dmesg | tail -n 30 || true" || true
+        sleep 30
+    done
+    [ $K8S_INIT_OK -eq 1 ] || { err "K8S master初始化最终失败，请查看 /root/k8s-init.log 及上方诊断信息"; return 1; }
 
     # 2. 获取join命令（重试）
     log "获取K8S join命令..."
@@ -987,26 +992,25 @@ sysctl --system 2>&1 | tee -a /root/k8s-worker-join.log
 'echo "[K8S] worker节点执行join..." | tee -a /root/k8s-worker-join.log
 '"$JOIN_CMD --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem 2>&1 | tee -a /root/k8s-worker-join.log"'
 '
-                if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "bash -c '$remote_cmd'"; then
-                    JOIN_OK=1
-                    log "$ip 加入集群成功"
-                    break
-                fi
-                warn "$ip 加入集群失败，重试($try/3)"
-                log "[K8S] 收集worker诊断日志..."
-                ssh-keygen -R "$ip" 2>/dev/null
-                sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "\
-                    echo '==== /root/k8s-worker-join.log ===='; tail -n 50 /root/k8s-worker-join.log 2>/dev/null; \
-                    echo '==== containerd status ===='; systemctl status containerd 2>&1 | tail -n 20; \
-                    echo '==== kubelet status ===='; systemctl status kubelet 2>&1 | tail -n 20; \
-                    echo '==== ping master ===='; ping -c 3 $MASTER_IP; \
-                    echo '==== telnet master 6443 ===='; (command -v telnet && telnet $MASTER_IP 6443 < /dev/null) || echo 'telnet not installed'; \
-                    echo '==== journalctl -xe ===='; journalctl -xe --no-pager | tail -n 50; \
-                " || true
-                sleep 30
-            done
-            [ $JOIN_OK -eq 1 ] || { err "$ip 加入集群最终失败，请查看 /root/k8s-worker-join.log 及上方诊断信息"; return 1; }
+            if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "bash -c '$remote_cmd'"; then
+                JOIN_OK=1
+                log "$ip 加入集群成功"
+                break
+            fi
+            warn "$ip 加入集群失败，重试($try/3)"
+            log "[K8S] 收集worker诊断日志..."
+            ssh-keygen -R "$ip" 2>/dev/null
+            sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "\
+                echo '==== /root/k8s-worker-join.log ===='; tail -n 50 /root/k8s-worker-join.log 2>/dev/null; \
+                echo '==== containerd status ===='; systemctl status containerd 2>&1 | tail -n 20; \
+                echo '==== kubelet status ===='; systemctl status kubelet 2>&1 | tail -n 20; \
+                echo '==== ping master ===='; ping -c 3 $MASTER_IP; \
+                echo '==== telnet master 6443 ===='; (command -v telnet && telnet $MASTER_IP 6443 < /dev/null) || echo 'telnet not installed'; \
+                echo '==== journalctl -xe ===='; journalctl -xe --no-pager | tail -n 50; \
+            " || true
+            sleep 30
         done
+        [ $JOIN_OK -eq 1 ] || { err "$ip 加入集群最终失败，请查看 /root/k8s-worker-join.log 及上方诊断信息"; return 1; }
     done
 
     # 4. 检查K8S集群状态
