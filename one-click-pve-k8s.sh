@@ -243,36 +243,22 @@ create_and_start_vms() {
     mkdir -p /var/lib/vz/snippets
     CLOUDINIT_CUSTOM_USERCFG="/var/lib/vz/snippets/debian-root.yaml"
     
-    # 创建更完整的cloud-init配置
+    # 创建更可靠的cloud-init配置
     cat > "$CLOUDINIT_CUSTOM_USERCFG" <<EOF
 #cloud-config
 disable_root: false
 ssh_pwauth: true
-users:
-  - name: root
-    lock_passwd: false
-    shell: /bin/bash
 chpasswd:
   expire: false
   list: |
     root:$CLOUDINIT_PASS
-ssh_authorized_keys: []
-packages:
-  - openssh-server
-  - curl
-  - wget
-  - net-tools
-bootcmd:
-  - echo "DEBUG: cloud-init starting..." > /root/debug.log
 runcmd:
-  - systemctl enable ssh
-  - systemctl start ssh
+  - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+  - sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+  - grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+  - grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+  - systemctl restart ssh
   - echo "root:$CLOUDINIT_PASS" | chpasswd
-  - cloud-init status --long >> /root/debug.log
-  - journalctl -u cloud-init >> /root/debug.log
-  - systemctl status ssh >> /root/debug.log
-  - ip a >> /root/debug.log
-  - echo "Cloud-init配置完成" >> /root/debug.log
 EOF
 
     # 同时创建一个简化版本作为备用
@@ -284,14 +270,13 @@ chpasswd:
   expire: false
   list: |
     root:$CLOUDINIT_PASS
-bootcmd:
-  - echo "DEBUG: simple cloud-init starting..." > /root/debug.log
 runcmd:
-  - systemctl enable ssh
-  - systemctl start ssh
+  - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+  - sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+  - grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+  - grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+  - systemctl restart ssh
   - echo "root:$CLOUDINIT_PASS" | chpasswd
-  - cloud-init status --long >> /root/debug.log
-  - echo "Simple cloud-init配置完成" >> /root/debug.log
 EOF
 
     log "Cloud-init配置文件内容:"
@@ -376,36 +361,22 @@ fix_existing_vms() {
     mkdir -p /var/lib/vz/snippets
     CLOUDINIT_CUSTOM_USERCFG="/var/lib/vz/snippets/debian-root.yaml"
     
-    # 创建更完整的cloud-init配置
+    # 创建更可靠的cloud-init配置
     cat > "$CLOUDINIT_CUSTOM_USERCFG" <<EOF
 #cloud-config
 disable_root: false
 ssh_pwauth: true
-users:
-  - name: root
-    lock_passwd: false
-    shell: /bin/bash
 chpasswd:
   expire: false
   list: |
     root:$CLOUDINIT_PASS
-ssh_authorized_keys: []
-packages:
-  - openssh-server
-  - curl
-  - wget
-  - net-tools
-bootcmd:
-  - echo "DEBUG: cloud-init starting..." > /root/debug.log
 runcmd:
-  - systemctl enable ssh
-  - systemctl start ssh
+  - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+  - sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+  - grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+  - grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+  - systemctl restart ssh
   - echo "root:$CLOUDINIT_PASS" | chpasswd
-  - cloud-init status --long >> /root/debug.log
-  - journalctl -u cloud-init >> /root/debug.log
-  - systemctl status ssh >> /root/debug.log
-  - ip a >> /root/debug.log
-  - echo "Cloud-init配置完成" >> /root/debug.log
 EOF
 
     log "Cloud-init配置文件内容:"
