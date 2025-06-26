@@ -571,6 +571,7 @@ show_menu() {
     echo -e "${YELLOW}8.${NC} 一键全自动部署"
     echo -e "${YELLOW}9.${NC} 诊断Cloud-init配置"
     echo -e "${YELLOW}10.${NC} 诊断单个虚拟机"
+    echo -e "${YELLOW}11.${NC} 升级K8S和KubeSphere"
     echo -e "${YELLOW}0.${NC} 退出"
     echo -e "${CYAN}================================${NC}"
 }
@@ -962,17 +963,50 @@ kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml 2>&1 | tee
         log "[K8S] $ip 加入集群..."
         JOIN_OK=0
         for try in {1..3}; do
+            ssh-keygen -R "$ip" 2>/dev/null
             log "$ip 加入集群尝试 $try/3..."
-            remote_cmd="apt-get update -y && apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common && curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/kubernetes-archive-keyring.gpg && echo 'deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main' > /etc/apt/sources.list.d/kubernetes.list && apt-get update -y && apt-get install -y kubelet kubeadm kubectl && swapoff -a && sed -i '/ swap / s/^/#/' /etc/fstab && $JOIN_CMD --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem && echo 'K8S worker加入完成'"
-            if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$ip "$remote_cmd" 2>/dev/null; then
-                JOIN_OK=1
-                log "$ip 加入集群成功"
-                break
-            fi
-            warn "$ip 加入集群失败，重试($try/3)"
-            sleep 30
+            remote_cmd='set -e
+'\
+'echo "[K8S] worker节点准备加入集群..." | tee -a /root/k8s-worker-join.log
+apt-get update -y 2>&1 | tee -a /root/k8s-worker-join.log
+apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common 2>&1 | tee -a /root/k8s-worker-join.log
+curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/kubernetes-archive-keyring.gpg 2>&1 | tee -a /root/k8s-worker-join.log
+echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+apt-get update -y 2>&1 | tee -a /root/k8s-worker-join.log
+apt-get install -y kubelet kubeadm kubectl 2>&1 | tee -a /root/k8s-worker-join.log
+swapoff -a 2>&1 | tee -a /root/k8s-worker-join.log
+sed -i "/ swap / s/^/#/" /etc/fstab
+modprobe br_netfilter
+ echo "br_netfilter" > /etc/modules-load.d/br_netfilter.conf
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+sysctl --system 2>&1 | tee -a /root/k8s-worker-join.log
+'\
+'echo "[K8S] worker节点执行join..." | tee -a /root/k8s-worker-join.log
+'"$JOIN_CMD --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem 2>&1 | tee -a /root/k8s-worker-join.log"'
+'
+                if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "bash -c '$remote_cmd'"; then
+                    JOIN_OK=1
+                    log "$ip 加入集群成功"
+                    break
+                fi
+                warn "$ip 加入集群失败，重试($try/3)"
+                log "[K8S] 收集worker诊断日志..."
+                ssh-keygen -R "$ip" 2>/dev/null
+                sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "\
+                    echo '==== /root/k8s-worker-join.log ===='; tail -n 50 /root/k8s-worker-join.log 2>/dev/null; \
+                    echo '==== containerd status ===='; systemctl status containerd 2>&1 | tail -n 20; \
+                    echo '==== kubelet status ===='; systemctl status kubelet 2>&1 | tail -n 20; \
+                    echo '==== ping master ===='; ping -c 3 $MASTER_IP; \
+                    echo '==== telnet master 6443 ===='; (command -v telnet && telnet $MASTER_IP 6443 < /dev/null) || echo 'telnet not installed'; \
+                    echo '==== journalctl -xe ===='; journalctl -xe --no-pager | tail -n 50; \
+                " || true
+                sleep 30
+            done
+            [ $JOIN_OK -eq 1 ] || { err "$ip 加入集群最终失败，请查看 /root/k8s-worker-join.log 及上方诊断信息"; return 1; }
         done
-        [ $JOIN_OK -eq 1 ] || { err "$ip 加入集群最终失败"; return 1; }
     done
 
     # 4. 检查K8S集群状态
@@ -987,33 +1021,63 @@ kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml 2>&1 | tee
     return 0
 }
 
-# 部署KubeSphere
+# 新增：一键升级K8S和KubeSphere
+upgrade_k8s_kubesphere() {
+    log "开始升级K8S和KubeSphere到最新版..."
+    # 升级K8S（master和所有node）
+    for idx in ${!VM_IDS[@]}; do
+        ip=${VM_IPS[$idx]}
+        name=${VM_NAMES[$idx]}
+        log "升级 $name ($ip) ..."
+        ssh-keygen -R "$ip" 2>/dev/null
+        upgrade_cmd='set -e
+apt-mark unhold kubelet kubeadm kubectl || true
+apt-get update
+apt-get install -y kubelet kubeadm kubectl
+apt-mark hold kubelet kubeadm kubectl
+kubeadm upgrade plan || true
+kubeadm upgrade apply -y || true
+systemctl restart kubelet || true'
+        sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "bash -c '$upgrade_cmd'" || warn "$name 升级K8S失败"
+    done
+    # 升级KubeSphere（只在master）
+    log "升级KubeSphere（master节点）..."
+    ssh-keygen -R "$MASTER_IP" 2>/dev/null
+    ks_upgrade_cmd='set -e
+cd /root || cd ~
+curl -sfL https://get-kk.kubesphere.io | VERSION=latest sh -
+./kk upgrade -f config-sample.yaml || ./kk create cluster -f config-sample.yaml || ./kk create cluster'
+    sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=120 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$MASTER_IP "bash -c '$ks_upgrade_cmd'" || warn "KubeSphere升级失败"
+    log "升级流程结束，请检查各节点状态。"
+}
+
+# 修改K8S和KubeSphere安装逻辑，始终安装最新版
+# K8S安装部分已默认用apt最新包，不指定版本
+# KubeSphere安装部分：
 deploy_kubesphere() {
     log "开始部署KubeSphere..."
-    
     # 检查K8S集群状态
     log "检查K8S集群状态..."
     if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "kubectl get nodes" 2>/dev/null; then
         err "K8S集群未就绪，请先部署K8S集群"
         return 1
     fi
-    
-    # 安装KubeSphere
-    log "在master节点安装KubeSphere..."
-    remote_cmd="curl -sfL https://get-ks.ksops.io | sh && ./kk create cluster -f ./config-sample.yaml || ./kk create cluster"
+    # 安装KubeSphere最新版
+    log "在master节点安装KubeSphere（最新版）..."
+    remote_cmd='cd /root || cd ~
+curl -sfL https://get-kk.kubesphere.io | VERSION=latest sh -
+./kk create cluster -f config-sample.yaml || ./kk create cluster'
     if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "$remote_cmd" 2>/dev/null; then
         err "KubeSphere安装失败，命令: $remote_cmd"
         echo "[建议] 检查KubeSphere安装日志、PVE资源、网络等。"
         return 1
     fi
-    
     # 检查KubeSphere端口
     log "等待KubeSphere服务启动..."
     if ! wait_for_port $MASTER_IP 30880; then
         err "KubeSphere服务启动失败"
         return 1
     fi
-    
     log "KubeSphere部署完成！"
     log "KubeSphere控制台: http://$MASTER_IP:30880"
     log "默认用户名: admin，密码: P@88w0rd"
@@ -1137,7 +1201,7 @@ main() {
     if [ -z "$1" ]; then
         while true; do
             show_menu
-            read -p "请选择操作 [0-10]: " choice
+            read -p "请选择操作 [0-11]: " choice
             case $choice in
                 1) diagnose_pve ;;
                 2) download_cloud_image ;;
@@ -1166,6 +1230,7 @@ main() {
                          sleep 2
                      fi
                      ;;
+                11) upgrade_k8s_kubesphere ;;
                 0) log "退出程序"; exit 0 ;;
                 *) echo -e "${RED}无效选择，请重新输入${NC}"; sleep 2 ;;
             esac
@@ -1186,6 +1251,8 @@ main() {
         echo "  8. 一键全自动部署"
         echo "  9. 诊断Cloud-init配置"
         echo "  10. 诊断单个虚拟机"
+        echo "  11. 升级K8S和KubeSphere"
+        echo "  0. 退出"
         exit 1
     fi
 }
