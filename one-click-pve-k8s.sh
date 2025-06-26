@@ -1045,8 +1045,24 @@ net.ipv4.ip_forward = 1
 EOF
 sysctl --system 2>&1 | tee -a /root/k8s-worker-join.log
 '\
+'echo "[K8S] 安装和配置containerd..." | tee -a /root/k8s-worker-join.log
+# 安装containerd
+apt-get install -y containerd 2>&1 | tee -a /root/k8s-worker-join.log
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+# 确保containerd启动
+systemctl daemon-reload
+systemctl enable containerd
+systemctl restart containerd
+# 等待containerd完全启动
+sleep 10
+# 检查containerd状态
+systemctl status containerd 2>&1 | tee -a /root/k8s-worker-join.log
+# 检查containerd socket
+ls -la /var/run/containerd/containerd.sock 2>&1 | tee -a /root/k8s-worker-join.log || echo "containerd socket不存在" | tee -a /root/k8s-worker-join.log
+'\
 'echo "[K8S] worker节点执行join..." | tee -a /root/k8s-worker-join.log
-'"$JOIN_CMD --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem 2>&1 | tee -a /root/k8s-worker-join.log"'
+'"$JOIN_CMD --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem --ignore-preflight-errors=CRI 2>&1 | tee -a /root/k8s-worker-join.log"'
 '
             if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "bash -c '$remote_cmd'"; then
                 JOIN_OK=1
@@ -1072,13 +1088,53 @@ sysctl --system 2>&1 | tee -a /root/k8s-worker-join.log
     # 4. 检查K8S集群状态
     log "[K8S] 检查集群状态..."
     sleep 30  # 等待集群稳定
-    if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "kubectl get nodes -o wide && kubectl get pods -A" 2>/dev/null; then
-        err "K8S集群状态异常，请检查deploy.log和K8S安装日志"
+    
+    # 详细的集群状态检查
+    log "执行详细的集群状态检查..."
+    cluster_check_cmd='
+echo "=== K8S集群状态检查 ==="
+echo ""
+echo "1. 节点状态:"
+kubectl get nodes -o wide 2>/dev/null || echo "无法获取节点信息"
+echo ""
+echo "2. Pod状态:"
+kubectl get pods -A 2>/dev/null || echo "无法获取Pod信息"
+echo ""
+echo "3. 系统Pod状态:"
+kubectl get pods -n kube-system 2>/dev/null || echo "无法获取kube-system Pod信息"
+echo ""
+echo "4. 服务状态:"
+kubectl get svc -A 2>/dev/null || echo "无法获取服务信息"
+echo ""
+echo "5. 事件信息:"
+kubectl get events --sort-by=.metadata.creationTimestamp | tail -20 2>/dev/null || echo "无法获取事件信息"
+echo ""
+echo "6. 集群信息:"
+kubectl cluster-info 2>/dev/null || echo "无法获取集群信息"
+echo ""
+echo "=== 检查完成 ==="
+'
+    
+    if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "bash -c '$cluster_check_cmd'"; then
+        log "K8S集群状态检查完成"
+        
+        # 检查是否有Ready节点
+        READY_NODES=$(sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "kubectl get nodes --no-headers | grep -c ' Ready ' 2>/dev/null || echo '0'")
+        TOTAL_NODES=$(sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "kubectl get nodes --no-headers | wc -l 2>/dev/null || echo '0'")
+        
+        log "集群节点状态: $READY_NODES/$TOTAL_NODES 节点就绪"
+        
+        if [ "$READY_NODES" -gt 0 ]; then
+            log "K8S集群部署成功！"
+            return 0
+        else
+            err "没有节点处于Ready状态，集群可能存在问题"
+            return 1
+        fi
+    else
+        err "K8S集群状态检查失败，请检查deploy.log和K8S安装日志"
         return 1
     fi
-
-    log "K8S集群部署完成！"
-    return 0
 }
 
 # 新增：一键升级K8S和KubeSphere
