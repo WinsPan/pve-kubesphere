@@ -253,6 +253,7 @@ users:
   - name: root
     lock_passwd: false
     shell: /bin/bash
+    hashed_passwd: $(openssl passwd -6 -salt xyz $CLOUDINIT_PASS)
 chpasswd:
   expire: false
   list: |
@@ -266,6 +267,7 @@ packages:
 runcmd:
   - systemctl enable ssh
   - systemctl start ssh
+  - echo "root:$CLOUDINIT_PASS" | chpasswd
   - echo "Cloud-init配置完成"
 EOF
 
@@ -361,6 +363,7 @@ users:
   - name: root
     lock_passwd: false
     shell: /bin/bash
+    hashed_passwd: $(openssl passwd -6 -salt xyz $CLOUDINIT_PASS)
 chpasswd:
   expire: false
   list: |
@@ -374,6 +377,7 @@ packages:
 runcmd:
   - systemctl enable ssh
   - systemctl start ssh
+  - echo "root:$CLOUDINIT_PASS" | chpasswd
   - echo "Cloud-init配置完成"
 EOF
 
@@ -706,47 +710,19 @@ deploy_k8s() {
         done
         
         if [ $SSH_OK -eq 0 ]; then
-            err "$name SSH连接最终失败，尝试重置cloud-init..."
-            
-            # 尝试重置cloud-init
-            log "停止虚拟机 ${VM_IDS[$idx]}..."
-            qm stop ${VM_IDS[$idx]} 2>/dev/null || true
-            sleep 5
-            
-            log "重置cloud-init配置..."
-            qm set ${VM_IDS[$idx]} --ciuser root --cipassword $CLOUDINIT_PASS
-            qm set ${VM_IDS[$idx]} --ipconfig0 ip=$ip/24,gw=$GATEWAY
-            qm set ${VM_IDS[$idx]} --nameserver "$DNS"
-            qm set ${VM_IDS[$idx]} --cicustom "user=local:snippets/debian-root.yaml"
-            
-            log "重新启动虚拟机 ${VM_IDS[$idx]}..."
-            qm start ${VM_IDS[$idx]}
-            sleep 30
-            
-            # 再次尝试SSH连接
-            log "重新尝试SSH连接..."
-            for retry in {1..5}; do
-                if sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=yes $CLOUDINIT_USER@$ip "echo 'SSH连接测试成功'" 2>&1 | tee /tmp/ssh_retry.log; then
-                    # 检查是否真的连接成功
-                    if ! grep -q "Permission denied\|Authentication failed" /tmp/ssh_retry.log; then
-                        SSH_OK=1
-                        log "$name SSH连接成功（重置后）"
-                        break
-                    fi
-                fi
-                warn "重置后SSH连接仍然失败，重试 $retry/5"
-                sleep 10
-            done
-            
-            if [ $SSH_OK -eq 0 ]; then
-                err "$name SSH连接最终失败，请检查："
-                err "  1. 虚拟机是否正常启动: qm status ${VM_IDS[$idx]}"
-                err "  2. cloud-init是否生效: qm config ${VM_IDS[$idx]} | grep cicustom"
-                err "  3. 网络是否连通: ping $ip"
-                err "  4. SSH端口是否开放: nc -z $ip 22"
-                err "  5. 尝试手动SSH: sshpass -p '$CLOUDINIT_PASS' ssh root@$ip"
-                return 1
-            fi
+            err "$name SSH连接最终失败，请检查："
+            err "  1. 虚拟机是否正常启动: qm status ${VM_IDS[$idx]}"
+            err "  2. cloud-init是否生效: qm config ${VM_IDS[$idx]} | grep cicustom"
+            err "  3. 网络是否连通: ping $ip"
+            err "  4. SSH端口是否开放: nc -z $ip 22"
+            err "  5. 尝试手动SSH: sshpass -p '$CLOUDINIT_PASS' ssh root@$ip"
+            err ""
+            err "如果问题持续，可以尝试手动重置密码："
+            err "  1. 停止虚拟机: qm stop ${VM_IDS[$idx]}"
+            err "  2. 重置cloud-init: qm set ${VM_IDS[$idx]} --ciuser root --cipassword $CLOUDINIT_PASS"
+            err "  3. 启动虚拟机: qm start ${VM_IDS[$idx]}"
+            err "  4. 等待2-3分钟后重试SSH连接"
+            return 1
         fi
         
         # 执行初始化命令
