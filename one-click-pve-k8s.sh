@@ -747,6 +747,7 @@ deploy_k8s() {
         # 增加SSH连接重试机制
         SSH_OK=0
         for ssh_try in {1..10}; do
+            ssh-keygen -R "$ip" 2>/dev/null
             log "测试 $name SSH连接... (尝试 $ssh_try/10)"
             
             # 先测试基本连接
@@ -872,6 +873,7 @@ deploy_k8s() {
         fi
         
         # 执行初始化命令
+        ssh-keygen -R "$ip" 2>/dev/null
         remote_cmd="hostnamectl set-hostname $name && apt-get update -y && apt-get install -y vim curl wget net-tools lsb-release sudo openssh-server && echo '初始化完成: $name'"
         log "执行初始化命令: $remote_cmd"
         if ! sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "$remote_cmd" 2>/dev/null; then
@@ -888,9 +890,9 @@ deploy_k8s() {
     log "\n开始K8S集群部署..."
 
     # 1. master节点初始化K8S（分步详细日志）
-    log "[K8S] master节点初始化(详细日志)..."
-    K8S_INIT_OK=0
+    ssh-keygen -R "$MASTER_IP" 2>/dev/null
     for try in {1..3}; do
+        ssh-keygen -R "$MASTER_IP" 2>/dev/null
         log "K8S master初始化尝试 $try/3..."
         remote_cmd='set -e
 '\
@@ -931,6 +933,7 @@ kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>&1 | tee -a /
             fi
             warn "K8S master初始化失败，重试($try/3)"
             log "[K8S] 收集诊断日志..."
+            ssh-keygen -R "$MASTER_IP" 2>/dev/null
             sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "tail -n 50 /root/k8s-init.log || true; tail -n 50 /var/log/syslog || true; journalctl -xe --no-pager | tail -n 50 || true; dmesg | tail -n 30 || true" || true
             sleep 30
         done
