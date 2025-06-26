@@ -880,6 +880,34 @@ deploy_k8s() {
     for try in {1..3}; do
         log "K8S master初始化尝试 $try/3..."
         ssh-keygen -R "$MASTER_IP" 2>/dev/null
+        
+        # 先清理可能存在的K8S配置
+        log "清理可能存在的K8S配置..."
+        cleanup_cmd='set -e
+echo "[K8S] 清理旧配置..." | tee -a /root/k8s-init.log
+# 停止kubelet
+systemctl stop kubelet 2>/dev/null || true
+# 清理kubeadm配置
+kubeadm reset -f 2>/dev/null || true
+# 清理etcd数据
+rm -rf /var/lib/etcd/* 2>/dev/null || true
+# 清理kubelet配置
+rm -rf /var/lib/kubelet/* 2>/dev/null || true
+# 清理manifests
+rm -rf /etc/kubernetes/manifests/* 2>/dev/null || true
+# 清理kubeconfig
+rm -rf /root/.kube 2>/dev/null || true
+# 清理iptables规则
+iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X 2>/dev/null || true
+# 清理网络接口
+ip link delete cni0 2>/dev/null || true
+ip link delete flannel.1 2>/dev/null || true
+# 等待端口释放
+sleep 5
+echo "[K8S] 清理完成" | tee -a /root/k8s-init.log'
+        
+        sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "bash -c '$cleanup_cmd'" || true
+        
         remote_cmd='set -e
 '\
 'echo "[K8S] 步骤0: 加载br_netfilter并设置内核参数..." | tee -a /root/k8s-init.log
@@ -918,7 +946,7 @@ swapoff -a 2>&1 | tee -a /root/k8s-init.log
 sed -i "/ swap / s/^/#/" /etc/fstab
 '\
 'echo "[K8S] 步骤6: kubeadm init..." | tee -a /root/k8s-init.log
-kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=$MASTER_IP --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem 2>&1 | tee -a /root/k8s-init.log
+kubeadm init --pod-network-cidr=192.168.0.0/16 --apiserver-advertise-address=$MASTER_IP --ignore-preflight-errors=NumCPU --ignore-preflight-errors=Mem --ignore-preflight-errors=Port-10257 --ignore-preflight-errors=Port-10250 --ignore-preflight-errors=FileAvailable--etc-kubernetes-manifests-kube-apiserver.yaml --ignore-preflight-errors=FileAvailable--etc-kubernetes-manifests-kube-controller-manager.yaml --ignore-preflight-errors=FileAvailable--etc-kubernetes-manifests-kube-scheduler.yaml --ignore-preflight-errors=FileAvailable--etc-kubernetes-manifests-etcd.yaml --ignore-preflight-errors=DirAvailable--var-lib-etcd 2>&1 | tee -a /root/k8s-init.log
 '\
 'echo "[K8S] 步骤7: 配置kubectl..." | tee -a /root/k8s-init.log
 mkdir -p /root/.kube
@@ -970,6 +998,34 @@ kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml 2>&1 | tee
         for try in {1..3}; do
             ssh-keygen -R "$ip" 2>/dev/null
             log "$ip 加入集群尝试 $try/3..."
+            
+            # 先清理worker节点的K8S配置
+            log "清理worker节点 $ip 的K8S配置..."
+            cleanup_worker_cmd='set -e
+echo "[K8S] 清理worker节点旧配置..." | tee -a /root/k8s-worker-join.log
+# 停止kubelet
+systemctl stop kubelet 2>/dev/null || true
+# 清理kubeadm配置
+kubeadm reset -f 2>/dev/null || true
+# 清理etcd数据
+rm -rf /var/lib/etcd/* 2>/dev/null || true
+# 清理kubelet配置
+rm -rf /var/lib/kubelet/* 2>/dev/null || true
+# 清理manifests
+rm -rf /etc/kubernetes/manifests/* 2>/dev/null || true
+# 清理kubeconfig
+rm -rf /root/.kube 2>/dev/null || true
+# 清理iptables规则
+iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X 2>/dev/null || true
+# 清理网络接口
+ip link delete cni0 2>/dev/null || true
+ip link delete flannel.1 2>/dev/null || true
+# 等待端口释放
+sleep 5
+echo "[K8S] worker节点清理完成" | tee -a /root/k8s-worker-join.log'
+            
+            sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "bash -c '$cleanup_worker_cmd'" || true
+            
             remote_cmd='set -e
 '\
 'echo "[K8S] worker节点准备加入集群..." | tee -a /root/k8s-worker-join.log
