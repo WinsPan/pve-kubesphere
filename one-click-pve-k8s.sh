@@ -99,11 +99,275 @@ wait_for_port() {
 # ==========================================
 # 修复与诊断功能区
 # ==========================================
-# 这里放所有修复、诊断相关函数，便于维护
-fix_flannel_network() { log "[修复] Flannel网络修复...（伪实现，具体逻辑略）"; }
-fix_controller_manager() { log "[修复] kube-controller-manager修复...（伪实现，具体逻辑略）"; }
-fix_kubesphere_installation() { log "[修复] KubeSphere安装修复...（伪实现，具体逻辑略）"; }
-check_cluster_status_repair() { log "[修复] 集群状态检查...（伪实现，具体逻辑略）"; }
+# 修复Flannel网络问题
+fix_flannel_network() {
+    log "开始修复Flannel网络问题..."
+    
+    # 检查K8S集群状态
+    if ! run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
+        err "K8S集群未就绪，无法修复网络问题"
+        return 1
+    fi
+    
+    log "检查当前网络插件状态..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '=== 当前网络插件状态 ==='
+        kubectl get pods -n kube-system | grep -E '(flannel|calico|weave)' || echo '未找到网络插件Pod'
+        echo ''
+        echo '=== 网络接口状态 ==='
+        ip a | grep -E '(cni|flannel|calico)' || echo '未找到CNI网络接口'
+        echo ''
+        echo '=== 路由表 ==='
+        ip route | head -10
+    " || true
+    
+    log "清理Flannel网络配置..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '清理Flannel网络...'
+        kubectl delete -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml 2>/dev/null || true
+        kubectl delete -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/k8s-manifests/kube-flannel-rbac.yml 2>/dev/null || true
+        ip link delete cni0 2>/dev/null || true
+        ip link delete flannel.1 2>/dev/null || true
+        rm -rf /var/lib/cni/flannel 2>/dev/null || true
+        rm -rf /run/flannel 2>/dev/null || true
+        echo 'Flannel清理完成'
+    " || true
+    
+    log "安装Calico网络插件..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '安装Calico网络插件...'
+        kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+        echo 'Calico安装完成'
+    " || true
+    
+    log "等待网络插件就绪..."
+    sleep 30
+    
+    log "检查网络修复结果..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '=== 修复后网络状态 ==='
+        kubectl get pods -n kube-system | grep -E '(calico|flannel)' || echo '未找到网络插件Pod'
+        echo ''
+        echo '=== 节点网络状态 ==='
+        kubectl get nodes -o wide
+        echo ''
+        echo '=== 网络连通性测试 ==='
+        kubectl get pods -n kube-system -o wide | head -5
+    " || true
+    
+    log "Flannel网络修复完成"
+}
+
+# 修复kube-controller-manager崩溃
+fix_controller_manager() {
+    log "开始修复kube-controller-manager崩溃..."
+    
+    # 检查K8S集群状态
+    if ! run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
+        err "K8S集群未就绪，无法修复控制器问题"
+        return 1
+    fi
+    
+    log "检查kube-controller-manager状态..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '=== kube-controller-manager状态 ==='
+        kubectl get pods -n kube-system | grep controller-manager || echo '未找到controller-manager Pod'
+        echo ''
+        echo '=== 系统资源状态 ==='
+        free -h
+        echo ''
+        df -h | head -5
+        echo ''
+        echo '=== 系统负载 ==='
+        uptime
+    " || true
+    
+    log "重启kube-controller-manager..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '重启kube-controller-manager...'
+        # 删除controller-manager Pod，让kubelet重新创建
+        kubectl delete pod -n kube-system -l component=kube-controller-manager --force --grace-period=0 2>/dev/null || true
+        echo 'controller-manager Pod已删除，等待重新创建...'
+    " || true
+    
+    log "等待controller-manager重启..."
+    sleep 30
+    
+    log "检查修复结果..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '=== 修复后controller-manager状态 ==='
+        kubectl get pods -n kube-system | grep controller-manager || echo '未找到controller-manager Pod'
+        echo ''
+        echo '=== 系统Pod状态 ==='
+        kubectl get pods -n kube-system | grep -E '(controller|scheduler|apiserver|etcd)' || echo '未找到系统Pod'
+        echo ''
+        echo '=== 事件信息 ==='
+        kubectl get events --sort-by=.metadata.creationTimestamp | tail -10 2>/dev/null || echo '无法获取事件信息'
+    " || true
+    
+    log "kube-controller-manager修复完成"
+}
+
+# 修复KubeSphere安装问题
+fix_kubesphere_installation() {
+    log "开始修复KubeSphere安装问题..."
+    
+    # 检查K8S集群状态
+    if ! run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
+        err "K8S集群未就绪，无法修复KubeSphere"
+        return 1
+    fi
+    
+    log "检查KubeSphere安装状态..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '=== KubeSphere安装状态 ==='
+        kubectl get ns | grep kubesphere || echo 'kubesphere-system命名空间不存在'
+        echo ''
+        echo '=== KubeSphere Pod状态 ==='
+        kubectl get pods -n kubesphere-system 2>/dev/null || echo 'kubesphere-system命名空间不存在'
+        echo ''
+        echo '=== 安装器Pod日志 ==='
+        INSTALLER_POD=\$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo '')
+        if [ -n \"\$INSTALLER_POD\" ]; then
+            echo '安装器Pod: '\$INSTALLER_POD
+            kubectl logs -n kubesphere-system \$INSTALLER_POD --tail=20 2>/dev/null || echo '无法获取安装日志'
+        else
+            echo '未找到安装器Pod'
+        fi
+    " || true
+    
+    log "清理现有KubeSphere安装..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '清理KubeSphere安装...'
+        kubectl delete -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml 2>/dev/null || true
+        kubectl delete -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml 2>/dev/null || true
+        kubectl delete ns kubesphere-system --force --grace-period=0 2>/dev/null || true
+        kubectl delete ns kubesphere-controls-system --force --grace-period=0 2>/dev/null || true
+        kubectl delete ns kubesphere-monitoring-system --force --grace-period=0 2>/dev/null || true
+        kubectl delete ns kubesphere-logging-system --force --grace-period=0 2>/dev/null || true
+        echo 'KubeSphere清理完成'
+    " || true
+    
+    log "等待清理完成..."
+    sleep 30
+    
+    log "重新安装KubeSphere（轻量版）..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '重新安装KubeSphere...'
+        kubectl apply -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml
+        kubectl apply -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml
+        echo 'KubeSphere重新安装完成'
+    " || true
+    
+    log "等待安装开始..."
+    sleep 30
+    
+    log "检查修复结果..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '=== 修复后KubeSphere状态 ==='
+        kubectl get ns | grep kubesphere || echo 'kubesphere-system命名空间不存在'
+        echo ''
+        echo '=== KubeSphere Pod状态 ==='
+        kubectl get pods -n kubesphere-system 2>/dev/null || echo 'kubesphere-system命名空间不存在'
+        echo ''
+        echo '=== 安装进度 ==='
+        INSTALLER_POD=\$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo '')
+        if [ -n \"\$INSTALLER_POD\" ]; then
+            echo '安装器Pod: '\$INSTALLER_POD
+            kubectl logs -n kubesphere-system \$INSTALLER_POD --tail=10 2>/dev/null || echo '无法获取安装日志'
+        else
+            echo '未找到安装器Pod，安装可能还在进行中'
+        fi
+    " || true
+    
+    log "KubeSphere安装修复完成"
+}
+
+# 检查集群状态
+check_cluster_status_repair() {
+    log "开始检查集群状态..."
+    
+    # 检查K8S集群状态
+    if ! run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
+        err "K8S集群未就绪"
+        return 1
+    fi
+    
+    log "执行详细集群状态检查..."
+    run_remote_cmd "$MASTER_IP" "
+        echo '=========================================='
+        echo 'K8S集群详细状态检查报告'
+        echo '=========================================='
+        echo ''
+        echo '1. 节点状态:'
+        kubectl get nodes -o wide
+        echo ''
+        echo '2. 系统Pod状态:'
+        kubectl get pods -n kube-system
+        echo ''
+        echo '3. 所有命名空间:'
+        kubectl get ns
+        echo ''
+        echo '4. 系统服务状态:'
+        kubectl get svc -n kube-system
+        echo ''
+        echo '5. 存储类:'
+        kubectl get storageclass 2>/dev/null || echo '未配置存储类'
+        echo ''
+        echo '6. 持久卷:'
+        kubectl get pv 2>/dev/null || echo '未配置持久卷'
+        echo ''
+        echo '7. 事件信息:'
+        kubectl get events --sort-by=.metadata.creationTimestamp | tail -20 2>/dev/null || echo '无法获取事件信息'
+        echo ''
+        echo '8. 集群信息:'
+        kubectl cluster-info 2>/dev/null || echo '无法获取集群信息'
+        echo ''
+        echo '9. 系统资源使用:'
+        kubectl top nodes 2>/dev/null || echo 'metrics-server未安装或未运行'
+        echo ''
+        echo '10. 网络插件状态:'
+        kubectl get pods -n kube-system | grep -E '(flannel|calico|weave|cilium)' || echo '未找到网络插件'
+        echo ''
+        echo '=========================================='
+        echo '检查完成'
+        echo '=========================================='
+    " || true
+    
+    # 检查KubeSphere状态（如果存在）
+    log "检查KubeSphere状态..."
+    run_remote_cmd "$MASTER_IP" "
+        if kubectl get ns kubesphere-system 2>/dev/null; then
+            echo '=========================================='
+            echo 'KubeSphere状态检查'
+            echo '=========================================='
+            echo ''
+            echo '1. KubeSphere Pod状态:'
+            kubectl get pods -n kubesphere-system
+            echo ''
+            echo '2. KubeSphere服务:'
+            kubectl get svc -n kubesphere-system
+            echo ''
+            echo '3. 安装器状态:'
+            INSTALLER_POD=\$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo '')
+            if [ -n \"\$INSTALLER_POD\" ]; then
+                echo '安装器Pod: '\$INSTALLER_POD
+                kubectl logs -n kubesphere-system \$INSTALLER_POD --tail=10 2>/dev/null || echo '无法获取安装日志'
+            else
+                echo '未找到安装器Pod'
+            fi
+            echo ''
+            echo '4. 控制台访问:'
+            kubectl get svc -n kubesphere-system ks-console 2>/dev/null || echo '控制台服务不存在'
+            echo ''
+            echo '=========================================='
+        else
+            echo 'KubeSphere未安装或命名空间不存在'
+        fi
+    " || true
+    
+    log "集群状态检查完成"
+}
 
 repair_menu() {
     while true; do
