@@ -784,11 +784,19 @@ fix_calico_network() {
         echo ""
         echo "5. Calico Pod详细错误日志:"
         for pod in $(kubectl get pods -n kube-system | grep calico-node | grep -v Running | awk "{print \$1}"); do
+            echo "--- Pod $pod 详细信息 ---"
+            kubectl describe pod -n kube-system $pod | tail -20 2>/dev/null || echo "无法获取Pod描述"
+            echo ""
+            echo "--- Pod $pod 事件信息 ---"
+            kubectl get events -n kube-system --field-selector involvedObject.name=$pod --sort-by=.metadata.creationTimestamp 2>/dev/null || echo "无法获取事件信息"
+            echo ""
             echo "--- Pod $pod 当前日志 ---"
             kubectl logs -n kube-system $pod --tail=15 2>/dev/null || echo "无法获取当前日志"
             echo ""
-            echo "--- Pod $pod 前一个容器日志 ---"
-            kubectl logs -n kube-system $pod --previous --tail=10 2>/dev/null || echo "无前一个容器日志"
+            echo "--- Pod $pod 初始化容器日志 ---"
+            kubectl logs -n kube-system $pod -c install-cni --tail=10 2>/dev/null || echo "无法获取install-cni日志"
+            kubectl logs -n kube-system $pod -c upgrade-ipam --tail=10 2>/dev/null || echo "无法获取upgrade-ipam日志"
+            kubectl logs -n kube-system $pod -c mount-bpffs --tail=10 2>/dev/null || echo "无法获取mount-bpffs日志"
             echo ""
         done
     ' || true
@@ -819,6 +827,157 @@ fix_calico_network() {
     fi
     
     success "Calico网络修复完成"
+}
+
+# 强力修复Calico网络问题
+force_fix_calico_network() {
+    log "开始强力修复Calico网络问题..."
+    
+    # 检查K8S集群状态
+    if ! run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
+        err "K8S集群未就绪，无法修复网络问题"
+        return 1
+    fi
+    
+    log "第一步：彻底清理所有网络组件..."
+    
+    # 在所有节点上清理
+    for node_ip in "$MASTER_IP" "${WORKER_IPS[@]}"; do
+        log "在节点 $node_ip 上执行深度清理..."
+        run_remote_cmd "$node_ip" '
+            echo "=== 深度清理网络组件 ==="
+            
+            # 1. 停止所有网络相关服务
+            echo "1. 停止网络服务..."
+            systemctl stop kubelet
+            systemctl stop containerd
+            
+            # 2. 清理所有网络接口
+            echo "2. 清理网络接口..."
+            for iface in $(ip link show | grep -E "cali|tunl|vxlan|flannel" | awk -F: "{print \$2}" | tr -d " "); do
+                [ -n "$iface" ] && ip link delete $iface 2>/dev/null || true
+            done
+            
+            # 3. 清理路由表
+            echo "3. 清理路由表..."
+            ip route flush proto bird 2>/dev/null || true
+            ip route flush table main 2>/dev/null || true
+            
+            # 4. 清理iptables规则
+            echo "4. 清理iptables规则..."
+            iptables -F
+            iptables -t nat -F
+            iptables -t mangle -F
+            iptables -X
+            iptables -t nat -X
+            iptables -t mangle -X
+            
+            # 5. 清理CNI配置
+            echo "5. 清理CNI配置..."
+            rm -rf /etc/cni/net.d/*
+            rm -rf /var/lib/cni/*
+            rm -rf /var/lib/calico/*
+            rm -rf /var/run/calico/*
+            rm -rf /var/log/calico/*
+            rm -rf /opt/cni/bin/calico*
+            rm -rf /opt/cni/bin/flannel*
+            
+            # 6. 清理容器和镜像
+            echo "6. 清理容器和镜像..."
+            crictl rmi --prune 2>/dev/null || true
+            
+            # 7. 重启服务
+            echo "7. 重启服务..."
+            systemctl start containerd
+            sleep 10
+            systemctl start kubelet
+            
+            echo "节点 $node_ip 深度清理完成"
+        ' || true
+    done
+    
+    log "第二步：等待集群稳定..."
+    sleep 60
+    
+    log "第三步：使用最简配置重新安装Calico..."
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== 使用最简配置安装Calico ==="
+        
+        # 删除所有现有的Calico资源
+        kubectl delete -n kube-system daemonset calico-node --force --grace-period=0 2>/dev/null || true
+        kubectl delete -n kube-system deployment calico-kube-controllers --force --grace-period=0 2>/dev/null || true
+        
+        # 等待Pod完全删除
+        sleep 30
+        
+        # 使用最基本的Calico配置
+        cat > /tmp/calico-minimal.yaml << "EOF"
+# Calico Version v3.25.0
+# https://docs.projectcalico.org/releases/v3.25.0
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  # Configures Calico networking.
+  calicoNetwork:
+    # Note: The ipPools section cannot be modified post-install.
+    ipPools:
+    - blockSize: 26
+      cidr: 10.244.0.0/16
+      encapsulation: VXLANCrossSubnet
+      natOutgoing: Enabled
+      nodeSelector: all()
+---
+# This section configures the Calico API server.
+# For more information, see: https://docs.projectcalico.org/reference/installation/api#operator.tigera.io/v1.APIServer
+apiVersion: operator.tigera.io/v1
+kind: APIServer
+metadata:
+  name: default
+spec: {}
+EOF
+        
+        # 先安装Calico operator
+        kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/tigera-operator.yaml 2>/dev/null || true
+        
+        # 等待operator启动
+        sleep 30
+        
+        # 应用配置
+        kubectl apply -f /tmp/calico-minimal.yaml
+        
+        echo "Calico最简配置安装完成"
+    ' || true
+    
+    log "第四步：等待Calico完全启动..."
+    sleep 120
+    
+    log "第五步：验证修复结果..."
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== 强力修复后状态检查 ==="
+        echo ""
+        echo "1. Calico operator状态:"
+        kubectl get pods -n tigera-operator 2>/dev/null || echo "operator未安装"
+        echo ""
+        echo "2. Calico Pod状态:"
+        kubectl get pods -n calico-system 2>/dev/null || echo "calico-system命名空间不存在"
+        kubectl get pods -n kube-system | grep calico 2>/dev/null || echo "kube-system中无calico"
+        echo ""
+        echo "3. 节点状态:"
+        kubectl get nodes -o wide
+        echo ""
+        echo "4. 网络接口:"
+        ip a | grep -E "cali|tunl|vxlan" | head -10 || echo "暂未发现网络接口"
+        echo ""
+        echo "5. 路由表:"
+        ip route | head -10
+        echo ""
+        echo "6. 网络连通性测试:"
+        kubectl get pods -n kube-system -o wide | head -5
+    ' || true
+    
+    success "强力Calico网络修复完成"
 }
 
 # 修复KubeSphere安装问题
@@ -1168,6 +1327,7 @@ repair_menu() {
         echo -e "${GREEN}网络修复:${NC}"
         echo -e "${YELLOW}1.${NC} 修复Flannel网络问题"
         echo -e "${YELLOW}2.${NC} 专门修复Calico网络问题"
+        echo -e "${YELLOW}13.${NC} 强力修复Calico网络问题"
         echo ""
         echo -e "${GREEN}基础修复:${NC}"
         echo -e "${YELLOW}3.${NC} 修复API服务器连接问题"
@@ -1188,7 +1348,7 @@ repair_menu() {
         echo -e "${YELLOW}12.${NC} 一键修复所有问题"
         echo -e "${YELLOW}0.${NC} 返回主菜单"
         echo -e "${CYAN}================================================${NC}"
-        read -p "请选择操作 (0-12): " repair_choice
+        read -p "请选择操作 (0-13): " repair_choice
         case $repair_choice in
             1) fix_flannel_network;;
             2) fix_calico_network;;
@@ -1202,6 +1362,7 @@ repair_menu() {
             10) configure_firewall;;
             11) generate_access_info;;
             12) fix_all_issues;;
+            13) force_fix_calico_network;;
             0) break;;
             *) err "无效选择，请重新输入";;
         esac
