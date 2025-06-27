@@ -572,6 +572,8 @@ show_menu() {
     echo -e "${YELLOW}9.${NC} 诊断Cloud-init配置"
     echo -e "${YELLOW}10.${NC} 诊断单个虚拟机"
     echo -e "${YELLOW}11.${NC} 升级K8S和KubeSphere"
+    echo -e "${YELLOW}12.${NC} 诊断KubeSphere安装问题"
+    echo -e "${YELLOW}13.${NC} 部署轻量版KubeSphere"
     echo -e "${YELLOW}0.${NC} 退出"
     echo -e "${CYAN}================================${NC}"
 }
@@ -1167,6 +1169,114 @@ curl -sfL https://get-kk.kubesphere.io | VERSION=latest sh -
     log "升级流程结束，请检查各节点状态。"
 }
 
+# 新增：KubeSphere安装诊断功能
+diagnose_kubesphere() {
+    log "开始诊断KubeSphere安装问题..."
+    
+    # 检查K8S集群状态
+    log "检查K8S集群状态..."
+    sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "
+        echo '=== K8S集群状态 ==='
+        echo '1. 节点状态:'
+        kubectl get nodes -o wide
+        echo ''
+        echo '2. 系统Pod状态:'
+        kubectl get pods -n kube-system
+        echo ''
+        echo '3. 资源使用情况:'
+        kubectl top nodes 2>/dev/null || echo 'metrics-server未安装或未运行'
+        echo ''
+        echo '4. 存储类:'
+        kubectl get storageclass
+        echo ''
+        echo '5. 持久卷:'
+        kubectl get pv
+        echo ''
+        echo '6. 持久卷声明:'
+        kubectl get pvc -A
+    " || true
+    
+    # 检查KubeSphere安装状态
+    log "检查KubeSphere安装状态..."
+    sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "
+        echo '=== KubeSphere安装状态 ==='
+        echo '1. KubeSphere命名空间:'
+        kubectl get ns | grep kubesphere || echo 'kubesphere-system命名空间不存在'
+        echo ''
+        echo '2. KubeSphere Pod状态:'
+        kubectl get pods -n kubesphere-system 2>/dev/null || echo 'kubesphere-system命名空间不存在'
+        echo ''
+        echo '3. KubeSphere服务:'
+        kubectl get svc -n kubesphere-system 2>/dev/null || echo 'kubesphere-system命名空间不存在'
+        echo ''
+        echo '4. 安装器Pod日志:'
+        INSTALLER_POD=\$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo '')
+        if [ -n \"\$INSTALLER_POD\" ]; then
+            echo '安装器Pod: '\$INSTALLER_POD
+            kubectl logs -n kubesphere-system \$INSTALLER_POD --tail=20 2>/dev/null || echo '无法获取安装日志'
+        else
+            echo '未找到安装器Pod'
+        fi
+        echo ''
+        echo '5. 事件信息:'
+        kubectl get events -n kubesphere-system --sort-by=.metadata.creationTimestamp | tail -10 2>/dev/null || echo '无法获取事件信息'
+        echo ''
+        echo '6. 集群事件:'
+        kubectl get events --sort-by=.metadata.creationTimestamp | grep -i kubesphere | tail -10 2>/dev/null || echo '未找到KubeSphere相关事件'
+    " || true
+    
+    # 检查资源使用情况
+    log "检查系统资源使用情况..."
+    sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no $CLOUDINIT_USER@$MASTER_IP "
+        echo '=== 系统资源使用情况 ==='
+        echo '1. 内存使用:'
+        free -h
+        echo ''
+        echo '2. 磁盘使用:'
+        df -h
+        echo ''
+        echo '3. CPU使用:'
+        top -bn1 | head -20
+        echo ''
+        echo '4. 网络连接:'
+        netstat -tlnp | grep :6443 || echo '6443端口未监听'
+        netstat -tlnp | grep :30880 || echo '30880端口未监听'
+    " || true
+    
+    # 提供解决方案
+    log "=== 常见问题解决方案 ==="
+    echo ""
+    echo "1. 如果Pod一直Pending，可能原因："
+    echo "   - 资源不足（CPU/内存）"
+    echo "   - 镜像下载失败"
+    echo "   - 存储问题"
+    echo "   - 网络问题"
+    echo ""
+    echo "2. 解决方案："
+    echo "   a) 检查资源："
+    echo "      kubectl describe pod <pod-name> -n kubesphere-system"
+    echo ""
+    echo "   b) 清理并重新安装："
+    echo "      kubectl delete -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml"
+    echo "      kubectl delete -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml"
+    echo "      kubectl delete ns kubesphere-system --force --grace-period=0"
+    echo ""
+    echo "   c) 使用最小化安装："
+    echo "      kubectl apply -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml"
+    echo "      kubectl patch cc ks-installer -n kubesphere-system --type='json' -p='[{\"op\": \"replace\", \"path\": \"/spec/authentication/mode\", \"value\": \"minimal\"}]'"
+    echo ""
+    echo "   d) 检查镜像拉取："
+    echo "      kubectl get events -n kubesphere-system | grep -i image"
+    echo ""
+    echo "3. 手动安装KubeSphere Core（轻量版）："
+    echo "   kubectl apply -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml"
+    echo "   kubectl apply -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml"
+    echo ""
+    
+    echo ""
+    read -p "按回车键返回主菜单..."
+}
+
 # 修改K8S和KubeSphere安装逻辑，始终安装最新版
 # K8S安装部分已默认用apt最新包，不指定版本
 # KubeSphere安装部分：
@@ -1440,7 +1550,7 @@ main() {
     if [ -z "$1" ]; then
         while true; do
             show_menu
-            read -p "请选择操作 [0-11]: " choice
+            read -p "请选择操作 [0-13]: " choice
             case $choice in
                 1) diagnose_pve ;;
                 2) download_cloud_image ;;
@@ -1470,6 +1580,8 @@ main() {
                      fi
                      ;;
                 11) upgrade_k8s_kubesphere ;;
+                12) diagnose_kubesphere ;;
+                13) deploy_kubesphere ;;
                 0) log "退出程序"; exit 0 ;;
                 *) echo -e "${RED}无效选择，请重新输入${NC}"; sleep 2 ;;
             esac
