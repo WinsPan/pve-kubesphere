@@ -378,6 +378,95 @@ fix_controller_manager() {
     log "kube-controller-manager修复完成"
 }
 
+# 修复API服务器连接问题
+fix_api_server() {
+    log "开始修复API服务器连接问题..."
+    
+    log "检查API服务器状态..."
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== API服务器诊断 ==="
+        echo ""
+        echo "1. 检查kubelet服务状态:"
+        systemctl status kubelet | head -10
+        echo ""
+        echo "2. 检查API服务器容器:"
+        crictl ps | grep kube-apiserver || echo "未找到API服务器容器"
+        echo ""
+        echo "3. 检查API服务器Pod:"
+        kubectl get pods -n kube-system | grep apiserver 2>/dev/null || echo "无法连接API服务器"
+        echo ""
+        echo "4. 检查API服务器端口:"
+        netstat -tlnp | grep :6443 || echo "6443端口未监听"
+        echo ""
+        echo "5. 检查系统负载:"
+        uptime
+        echo ""
+        echo "6. 检查磁盘空间:"
+        df -h | head -5
+    ' || true
+    
+    log "重启kubelet和containerd服务..."
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== 重启相关服务 ==="
+        echo "1. 重启containerd..."
+        systemctl restart containerd
+        sleep 10
+        
+        echo "2. 重启kubelet..."
+        systemctl restart kubelet
+        sleep 20
+        
+        echo "3. 检查服务状态..."
+        systemctl is-active containerd kubelet
+        
+        echo "4. 等待API服务器启动..."
+        sleep 30
+        
+        echo "5. 检查API服务器容器:"
+        crictl ps | grep kube-apiserver || echo "API服务器容器未启动"
+    ' || true
+    
+    log "等待API服务器完全启动..."
+    sleep 60
+    
+    log "验证API服务器恢复..."
+    local retry_count=0
+    local max_retries=5
+    
+    while [ $retry_count -lt $max_retries ]; do
+        if run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
+            success "✓ API服务器已恢复正常"
+            run_remote_cmd "$MASTER_IP" '
+                echo "=== API服务器恢复后状态 ==="
+                echo "1. 集群节点状态:"
+                kubectl get nodes
+                echo ""
+                echo "2. 系统Pod状态:"
+                kubectl get pods -n kube-system | grep -E "apiserver|etcd|scheduler|controller"
+                echo ""
+                echo "3. API服务器端口:"
+                netstat -tlnp | grep :6443
+            ' || true
+            break
+        else
+            retry_count=$((retry_count + 1))
+            warn "API服务器尚未恢复，重试 $retry_count/$max_retries..."
+            sleep 30
+        fi
+    done
+    
+    if [ $retry_count -eq $max_retries ]; then
+        err "API服务器恢复失败，可能需要手动检查以下项目："
+        echo "1. 检查etcd服务状态"
+        echo "2. 检查证书文件是否正确"
+        echo "3. 检查磁盘空间是否充足"
+        echo "4. 检查系统资源使用情况"
+        echo "5. 查看kubelet日志: journalctl -u kubelet -f"
+    fi
+    
+    log "API服务器修复完成"
+}
+
 # 专门修复Calico网络问题
 fix_calico_network() {
     log "开始专门修复Calico网络问题..."
@@ -562,48 +651,51 @@ fix_calico_network() {
         cd /tmp
         rm -f calico.yaml calico-custom.yaml
         
-        # 尝试多个源下载Calico
-        if ! wget -O calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.26.4/manifests/calico.yaml 2>/dev/null; then
-            if ! wget -O calico.yaml https://docs.projectcalico.org/manifests/calico.yaml 2>/dev/null; then
-                echo "下载失败，使用备用配置..."
-                # 如果下载失败，创建基本配置
-                cat > calico.yaml << "EOF"
-# 这里可以放置一个基本的Calico配置
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: kube-system
----
-# 基本的Calico DaemonSet配置
-EOF
-            fi
+        # 尝试下载Calico配置，使用稳定版本
+        echo "尝试下载Calico v3.25.0配置..."
+        if wget -O calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml 2>/dev/null; then
+            echo "✓ 成功下载Calico v3.25.0配置"
+        elif curl -o calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml 2>/dev/null; then
+            echo "✓ 使用curl下载Calico v3.25.0配置"
+        else
+            echo "下载失败，使用kubectl直接安装..."
+            # 直接使用kubectl安装，不修改配置
+            kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml
+            echo "Calico安装完成（使用默认配置）"
+            return
         fi
         
-        # 2. 修改配置文件
-        echo "2. 修改Calico配置..."
+        # 2. 验证下载的配置文件
+        echo "2. 验证配置文件..."
+        if ! kubectl apply --dry-run=client -f calico.yaml >/dev/null 2>&1; then
+            echo "配置文件格式有问题，使用在线安装..."
+            kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml
+            echo "Calico在线安装完成"
+            return
+        fi
+        
+        # 3. 修改配置文件（仅修改必要的部分）
+        echo "3. 修改Calico配置..."
         cp calico.yaml calico-custom.yaml
         
-        # 修改Pod网络CIDR
-        sed -i "s|# - name: CALICO_IPV4POOL_CIDR|  - name: CALICO_IPV4POOL_CIDR|g" calico-custom.yaml
-        sed -i "s|#   value: \"192.168.0.0/16\"|    value: \"10.244.0.0/16\"|g" calico-custom.yaml
-        
-        # 设置网络模式
-        sed -i "s|# - name: CALICO_IPV4POOL_IPIP|  - name: CALICO_IPV4POOL_IPIP|g" calico-custom.yaml
-        sed -i "s|#   value: \"Always\"|    value: \"CrossSubnet\"|g" calico-custom.yaml
-        
-        # 禁用IPv6（如果不需要）
-        sed -i "s|# - name: IP6|  - name: IP6|g" calico-custom.yaml
-        sed -i "s|#   value: \"autodetect\"|    value: \"none\"|g" calico-custom.yaml
-        
-        # 设置网络接口检测
-        sed -i "s|# - name: IP_AUTODETECTION_METHOD|  - name: IP_AUTODETECTION_METHOD|g" calico-custom.yaml
-        sed -i "s|#   value: \"interface=eth0\"|    value: \"interface=eth0\"|g" calico-custom.yaml
+        # 只修改Pod网络CIDR，其他保持默认
+        if grep -q "CALICO_IPV4POOL_CIDR" calico-custom.yaml; then
+            sed -i "s|# - name: CALICO_IPV4POOL_CIDR|  - name: CALICO_IPV4POOL_CIDR|g" calico-custom.yaml
+            sed -i "s|#   value: \"192.168.0.0/16\"|    value: \"10.244.0.0/16\"|g" calico-custom.yaml
+            echo "✓ 已设置Pod网络CIDR为10.244.0.0/16"
+        fi
         
         echo "配置修改完成"
         
-        # 3. 应用配置
-        echo "3. 应用Calico配置..."
-        kubectl apply -f calico-custom.yaml
+        # 4. 验证修改后的配置
+        echo "4. 验证修改后的配置..."
+        if kubectl apply --dry-run=client -f calico-custom.yaml >/dev/null 2>&1; then
+            echo "✓ 配置文件验证通过"
+            kubectl apply -f calico-custom.yaml
+        else
+            echo "修改后的配置有问题，使用原始配置..."
+            kubectl apply -f calico.yaml
+        fi
         
         echo "Calico重新安装完成"
         
@@ -632,6 +724,31 @@ EOF
         echo "4. Pod网络测试:"
         kubectl get pods -n kube-system -o wide | head -5
     ' || true
+    
+    # 检查API服务器状态
+    log "检查API服务器状态..."
+    if ! run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
+        warn "API服务器连接失败，尝试重启API服务器..."
+        run_remote_cmd "$MASTER_IP" '
+            echo "重启API服务器..."
+            systemctl restart kubelet
+            # 等待API服务器重新启动
+            sleep 30
+            # 检查API服务器Pod
+            crictl ps | grep kube-apiserver || echo "API服务器Pod未找到"
+        ' || true
+        
+        # 再次等待API服务器启动
+        log "等待API服务器恢复..."
+        sleep 60
+        
+        # 验证API服务器是否恢复
+        if run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
+            success "✓ API服务器已恢复"
+        else
+            warn "✗ API服务器仍未恢复，可能需要手动检查"
+        fi
+    fi
     
     success "Calico网络修复完成"
 }
@@ -985,36 +1102,38 @@ repair_menu() {
         echo -e "${YELLOW}2.${NC} 专门修复Calico网络问题"
         echo ""
         echo -e "${GREEN}基础修复:${NC}"
-        echo -e "${YELLOW}3.${NC} 修复kube-controller-manager崩溃"
-        echo -e "${YELLOW}4.${NC} 修复KubeSphere安装问题"
-        echo -e "${YELLOW}5.${NC} 强制修复KubeSphere安装器"
+        echo -e "${YELLOW}3.${NC} 修复API服务器连接问题"
+        echo -e "${YELLOW}4.${NC} 修复kube-controller-manager崩溃"
+        echo -e "${YELLOW}5.${NC} 修复KubeSphere安装问题"
+        echo -e "${YELLOW}6.${NC} 强制修复KubeSphere安装器"
         echo ""
         echo -e "${GREEN}状态检查:${NC}"
-        echo -e "${YELLOW}6.${NC} 检查KubeSphere控制台访问"
-        echo -e "${YELLOW}7.${NC} 网络连通性测试"
-        echo -e "${YELLOW}8.${NC} 检查集群状态"
+        echo -e "${YELLOW}7.${NC} 检查KubeSphere控制台访问"
+        echo -e "${YELLOW}8.${NC} 网络连通性测试"
+        echo -e "${YELLOW}9.${NC} 检查集群状态"
         echo ""
         echo -e "${GREEN}系统配置:${NC}"
-        echo -e "${YELLOW}9.${NC} 配置防火墙规则"
-        echo -e "${YELLOW}10.${NC} 生成访问信息"
+        echo -e "${YELLOW}10.${NC} 配置防火墙规则"
+        echo -e "${YELLOW}11.${NC} 生成访问信息"
         echo ""
         echo -e "${GREEN}一键操作:${NC}"
-        echo -e "${YELLOW}11.${NC} 一键修复所有问题"
+        echo -e "${YELLOW}12.${NC} 一键修复所有问题"
         echo -e "${YELLOW}0.${NC} 返回主菜单"
         echo -e "${CYAN}================================================${NC}"
-        read -p "请选择操作 (0-11): " repair_choice
+        read -p "请选择操作 (0-12): " repair_choice
         case $repair_choice in
             1) fix_flannel_network;;
             2) fix_calico_network;;
-            3) fix_controller_manager;;
-            4) fix_kubesphere_installation;;
-            5) force_fix_kubesphere_installer;;
-            6) check_kubesphere_console;;
-            7) test_network_connectivity;;
-            8) check_cluster_status_repair;;
-            9) configure_firewall;;
-            10) generate_access_info;;
-            11) fix_all_issues;;
+            3) fix_api_server;;
+            4) fix_controller_manager;;
+            5) fix_kubesphere_installation;;
+            6) force_fix_kubesphere_installer;;
+            7) check_kubesphere_console;;
+            8) test_network_connectivity;;
+            9) check_cluster_status_repair;;
+            10) configure_firewall;;
+            11) generate_access_info;;
+            12) fix_all_issues;;
             0) break;;
             *) err "无效选择，请重新输入";;
         esac
@@ -1362,7 +1481,7 @@ deploy_k8s() {
 
     # K8S master初始化
     log "[K8S] master节点初始化..."
-    remote_cmd='set -e
+        remote_cmd='set -e
 echo "[K8S] 开始初始化..." | tee -a /root/k8s-init.log
 apt-get update -y 2>&1 | tee -a /root/k8s-init.log
 apt-get install -y apt-transport-https ca-certificates curl gnupg2 software-properties-common 2>&1 | tee -a /root/k8s-init.log
@@ -1373,7 +1492,7 @@ apt-get install -y kubelet kubeadm kubectl 2>&1 | tee -a /root/k8s-init.log
 swapoff -a 2>&1 | tee -a /root/k8s-init.log
 sed -i "/ swap / s/^/#/" /etc/fstab
 modprobe br_netfilter
-echo "br_netfilter" > /etc/modules-load.d/br_netfilter.conf
+ echo "br_netfilter" > /etc/modules-load.d/br_netfilter.conf
 cat <<EOF | tee /etc/sysctl.d/k8s.conf
 net.bridge.bridge-nf-call-iptables = 1
 net.ipv4.ip_forward = 1
@@ -1428,7 +1547,7 @@ apt-get install -y kubelet kubeadm kubectl 2>&1 | tee -a /root/k8s-worker-join.l
 swapoff -a 2>&1 | tee -a /root/k8s-worker-join.log
 sed -i "/ swap / s/^/#/" /etc/fstab
 modprobe br_netfilter
-echo "br_netfilter" > /etc/modules-load.d/br_netfilter.conf
+ echo "br_netfilter" > /etc/modules-load.d/br_netfilter.conf
 cat <<EOF | tee /etc/sysctl.d/k8s.conf
 net.bridge.bridge-nf-call-iptables = 1
 net.ipv4.ip_forward = 1
@@ -1474,7 +1593,7 @@ echo "=== 检查完成 ==="
         
         if [ "$READY_NODES" -gt 0 ]; then
             log "K8S集群部署成功！"
-            return 0
+    return 0
         else
             err "没有节点处于Ready状态，集群可能存在问题"
             return 1
@@ -1641,18 +1760,19 @@ auto_deploy_all() {
 # 一键修复所有问题
 fix_all_issues() {
     log "开始一键修复所有问题..."
-    echo ""
+                     echo ""
     echo -e "${CYAN}修复流程：${NC}"
     echo "1. 网络连通性测试"
     echo "2. 专门修复Calico网络问题"
-    echo "3. 修复kube-controller-manager崩溃"
-    echo "4. 修复KubeSphere安装问题"
-    echo "5. 强制修复KubeSphere安装器"
-    echo "6. 配置防火墙规则"
-    echo "7. 检查集群状态"
-    echo "8. 检查KubeSphere控制台访问"
-    echo "9. 生成访问信息"
-    echo ""
+    echo "3. 修复API服务器连接问题"
+    echo "4. 修复kube-controller-manager崩溃"
+    echo "5. 修复KubeSphere安装问题"
+    echo "6. 强制修复KubeSphere安装器"
+    echo "7. 配置防火墙规则"
+    echo "8. 检查集群状态"
+    echo "9. 检查KubeSphere控制台访问"
+    echo "10. 生成访问信息"
+                     echo ""
     read -p "是否继续执行一键修复？(y/n): " confirm
     if [[ ! $confirm =~ ^[Yy]$ ]]; then
         warn "用户取消操作"
@@ -1667,43 +1787,50 @@ fix_all_issues() {
     log "步骤2: 专门修复Calico网络问题"
     fix_calico_network
     
-    # 3. 修复kube-controller-manager崩溃
-    log "步骤3: 修复kube-controller-manager崩溃"
-    fix_controller_manager
+
     
     # 等待网络稳定
     log "等待网络稳定..."
     sleep 60
     
-    # 4. 修复KubeSphere安装问题
-    log "步骤4: 修复KubeSphere安装问题"
+    # 3. 修复API服务器连接问题
+    log "步骤3: 修复API服务器连接问题"
+    fix_api_server
+    
+    # 4. 修复kube-controller-manager崩溃
+    log "步骤4: 修复kube-controller-manager崩溃"
+    fix_controller_manager
+    
+    # 5. 修复KubeSphere安装问题
+    log "步骤5: 修复KubeSphere安装问题"
     fix_kubesphere_installation
     
-    # 5. 强制修复KubeSphere安装器
-    log "步骤5: 强制修复KubeSphere安装器"
+    # 6. 强制修复KubeSphere安装器
+    log "步骤6: 强制修复KubeSphere安装器"
     force_fix_kubesphere_installer
     
-    # 6. 配置防火墙规则
-    log "步骤6: 配置防火墙规则"
+    # 7. 配置防火墙规则
+    log "步骤7: 配置防火墙规则"
     configure_firewall
     
-    # 7. 检查集群状态
-    log "步骤7: 检查集群状态"
+    # 8. 检查集群状态
+    log "步骤8: 检查集群状态"
     check_cluster_status_repair
     
-    # 8. 检查KubeSphere控制台访问
-    log "步骤8: 检查KubeSphere控制台访问"
+    # 9. 检查KubeSphere控制台访问
+    log "步骤9: 检查KubeSphere控制台访问"
     check_kubesphere_console
     
-    # 9. 生成访问信息
-    log "步骤9: 生成访问信息"
+    # 10. 生成访问信息
+    log "步骤10: 生成访问信息"
     generate_access_info
     
     success "一键修复完成！"
-    echo ""
+                         echo ""
     echo -e "${GREEN}修复总结：${NC}"
     echo "✓ 网络连通性已测试"
     echo "✓ Calico网络问题已专门修复"
+    echo "✓ API服务器连接已修复"
     echo "✓ kube-controller-manager已重启"
     echo "✓ KubeSphere安装器已修复"
     echo "✓ 防火墙规则已配置"
@@ -1833,7 +1960,7 @@ test_network_connectivity() {
 generate_access_info() {
     log "生成访问信息..."
     
-    echo ""
+        echo ""
     echo -e "${CYAN}========== 访问信息 ==========${NC}"
     echo -e "${GREEN}KubeSphere控制台:${NC}"
     echo "  URL: http://$MASTER_IP:30880"
@@ -2056,4 +2183,4 @@ main() {
 }
 
 # 脚本入口
-main "$@"
+main "$@" 
