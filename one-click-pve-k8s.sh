@@ -1008,25 +1008,280 @@ fix_calico_api_connection() {
     run_remote_cmd "$MASTER_IP" '
         echo "=== 修复kube-proxy ==="
         
-        # 1. 重启kube-proxy
-        echo "1. 重启kube-proxy..."
-        kubectl delete pods -n kube-system -l k8s-app=kube-proxy --force --grace-period=0 2>/dev/null || true
-        sleep 20
+        # 1. 检查并创建必要的ServiceAccount
+        echo "1. 检查ServiceAccount..."
         
-        # 2. 检查kube-proxy状态
-        echo "2. 检查kube-proxy状态:"
-        kubectl get pods -n kube-system | grep kube-proxy
+        # 创建kube-proxy ServiceAccount
+        if ! kubectl get serviceaccount -n kube-system kube-proxy >/dev/null 2>&1; then
+            echo "创建kube-proxy ServiceAccount..."
+            kubectl create serviceaccount kube-proxy -n kube-system
+            kubectl create clusterrolebinding kube-proxy --clusterrole=system:node-proxier --serviceaccount=kube-system:kube-proxy
+        fi
         
-        # 3. 重启coredns
-        echo "3. 重启coredns..."
-        kubectl delete pods -n kube-system -l k8s-app=kube-dns --force --grace-period=0 2>/dev/null || true
-        sleep 20
+        # 创建coredns ServiceAccount
+        if ! kubectl get serviceaccount -n kube-system coredns >/dev/null 2>&1; then
+            echo "创建coredns ServiceAccount..."
+            kubectl create serviceaccount coredns -n kube-system
+            kubectl create clusterrolebinding system:coredns --clusterrole=system:coredns --serviceaccount=kube-system:coredns
+        fi
         
-        # 4. 检查coredns状态
-        echo "4. 检查coredns状态:"
-        kubectl get pods -n kube-system | grep coredns
+                 # 创建kube-proxy ConfigMap
+        if ! kubectl get configmap -n kube-system kube-proxy >/dev/null 2>&1; then
+            echo "创建kube-proxy ConfigMap..."
+            cat > /tmp/kube-proxy-config.yaml << "EOF"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-proxy
+  namespace: kube-system
+data:
+  config.conf: |
+    apiVersion: kubeproxy.config.k8s.io/v1alpha1
+    kind: KubeProxyConfiguration
+    clientConnection:
+      kubeconfig: /var/lib/kube-proxy/kubeconfig.conf
+    mode: "iptables"
+    clusterCIDR: "10.244.0.0/16"
+  kubeconfig.conf: |
+    apiVersion: v1
+    kind: Config
+    clusters:
+    - cluster:
+        certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        server: https://10.0.0.10:6443
+      name: default
+    contexts:
+    - context:
+        cluster: default
+        namespace: default
+        user: default
+      name: default
+    current-context: default
+    users:
+    - name: default
+      user:
+        tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+EOF
+            kubectl apply -f /tmp/kube-proxy-config.yaml
+        fi
         
-        echo "kube-proxy和coredns重启完成"
+        # 创建coredns ConfigMap
+        if ! kubectl get configmap -n kube-system coredns >/dev/null 2>&1; then
+            echo "创建coredns ConfigMap..."
+            cat > /tmp/coredns-config.yaml << "EOF"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health {
+            lameduck 5s
+        }
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+            pods insecure
+            fallthrough in-addr.arpa ip6.arpa
+            ttl 30
+        }
+        prometheus :9153
+        forward . /etc/resolv.conf
+        cache 30
+        loop
+        reload
+        loadbalance
+    }
+EOF
+            kubectl apply -f /tmp/coredns-config.yaml
+        fi
+        
+        # 2. 检查kube-proxy是否存在
+        echo "2. 检查kube-proxy DaemonSet..."
+        if ! kubectl get daemonset -n kube-system kube-proxy >/dev/null 2>&1; then
+            echo "kube-proxy DaemonSet不存在，重新创建..."
+            
+            # 创建kube-proxy配置
+            cat > /tmp/kube-proxy.yaml << "EOF"
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    k8s-app: kube-proxy
+  name: kube-proxy
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      k8s-app: kube-proxy
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-proxy
+    spec:
+      containers:
+      - command:
+        - /usr/local/bin/kube-proxy
+        - --config=/var/lib/kube-proxy/config.conf
+        - --hostname-override=$(NODE_NAME)
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        image: registry.k8s.io/kube-proxy:v1.28.2
+        imagePullPolicy: IfNotPresent
+        name: kube-proxy
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /var/lib/kube-proxy
+          name: kube-proxy
+        - mountPath: /run/xtables.lock
+          name: xtables-lock
+        - mountPath: /lib/modules
+          name: lib-modules
+          readOnly: true
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/os: linux
+      serviceAccountName: kube-proxy
+      tolerations:
+      - operator: Exists
+      volumes:
+      - configMap:
+          name: kube-proxy
+        name: kube-proxy
+      - hostPath:
+          path: /run/xtables.lock
+          type: FileOrCreate
+        name: xtables-lock
+      - hostPath:
+          path: /lib/modules
+        name: lib-modules
+EOF
+            kubectl apply -f /tmp/kube-proxy.yaml
+        else
+            echo "kube-proxy DaemonSet存在，重启Pod..."
+            kubectl delete pods -n kube-system -l k8s-app=kube-proxy --force --grace-period=0 2>/dev/null || true
+        fi
+        
+        sleep 30
+        
+        # 3. 检查kube-proxy状态
+        echo "3. 检查kube-proxy状态:"
+        kubectl get pods -n kube-system | grep kube-proxy || echo "kube-proxy Pod未找到"
+        
+        # 4. 检查coredns是否存在
+        echo "4. 检查coredns Deployment..."
+        if ! kubectl get deployment -n kube-system coredns >/dev/null 2>&1; then
+            echo "coredns Deployment不存在，重新创建..."
+            
+            # 创建coredns配置
+            cat > /tmp/coredns.yaml << "EOF"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coredns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+    kubernetes.io/name: "CoreDNS"
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      k8s-app: kube-dns
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-dns
+    spec:
+      serviceAccountName: coredns
+      tolerations:
+        - key: "CriticalAddonsOnly"
+          operator: "Equal"
+          value: "true"
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+      - name: coredns
+        image: registry.k8s.io/coredns/coredns:v1.10.1
+        imagePullPolicy: IfNotPresent
+        resources:
+          limits:
+            memory: 170Mi
+          requests:
+            cpu: 100m
+            memory: 70Mi
+        args: [ "-conf", "/etc/coredns/Corefile" ]
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/coredns
+          readOnly: true
+        ports:
+        - containerPort: 53
+          name: dns
+          protocol: UDP
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+        - containerPort: 9153
+          name: metrics
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            add:
+            - NET_BIND_SERVICE
+            drop:
+            - all
+          readOnlyRootFilesystem: true
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 60
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8181
+            scheme: HTTP
+      dnsPolicy: Default
+      volumes:
+        - name: config-volume
+          configMap:
+            name: coredns
+            items:
+            - key: Corefile
+              path: Corefile
+EOF
+            kubectl apply -f /tmp/coredns.yaml
+        else
+            echo "coredns Deployment存在，重启Pod..."
+            kubectl delete pods -n kube-system -l k8s-app=kube-dns --force --grace-period=0 2>/dev/null || true
+        fi
+        
+        sleep 30
+        
+        # 5. 检查coredns状态
+        echo "5. 检查coredns状态:"
+        kubectl get pods -n kube-system | grep coredns || echo "coredns Pod未找到"
+        
+        echo "kube-proxy和coredns修复完成"
     ' || true
     
     log "等待服务恢复..."
