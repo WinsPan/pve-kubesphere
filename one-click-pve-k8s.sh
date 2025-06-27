@@ -107,8 +107,14 @@ run_remote_cmd() {
             return 0
         else
             if [[ $i -lt $retries ]]; then
-                warn "远程命令执行失败，重试 $i/$retries..."
-                sleep 5
+                warn "节点 $ip 远程命令执行失败，重试 $i/$retries..."
+                # 检查基本连接
+                if ! nc -z "$ip" 22 &>/dev/null; then
+                    warn "节点 $ip SSH端口不可达"
+                fi
+                sleep 10
+            else
+                err "节点 $ip 远程命令执行最终失败"
             fi
         fi
     done
@@ -131,6 +137,36 @@ wait_for_ssh() {
     done
     
     err "$ip SSH服务启动超时"
+    return 1
+}
+
+# 等待Cloud-init完成
+wait_for_cloudinit() {
+    local ip=$1
+    local max_try=${2:-60}
+    
+    log "等待 $ip Cloud-init初始化完成..."
+    
+    for ((i=1; i<=max_try; i++)); do
+        # 检查Cloud-init状态
+        if sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=10 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$CLOUDINIT_USER@$ip" "cloud-init status --wait" 2>/dev/null; then
+            
+            success "$ip Cloud-init初始化完成"
+            return 0
+        else
+            if [[ $((i % 10)) -eq 0 ]]; then
+                log "$ip Cloud-init还在运行中... ($i/$max_try)"
+            fi
+            sleep 10
+        fi
+    done
+    
+    warn "$ip Cloud-init等待超时，尝试继续..."
     return 1
 }
 
@@ -593,7 +629,12 @@ wait_for_vms() {
         wait_for_ssh "$ip"
     done
     
-    success "所有虚拟机已启动"
+    # 等待Cloud-init完成
+    for ip in "${VM_IPS[@]}"; do
+        wait_for_cloudinit "$ip"
+    done
+    
+    success "所有虚拟机已启动并初始化完成"
 }
 
 # 部署K8S集群
@@ -696,6 +737,87 @@ cleanup_all() {
     success "清理完成"
 }
 
+# 诊断虚拟机连接状态
+diagnose_vms() {
+    log "诊断虚拟机连接状态..."
+    
+    for i in "${!VM_IDS[@]}"; do
+        local vm_id="${VM_IDS[$i]}"
+        local vm_name="${VM_NAMES[$i]}"
+        local vm_ip="${VM_IPS[$i]}"
+        
+        echo -e "\n${CYAN}=== 诊断虚拟机: $vm_name ($vm_ip) ===${NC}"
+        
+        # 1. 检查虚拟机状态
+        if qm status "$vm_id" &>/dev/null; then
+            local status=$(qm status "$vm_id" | awk '{print $2}')
+            echo -e "虚拟机状态: ${GREEN}$status${NC}"
+        else
+            echo -e "虚拟机状态: ${RED}不存在${NC}"
+            continue
+        fi
+        
+        # 2. 检查网络连通性
+        if ping -c 1 -W 3 "$vm_ip" &>/dev/null; then
+            echo -e "网络连通性: ${GREEN}正常${NC}"
+        else
+            echo -e "网络连通性: ${RED}失败${NC}"
+            continue
+        fi
+        
+        # 3. 检查SSH端口
+        if nc -z "$vm_ip" 22 2>/dev/null; then
+            echo -e "SSH端口: ${GREEN}开放${NC}"
+        else
+            echo -e "SSH端口: ${RED}关闭${NC}"
+            continue
+        fi
+        
+        # 4. 检查SSH认证
+        if sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$CLOUDINIT_USER@$vm_ip" "echo 'SSH连接成功'" 2>/dev/null; then
+            echo -e "SSH认证: ${GREEN}成功${NC}"
+        else
+            echo -e "SSH认证: ${RED}失败${NC}"
+            continue
+        fi
+        
+        # 5. 检查Cloud-init状态
+        local cloudinit_status
+        cloudinit_status=$(sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$CLOUDINIT_USER@$vm_ip" "cloud-init status" 2>/dev/null || echo "unknown")
+        
+        if [[ "$cloudinit_status" == *"done"* ]]; then
+            echo -e "Cloud-init状态: ${GREEN}完成${NC}"
+        elif [[ "$cloudinit_status" == *"running"* ]]; then
+            echo -e "Cloud-init状态: ${YELLOW}运行中${NC}"
+        else
+            echo -e "Cloud-init状态: ${RED}$cloudinit_status${NC}"
+        fi
+        
+        # 6. 检查系统负载
+        local load_avg
+        load_avg=$(sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$CLOUDINIT_USER@$vm_ip" "uptime | awk -F'load average:' '{print \$2}' | awk '{print \$1}'" 2>/dev/null || echo "unknown")
+        
+        echo -e "系统负载: $load_avg"
+    done
+    
+    echo -e "\n${GREEN}诊断完成${NC}"
+}
+
 # ==========================================
 # 界面显示
 # ==========================================
@@ -725,6 +847,9 @@ show_menu() {
     echo -e "  ${CYAN}8.${NC} 检查集群状态"
     echo -e "  ${CYAN}9.${NC} 一键修复所有问题"
     echo ""
+    echo -e "${BLUE}诊断功能：${NC}"
+    echo -e "  ${CYAN}11.${NC} 检查虚拟机连接状态"
+    echo ""
     echo -e "${RED}管理功能：${NC}"
     echo -e "  ${CYAN}10.${NC} 清理所有资源"
     echo -e "  ${CYAN}0.${NC} 退出"
@@ -743,7 +868,7 @@ main() {
         show_banner
         show_menu
         
-        read -p "请选择操作 [0-10]: " choice
+        read -p "请选择操作 [0-11]: " choice
         
         case $choice in
             1)
@@ -780,6 +905,7 @@ main() {
                 fi
                 ;;
             10) cleanup_all ;;
+            11) diagnose_vms ;;
             0) 
                 log "退出脚本"
                 exit 0 
