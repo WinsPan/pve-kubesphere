@@ -339,43 +339,301 @@ fix_controller_manager() {
     fi
     
     log "检查kube-controller-manager状态..."
-    run_remote_cmd "$MASTER_IP" "
-        echo '=== kube-controller-manager状态 ==='
-        kubectl get pods -n kube-system | grep controller-manager || echo '未找到controller-manager Pod'
-        echo ''
-        echo '=== 系统资源状态 ==='
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== kube-controller-manager状态 ==="
+        kubectl get pods -n kube-system | grep controller-manager || echo "未找到controller-manager Pod"
+        echo ""
+        echo "=== 系统资源状态 ==="
         free -h
-        echo ''
+        echo ""
         df -h | head -5
-        echo ''
-        echo '=== 系统负载 ==='
+        echo ""
+        echo "=== 系统负载 ==="
         uptime
-    " || true
+    ' || true
     
     log "重启kube-controller-manager..."
-    run_remote_cmd "$MASTER_IP" "
-        echo '重启kube-controller-manager...'
+    run_remote_cmd "$MASTER_IP" '
+        echo "重启kube-controller-manager..."
         # 删除controller-manager Pod，让kubelet重新创建
         kubectl delete pod -n kube-system -l component=kube-controller-manager --force --grace-period=0 2>/dev/null || true
-        echo 'controller-manager Pod已删除，等待重新创建...'
-    " || true
+        echo "controller-manager Pod已删除，等待重新创建..."
+    ' || true
     
     log "等待controller-manager重启..."
     sleep 30
     
     log "检查修复结果..."
-    run_remote_cmd "$MASTER_IP" "
-        echo '=== 修复后controller-manager状态 ==='
-        kubectl get pods -n kube-system | grep controller-manager || echo '未找到controller-manager Pod'
-        echo ''
-        echo '=== 系统Pod状态 ==='
-        kubectl get pods -n kube-system | grep -E '(controller|scheduler|apiserver|etcd)' || echo '未找到系统Pod'
-        echo ''
-        echo '=== 事件信息 ==='
-        kubectl get events --sort-by=.metadata.creationTimestamp | tail -10 2>/dev/null || echo '无法获取事件信息'
-    " || true
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== 修复后controller-manager状态 ==="
+        kubectl get pods -n kube-system | grep controller-manager || echo "未找到controller-manager Pod"
+        echo ""
+        echo "=== 系统Pod状态 ==="
+        kubectl get pods -n kube-system | grep -E "controller|scheduler|apiserver|etcd" || echo "未找到系统Pod"
+        echo ""
+        echo "=== 事件信息 ==="
+        kubectl get events --sort-by=.metadata.creationTimestamp | tail -10 2>/dev/null || echo "无法获取事件信息"
+    ' || true
     
     log "kube-controller-manager修复完成"
+}
+
+# 专门修复Calico网络问题
+fix_calico_network() {
+    log "开始专门修复Calico网络问题..."
+    
+    # 检查K8S集群状态
+    if ! run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
+        err "K8S集群未就绪，无法修复网络问题"
+        return 1
+    fi
+    
+    log "诊断Calico网络问题..."
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== Calico网络诊断 ==="
+        echo ""
+        echo "1. Calico Pod状态:"
+        kubectl get pods -n kube-system | grep calico || echo "未找到Calico Pod"
+        echo ""
+        echo "2. Calico节点状态:"
+        kubectl get nodes -o wide
+        echo ""
+        echo "3. 网络接口状态:"
+        ip a | grep -E "cali|tunl|vxlan" || echo "未找到Calico网络接口"
+        echo ""
+        echo "4. 路由表:"
+        ip route | grep -E "cali|10\.244" || echo "未找到Calico路由"
+        echo ""
+        echo "5. iptables规则:"
+        iptables -t nat -L | grep -E "cali|KUBE" | head -10 || echo "未找到相关iptables规则"
+        echo ""
+        echo "6. 检查Calico Pod错误日志:"
+        for pod in $(kubectl get pods -n kube-system | grep calico-node | awk "{print \$1}"); do
+            echo "Pod $pod 日志:"
+            kubectl logs -n kube-system $pod --tail=5 2>/dev/null || echo "无法获取日志"
+            echo ""
+        done
+    ' || true
+    
+    log "完全清理Calico网络..."
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== 完全清理Calico网络 ==="
+        
+        # 1. 强制删除所有Calico资源
+        echo "1. 强制删除Calico资源..."
+        kubectl delete daemonset calico-node -n kube-system --force --grace-period=0 2>/dev/null || true
+        kubectl delete deployment calico-kube-controllers -n kube-system --force --grace-period=0 2>/dev/null || true
+        kubectl delete pods -n kube-system -l k8s-app=calico-node --force --grace-period=0 2>/dev/null || true
+        kubectl delete pods -n kube-system -l k8s-app=calico-kube-controllers --force --grace-period=0 2>/dev/null || true
+        kubectl delete configmap calico-config -n kube-system 2>/dev/null || true
+        kubectl delete secret calico-node -n kube-system 2>/dev/null || true
+        kubectl delete serviceaccount calico-node -n kube-system 2>/dev/null || true
+        kubectl delete serviceaccount calico-kube-controllers -n kube-system 2>/dev/null || true
+        
+        # 2. 清理CRD资源
+        echo "2. 清理Calico CRD资源..."
+        kubectl delete crd bgpconfigurations.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd bgppeers.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd blockaffinities.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd caliconodestatuses.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd clusterinformations.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd felixconfigurations.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd globalnetworkpolicies.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd globalnetworksets.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd hostendpoints.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd ipamblocks.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd ipamconfigs.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd ipamhandles.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd ippools.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd ipreservations.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd kubecontrollersconfigurations.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd networkpolicies.crd.projectcalico.org 2>/dev/null || true
+        kubectl delete crd networksets.crd.projectcalico.org 2>/dev/null || true
+        
+        # 3. 清理网络接口
+        echo "3. 清理网络接口..."
+        ip link delete cali0 2>/dev/null || true
+        ip link delete tunl0 2>/dev/null || true
+        ip link delete vxlan.calico 2>/dev/null || true
+        ip link delete felix-fv-eth0 2>/dev/null || true
+        for iface in $(ip link show | grep cali | awk -F: "{print \$2}" | tr -d " " | head -20); do
+            [ -n "$iface" ] && ip link delete $iface 2>/dev/null || true
+        done
+        
+        # 4. 清理路由
+        echo "4. 清理路由..."
+        ip route flush proto bird 2>/dev/null || true
+        ip route del 10.244.0.0/16 2>/dev/null || true
+        ip route del 192.168.0.0/16 2>/dev/null || true
+        
+        # 5. 清理iptables规则
+        echo "5. 清理iptables规则..."
+        iptables -t nat -F cali-nat-outgoing 2>/dev/null || true
+        iptables -t nat -F cali-PREROUTING 2>/dev/null || true
+        iptables -t nat -F cali-OUTPUT 2>/dev/null || true
+        iptables -t filter -F cali-FORWARD 2>/dev/null || true
+        iptables -t filter -F cali-INPUT 2>/dev/null || true
+        iptables -t filter -F cali-OUTPUT 2>/dev/null || true
+        iptables -t mangle -F cali-PREROUTING 2>/dev/null || true
+        iptables -t mangle -F cali-OUTPUT 2>/dev/null || true
+        
+        # 6. 清理CNI配置
+        echo "6. 清理CNI配置..."
+        rm -rf /etc/cni/net.d/10-calico.conflist 2>/dev/null || true
+        rm -rf /etc/cni/net.d/calico-kubeconfig 2>/dev/null || true
+        rm -rf /var/lib/calico 2>/dev/null || true
+        rm -rf /var/run/calico 2>/dev/null || true
+        rm -rf /var/log/calico 2>/dev/null || true
+        rm -rf /opt/cni/bin/calico* 2>/dev/null || true
+        
+        # 7. 重启网络服务
+        echo "7. 重启网络服务..."
+        systemctl restart containerd
+        systemctl restart kubelet
+        
+        echo "主节点Calico清理完成"
+    ' || true
+    
+    # 在所有工作节点上也执行清理
+    for worker_ip in "${WORKER_IPS[@]}"; do
+        log "在工作节点 $worker_ip 上清理Calico..."
+        run_remote_cmd "$worker_ip" '
+            echo "=== 清理工作节点上的Calico残留 ==="
+            
+            # 1. 清理网络接口
+            echo "1. 清理网络接口..."
+            ip link delete cali0 2>/dev/null || true
+            ip link delete tunl0 2>/dev/null || true
+            ip link delete vxlan.calico 2>/dev/null || true
+            ip link delete felix-fv-eth0 2>/dev/null || true
+            for iface in $(ip link show | grep cali | awk -F: "{print \$2}" | tr -d " " | head -20); do
+                [ -n "$iface" ] && ip link delete $iface 2>/dev/null || true
+            done
+            
+            # 2. 清理路由
+            echo "2. 清理路由..."
+            ip route flush proto bird 2>/dev/null || true
+            ip route del 10.244.0.0/16 2>/dev/null || true
+            ip route del 192.168.0.0/16 2>/dev/null || true
+            
+            # 3. 清理iptables规则
+            echo "3. 清理iptables规则..."
+            iptables -t nat -F cali-nat-outgoing 2>/dev/null || true
+            iptables -t nat -F cali-PREROUTING 2>/dev/null || true
+            iptables -t nat -F cali-OUTPUT 2>/dev/null || true
+            iptables -t filter -F cali-FORWARD 2>/dev/null || true
+            iptables -t filter -F cali-INPUT 2>/dev/null || true
+            iptables -t filter -F cali-OUTPUT 2>/dev/null || true
+            iptables -t mangle -F cali-PREROUTING 2>/dev/null || true
+            iptables -t mangle -F cali-OUTPUT 2>/dev/null || true
+            
+            # 4. 清理CNI配置
+            echo "4. 清理CNI配置..."
+            rm -rf /etc/cni/net.d/10-calico.conflist 2>/dev/null || true
+            rm -rf /etc/cni/net.d/calico-kubeconfig 2>/dev/null || true
+            rm -rf /var/lib/calico 2>/dev/null || true
+            rm -rf /var/run/calico 2>/dev/null || true
+            rm -rf /var/log/calico 2>/dev/null || true
+            rm -rf /opt/cni/bin/calico* 2>/dev/null || true
+            
+            # 5. 清理容器和镜像
+            echo "5. 清理容器和镜像..."
+            crictl rmi --prune 2>/dev/null || true
+            docker system prune -f 2>/dev/null || true
+            
+            # 6. 重启服务
+            echo "6. 重启服务..."
+            systemctl restart containerd
+            systemctl restart kubelet
+            
+            echo "工作节点 '$worker_ip' 清理完成"
+        ' || true
+    done
+    
+    log "等待集群稳定..."
+    sleep 30
+    
+    log "重新安装Calico网络插件..."
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== 重新安装Calico网络插件 ==="
+        
+        # 1. 下载Calico配置
+        echo "1. 下载Calico配置文件..."
+        cd /tmp
+        rm -f calico.yaml calico-custom.yaml
+        
+        # 尝试多个源下载Calico
+        if ! wget -O calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.26.4/manifests/calico.yaml 2>/dev/null; then
+            if ! wget -O calico.yaml https://docs.projectcalico.org/manifests/calico.yaml 2>/dev/null; then
+                echo "下载失败，使用备用配置..."
+                # 如果下载失败，创建基本配置
+                cat > calico.yaml << "EOF"
+# 这里可以放置一个基本的Calico配置
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kube-system
+---
+# 基本的Calico DaemonSet配置
+EOF
+            fi
+        fi
+        
+        # 2. 修改配置文件
+        echo "2. 修改Calico配置..."
+        cp calico.yaml calico-custom.yaml
+        
+        # 修改Pod网络CIDR
+        sed -i "s|# - name: CALICO_IPV4POOL_CIDR|  - name: CALICO_IPV4POOL_CIDR|g" calico-custom.yaml
+        sed -i "s|#   value: \"192.168.0.0/16\"|    value: \"10.244.0.0/16\"|g" calico-custom.yaml
+        
+        # 设置网络模式
+        sed -i "s|# - name: CALICO_IPV4POOL_IPIP|  - name: CALICO_IPV4POOL_IPIP|g" calico-custom.yaml
+        sed -i "s|#   value: \"Always\"|    value: \"CrossSubnet\"|g" calico-custom.yaml
+        
+        # 禁用IPv6（如果不需要）
+        sed -i "s|# - name: IP6|  - name: IP6|g" calico-custom.yaml
+        sed -i "s|#   value: \"autodetect\"|    value: \"none\"|g" calico-custom.yaml
+        
+        # 设置网络接口检测
+        sed -i "s|# - name: IP_AUTODETECTION_METHOD|  - name: IP_AUTODETECTION_METHOD|g" calico-custom.yaml
+        sed -i "s|#   value: \"interface=eth0\"|    value: \"interface=eth0\"|g" calico-custom.yaml
+        
+        echo "配置修改完成"
+        
+        # 3. 应用配置
+        echo "3. 应用Calico配置..."
+        kubectl apply -f calico-custom.yaml
+        
+        echo "Calico重新安装完成"
+        
+        # 4. 验证安装
+        echo "4. 验证安装状态..."
+        sleep 10
+        kubectl get pods -n kube-system | grep calico || echo "Calico Pod尚未创建"
+    ' || true
+    
+    log "等待Calico Pod启动..."
+    sleep 90
+    
+    log "检查Calico修复结果..."
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== Calico修复后状态 ==="
+        echo ""
+        echo "1. Calico Pod状态:"
+        kubectl get pods -n kube-system | grep calico
+        echo ""
+        echo "2. 节点状态:"
+        kubectl get nodes -o wide
+        echo ""
+        echo "3. 网络接口:"
+        ip a | grep -E "(cali|tunl)" | head -10 || echo "暂未发现Calico接口"
+        echo ""
+        echo "4. Pod网络测试:"
+        kubectl get pods -n kube-system -o wide | head -5
+    ' || true
+    
+    success "Calico网络修复完成"
 }
 
 # 修复KubeSphere安装问题
@@ -676,7 +934,7 @@ check_cluster_status_repair() {
         kubectl top nodes 2>/dev/null || echo "metrics-server未安装或未运行"
         echo ""
         echo "10. 网络插件状态:"
-        kubectl get pods -n kube-system | grep -E "(flannel|calico|weave|cilium)" || echo "未找到网络插件"
+        kubectl get pods -n kube-system | grep -E "flannel|calico|weave|cilium" || echo "未找到网络插件"
         echo ""
         echo "=========================================="
         echo "检查完成"
@@ -722,37 +980,41 @@ repair_menu() {
     while true; do
         clear
         echo -e "${CYAN}========== K8S/KubeSphere 修复与诊断 ==========${NC}"
-        echo -e "${GREEN}基础修复:${NC}"
+        echo -e "${GREEN}网络修复:${NC}"
         echo -e "${YELLOW}1.${NC} 修复Flannel网络问题"
-        echo -e "${YELLOW}2.${NC} 修复kube-controller-manager崩溃"
-        echo -e "${YELLOW}3.${NC} 修复KubeSphere安装问题"
-        echo -e "${YELLOW}4.${NC} 强制修复KubeSphere安装器"
+        echo -e "${YELLOW}2.${NC} 专门修复Calico网络问题"
+        echo ""
+        echo -e "${GREEN}基础修复:${NC}"
+        echo -e "${YELLOW}3.${NC} 修复kube-controller-manager崩溃"
+        echo -e "${YELLOW}4.${NC} 修复KubeSphere安装问题"
+        echo -e "${YELLOW}5.${NC} 强制修复KubeSphere安装器"
         echo ""
         echo -e "${GREEN}状态检查:${NC}"
-        echo -e "${YELLOW}5.${NC} 检查KubeSphere控制台访问"
-        echo -e "${YELLOW}6.${NC} 网络连通性测试"
-        echo -e "${YELLOW}7.${NC} 检查集群状态"
+        echo -e "${YELLOW}6.${NC} 检查KubeSphere控制台访问"
+        echo -e "${YELLOW}7.${NC} 网络连通性测试"
+        echo -e "${YELLOW}8.${NC} 检查集群状态"
         echo ""
         echo -e "${GREEN}系统配置:${NC}"
-        echo -e "${YELLOW}8.${NC} 配置防火墙规则"
-        echo -e "${YELLOW}9.${NC} 生成访问信息"
+        echo -e "${YELLOW}9.${NC} 配置防火墙规则"
+        echo -e "${YELLOW}10.${NC} 生成访问信息"
         echo ""
         echo -e "${GREEN}一键操作:${NC}"
-        echo -e "${YELLOW}10.${NC} 一键修复所有问题"
+        echo -e "${YELLOW}11.${NC} 一键修复所有问题"
         echo -e "${YELLOW}0.${NC} 返回主菜单"
         echo -e "${CYAN}================================================${NC}"
-        read -p "请选择操作 (0-10): " repair_choice
+        read -p "请选择操作 (0-11): " repair_choice
         case $repair_choice in
             1) fix_flannel_network;;
-            2) fix_controller_manager;;
-            3) fix_kubesphere_installation;;
-            4) force_fix_kubesphere_installer;;
-            5) check_kubesphere_console;;
-            6) test_network_connectivity;;
-            7) check_cluster_status_repair;;
-            8) configure_firewall;;
-            9) generate_access_info;;
-            10) fix_all_issues;;
+            2) fix_calico_network;;
+            3) fix_controller_manager;;
+            4) fix_kubesphere_installation;;
+            5) force_fix_kubesphere_installer;;
+            6) check_kubesphere_console;;
+            7) test_network_connectivity;;
+            8) check_cluster_status_repair;;
+            9) configure_firewall;;
+            10) generate_access_info;;
+            11) fix_all_issues;;
             0) break;;
             *) err "无效选择，请重新输入";;
         esac
@@ -1382,7 +1644,7 @@ fix_all_issues() {
     echo ""
     echo -e "${CYAN}修复流程：${NC}"
     echo "1. 网络连通性测试"
-    echo "2. 修复Flannel网络问题"
+    echo "2. 专门修复Calico网络问题"
     echo "3. 修复kube-controller-manager崩溃"
     echo "4. 修复KubeSphere安装问题"
     echo "5. 强制修复KubeSphere安装器"
@@ -1401,13 +1663,17 @@ fix_all_issues() {
     log "步骤1: 网络连通性测试"
     test_network_connectivity
     
-    # 2. 修复Flannel网络问题
-    log "步骤2: 修复Flannel网络问题"
-    fix_flannel_network
+    # 2. 专门修复Calico网络问题
+    log "步骤2: 专门修复Calico网络问题"
+    fix_calico_network
     
     # 3. 修复kube-controller-manager崩溃
     log "步骤3: 修复kube-controller-manager崩溃"
     fix_controller_manager
+    
+    # 等待网络稳定
+    log "等待网络稳定..."
+    sleep 60
     
     # 4. 修复KubeSphere安装问题
     log "步骤4: 修复KubeSphere安装问题"
@@ -1437,7 +1703,7 @@ fix_all_issues() {
     echo ""
     echo -e "${GREEN}修复总结：${NC}"
     echo "✓ 网络连通性已测试"
-    echo "✓ Flannel网络问题已修复"
+    echo "✓ Calico网络问题已专门修复"
     echo "✓ kube-controller-manager已重启"
     echo "✓ KubeSphere安装器已修复"
     echo "✓ 防火墙规则已配置"
@@ -1446,10 +1712,11 @@ fix_all_issues() {
     echo "✓ 访问信息已生成"
     echo ""
     echo -e "${YELLOW}后续建议：${NC}"
-    echo "1. 等待KubeSphere安装完成（10-30分钟）"
-    echo "2. 定期检查：kubectl get pods -n kubesphere-system"
-    echo "3. 访问控制台：http://$MASTER_IP:30880"
-    echo "4. 如有问题，可单独运行相应的修复功能"
+    echo "1. 等待Calico网络完全稳定（5-10分钟）"
+    echo "2. 等待KubeSphere安装完成（10-30分钟）"
+    echo "3. 定期检查：kubectl get pods -n kubesphere-system"
+    echo "4. 访问控制台：http://$MASTER_IP:30880"
+    echo "5. 如有问题，可单独运行相应的修复功能"
 }
 
 # 快速状态检查
