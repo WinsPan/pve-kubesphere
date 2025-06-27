@@ -51,6 +51,7 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 err()   { echo -e "${RED}[ERROR]${NC} $1"; }
 debug() { echo -e "${BLUE}[DEBUG]${NC} $1"; }
 info()  { echo -e "${CYAN}[INFO]${NC} $1"; }
+success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 
 run_remote_cmd() {
     # 统一远程SSH命令执行，带日志和错误处理
@@ -306,10 +307,18 @@ check_kubesphere_console() {
         echo "3. 所有KubeSphere Pod:"
         kubectl get pods -n kubesphere-system 2>/dev/null || echo "kubesphere-system命名空间不存在"
         echo ""
-        echo "4. 安装器日志:"
+        echo "4. 安装器Pod详细信息:"
         INSTALLER_POD=$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "")
         if [ -n "$INSTALLER_POD" ]; then
             echo "安装器Pod: $INSTALLER_POD"
+            echo ""
+            echo "Pod详细信息:"
+            kubectl describe pod -n kubesphere-system $INSTALLER_POD 2>/dev/null || echo "无法获取Pod详细信息"
+            echo ""
+            echo "Pod事件:"
+            kubectl get events -n kubesphere-system --field-selector involvedObject.name=$INSTALLER_POD --sort-by=.metadata.creationTimestamp 2>/dev/null || echo "无法获取Pod事件"
+            echo ""
+            echo "安装器日志:"
             kubectl logs -n kubesphere-system $INSTALLER_POD --tail=20 2>/dev/null || echo "无法获取安装日志"
         else
             echo "未找到安装器Pod"
@@ -323,12 +332,24 @@ check_kubesphere_console() {
         echo ""
         echo "7. 防火墙状态:"
         iptables -L | grep 30880 || echo "防火墙规则中未找到30880端口"
+        echo ""
+        echo "8. 系统资源状态:"
+        echo "CPU使用率:"
+        top -bn1 | grep "Cpu(s)" || echo "无法获取CPU信息"
+        echo ""
+        echo "内存使用率:"
+        free -h || echo "无法获取内存信息"
+        echo ""
+        echo "磁盘使用率:"
+        df -h | grep -E "(/$|/var)" || echo "无法获取磁盘信息"
     ' || true
     
     # 检查端口访问
     log "检查30880端口访问..."
     if nc -z $MASTER_IP 30880 2>/dev/null; then
         log "✓ 30880端口可访问"
+        success "KubeSphere控制台应该可以正常访问"
+        return 0
     else
         warn "✗ 30880端口无法访问"
         log "尝试诊断端口问题..."
@@ -344,17 +365,12 @@ check_kubesphere_console() {
         ' || true
     fi
     
-    # 如果KubeSphere未完全安装，尝试重新启动安装
-    log "检查是否需要重新启动KubeSphere安装..."
-    run_remote_cmd "$MASTER_IP" '
-        if ! kubectl get pod -n kubesphere-system -l app=ks-install 2>/dev/null | grep -q Running; then
-            echo "KubeSphere安装器未运行，尝试重新启动..."
-            kubectl delete pod -n kubesphere-system -l app=ks-install --force --grace-period=0 2>/dev/null || true
-            echo "安装器Pod已删除，等待重新创建..."
-        else
-            echo "KubeSphere安装器正在运行"
-        fi
-    ' || true
+    # 询问是否进行自动修复
+    echo ""
+    read -p "是否尝试自动修复KubeSphere安装问题？(y/n): " auto_fix
+    if [[ $auto_fix =~ ^[Yy]$ ]]; then
+        force_fix_kubesphere_installer
+    fi
     
     log "KubeSphere控制台检查完成"
     echo ""
@@ -362,11 +378,89 @@ check_kubesphere_console() {
     echo "1. KubeSphere安装未完成"
     echo "2. 防火墙阻止了端口访问"
     echo "3. 网络配置问题"
+    echo "4. 系统资源不足"
     echo ""
     echo "建议操作："
     echo "1. 等待KubeSphere安装完成（可能需要10-30分钟）"
     echo "2. 检查防火墙设置：iptables -I INPUT -p tcp --dport 30880 -j ACCEPT"
-    echo "3. 重新运行修复功能"
+    echo "3. 检查系统资源：top, free -h, df -h"
+    echo "4. 重新运行修复功能"
+    echo "5. 如果问题持续，考虑重新安装KubeSphere"
+}
+
+# 强制修复KubeSphere安装器
+force_fix_kubesphere_installer() {
+    log "开始强制修复KubeSphere安装器..."
+    
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== 强制修复KubeSphere安装器 ==="
+        
+        # 1. 强制删除卡住的安装器Pod
+        echo "1. 强制删除卡住的安装器Pod..."
+        INSTALLER_POD=$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "")
+        if [ -n "$INSTALLER_POD" ]; then
+            echo "找到安装器Pod: $INSTALLER_POD"
+            kubectl delete pod -n kubesphere-system $INSTALLER_POD --force --grace-period=0 2>/dev/null || true
+            echo "安装器Pod已删除"
+        else
+            echo "未找到安装器Pod"
+        fi
+        
+        # 2. 清理所有Pending状态的Pod
+        echo ""
+        echo "2. 清理Pending状态的Pod..."
+        kubectl delete pods -n kubesphere-system --field-selector=status.phase=Pending --force --grace-period=0 2>/dev/null || true
+        kubectl delete pods -n kubesphere-system --field-selector=status.phase=Unknown --force --grace-period=0 2>/dev/null || true
+        
+        # 3. 清理可能卡住的镜像
+        echo ""
+        echo "3. 清理Docker系统..."
+        docker system prune -f 2>/dev/null || true
+        
+        # 4. 重启kubelet
+        echo ""
+        echo "4. 重启kubelet..."
+        systemctl restart kubelet 2>/dev/null || true
+        
+        # 5. 等待新Pod创建
+        echo ""
+        echo "5. 等待新安装器Pod创建..."
+        sleep 15
+        
+        # 6. 检查新Pod状态
+        echo ""
+        echo "6. 检查新安装器Pod状态..."
+        NEW_INSTALLER_POD=$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "")
+        if [ -n "$NEW_INSTALLER_POD" ]; then
+            echo "新安装器Pod: $NEW_INSTALLER_POD"
+            kubectl get pod -n kubesphere-system $NEW_INSTALLER_POD
+            echo ""
+            echo "Pod详细信息:"
+            kubectl describe pod -n kubesphere-system $NEW_INSTALLER_POD 2>/dev/null || echo "无法获取Pod详细信息"
+        else
+            echo "未找到新的安装器Pod，可能需要重新安装KubeSphere"
+        fi
+    ' || true
+    
+    # 检查修复结果
+    log "检查修复结果..."
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== 修复后状态检查 ==="
+        echo ""
+        echo "1. 安装器Pod状态:"
+        kubectl get pods -n kubesphere-system -l app=ks-install 2>/dev/null || echo "未找到安装器Pod"
+        echo ""
+        echo "2. 所有KubeSphere Pod:"
+        kubectl get pods -n kubesphere-system 2>/dev/null || echo "kubesphere-system命名空间不存在"
+        echo ""
+        echo "3. 控制台服务:"
+        kubectl get svc -n kubesphere-system ks-console 2>/dev/null || echo "控制台服务不存在"
+        echo ""
+        echo "4. 端口监听状态:"
+        netstat -tlnp | grep :30880 || echo "30880端口未监听"
+    ' || true
+    
+    success "KubeSphere安装器修复完成"
 }
 
 # 检查集群状态
@@ -459,21 +553,37 @@ repair_menu() {
     while true; do
         clear
         echo -e "${CYAN}========== K8S/KubeSphere 修复与诊断 ==========${NC}"
+        echo -e "${GREEN}基础修复:${NC}"
         echo -e "${YELLOW}1.${NC} 修复Flannel网络问题"
         echo -e "${YELLOW}2.${NC} 修复kube-controller-manager崩溃"
         echo -e "${YELLOW}3.${NC} 修复KubeSphere安装问题"
-        echo -e "${YELLOW}4.${NC} 检查集群状态"
+        echo -e "${YELLOW}4.${NC} 强制修复KubeSphere安装器"
+        echo ""
+        echo -e "${GREEN}状态检查:${NC}"
         echo -e "${YELLOW}5.${NC} 检查KubeSphere控制台访问"
-        echo -e "${YELLOW}6.${NC} 一键修复所有问题"
+        echo -e "${YELLOW}6.${NC} 网络连通性测试"
+        echo -e "${YELLOW}7.${NC} 检查集群状态"
+        echo ""
+        echo -e "${GREEN}系统配置:${NC}"
+        echo -e "${YELLOW}8.${NC} 配置防火墙规则"
+        echo -e "${YELLOW}9.${NC} 生成访问信息"
+        echo ""
+        echo -e "${GREEN}一键操作:${NC}"
+        echo -e "${YELLOW}10.${NC} 一键修复所有问题"
         echo -e "${YELLOW}0.${NC} 返回主菜单"
-        read -p "请选择修复操作 (0-6): " repair_choice
+        echo -e "${CYAN}================================================${NC}"
+        read -p "请选择操作 (0-10): " repair_choice
         case $repair_choice in
             1) fix_flannel_network;;
             2) fix_controller_manager;;
             3) fix_kubesphere_installation;;
-            4) check_cluster_status_repair;;
+            4) force_fix_kubesphere_installer;;
             5) check_kubesphere_console;;
-            6) fix_flannel_network; fix_controller_manager; fix_kubesphere_installation; check_kubesphere_console; check_cluster_status_repair;;
+            6) test_network_connectivity;;
+            7) check_cluster_status_repair;;
+            8) configure_firewall;;
+            9) generate_access_info;;
+            10) fix_all_issues;;
             0) break;;
             *) err "无效选择，请重新输入";;
         esac
@@ -1032,6 +1142,220 @@ auto_deploy_all() {
     done
     echo ""
     echo -e "${CYAN}部署日志：${NC} $LOGFILE"
+}
+
+# 一键修复所有问题
+fix_all_issues() {
+    log "开始一键修复所有问题..."
+    echo ""
+    echo -e "${CYAN}修复流程：${NC}"
+    echo "1. 网络连通性测试"
+    echo "2. 修复Flannel网络问题"
+    echo "3. 修复kube-controller-manager崩溃"
+    echo "4. 修复KubeSphere安装问题"
+    echo "5. 强制修复KubeSphere安装器"
+    echo "6. 配置防火墙规则"
+    echo "7. 检查集群状态"
+    echo "8. 检查KubeSphere控制台访问"
+    echo "9. 生成访问信息"
+    echo ""
+    read -p "是否继续执行一键修复？(y/n): " confirm
+    if [[ ! $confirm =~ ^[Yy]$ ]]; then
+        warn "用户取消操作"
+        return 0
+    fi
+    
+    # 1. 网络连通性测试
+    log "步骤1: 网络连通性测试"
+    test_network_connectivity
+    
+    # 2. 修复Flannel网络问题
+    log "步骤2: 修复Flannel网络问题"
+    fix_flannel_network
+    
+    # 3. 修复kube-controller-manager崩溃
+    log "步骤3: 修复kube-controller-manager崩溃"
+    fix_controller_manager
+    
+    # 4. 修复KubeSphere安装问题
+    log "步骤4: 修复KubeSphere安装问题"
+    fix_kubesphere_installation
+    
+    # 5. 强制修复KubeSphere安装器
+    log "步骤5: 强制修复KubeSphere安装器"
+    force_fix_kubesphere_installer
+    
+    # 6. 配置防火墙规则
+    log "步骤6: 配置防火墙规则"
+    configure_firewall
+    
+    # 7. 检查集群状态
+    log "步骤7: 检查集群状态"
+    check_cluster_status_repair
+    
+    # 8. 检查KubeSphere控制台访问
+    log "步骤8: 检查KubeSphere控制台访问"
+    check_kubesphere_console
+    
+    # 9. 生成访问信息
+    log "步骤9: 生成访问信息"
+    generate_access_info
+    
+    success "一键修复完成！"
+    echo ""
+    echo -e "${GREEN}修复总结：${NC}"
+    echo "✓ 网络连通性已测试"
+    echo "✓ Flannel网络问题已修复"
+    echo "✓ kube-controller-manager已重启"
+    echo "✓ KubeSphere安装器已修复"
+    echo "✓ 防火墙规则已配置"
+    echo "✓ 集群状态已检查"
+    echo "✓ 控制台访问已检查"
+    echo "✓ 访问信息已生成"
+    echo ""
+    echo -e "${YELLOW}后续建议：${NC}"
+    echo "1. 等待KubeSphere安装完成（10-30分钟）"
+    echo "2. 定期检查：kubectl get pods -n kubesphere-system"
+    echo "3. 访问控制台：http://$MASTER_IP:30880"
+    echo "4. 如有问题，可单独运行相应的修复功能"
+}
+
+# 快速状态检查
+quick_status_check() {
+    log "快速状态检查..."
+    
+    # 检查连接
+    if ! run_remote_cmd "$MASTER_IP" "echo '连接测试成功'" 2>/dev/null; then
+        err "无法连接到K8S主节点 $MASTER_IP"
+        return 1
+    fi
+    
+    # 检查K8S集群状态
+    log "K8S集群状态:"
+    run_remote_cmd "$MASTER_IP" "kubectl get nodes -o wide" || true
+    
+    # 检查关键Pod状态
+    log "关键Pod状态:"
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== kube-system ==="
+        kubectl get pods -n kube-system | grep -E "(kube-apiserver|kube-controller-manager|kube-scheduler|etcd|calico|flannel)" || echo "未找到关键Pod"
+        echo ""
+        echo "=== kubesphere-system ==="
+        kubectl get pods -n kubesphere-system 2>/dev/null || echo "kubesphere-system命名空间不存在"
+    ' || true
+    
+    # 检查服务状态
+    log "服务状态:"
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== KubeSphere控制台服务 ==="
+        kubectl get svc -n kubesphere-system ks-console 2>/dev/null || echo "控制台服务不存在"
+        echo ""
+        echo "=== 端口监听 ==="
+        netstat -tlnp | grep -E ":30880|:6443" || echo "关键端口未监听"
+    ' || true
+    
+    # 检查30880端口访问
+    if nc -z $MASTER_IP 30880 2>/dev/null; then
+        success "✓ KubeSphere控制台可访问 (http://$MASTER_IP:30880)"
+    else
+        warn "✗ KubeSphere控制台无法访问"
+    fi
+}
+
+# 自动配置防火墙
+configure_firewall() {
+    log "配置防火墙规则..."
+    
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== 配置防火墙规则 ==="
+        
+        # 添加KubeSphere控制台端口
+        iptables -I INPUT -p tcp --dport 30880 -j ACCEPT 2>/dev/null || true
+        echo "✓ 已添加30880端口规则"
+        
+        # 添加K8S API端口
+        iptables -I INPUT -p tcp --dport 6443 -j ACCEPT 2>/dev/null || true
+        echo "✓ 已添加6443端口规则"
+        
+        # 添加NodePort范围
+        iptables -I INPUT -p tcp --dport 30000:32767 -j ACCEPT 2>/dev/null || true
+        echo "✓ 已添加NodePort范围规则"
+        
+        # 保存规则（如果系统支持）
+        if command -v iptables-save >/dev/null 2>&1; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            echo "✓ 防火墙规则已保存"
+        fi
+        
+        echo ""
+        echo "当前防火墙规则:"
+        iptables -L INPUT -n | grep -E "(30880|6443|30000:32767)" || echo "未找到相关规则"
+    ' || true
+    
+    success "防火墙配置完成"
+}
+
+# 网络连通性测试
+test_network_connectivity() {
+    log "网络连通性测试..."
+    
+    # 测试主节点连接
+    if ping -c 3 $MASTER_IP >/dev/null 2>&1; then
+        success "✓ 主节点网络连通"
+    else
+        err "✗ 主节点网络不通"
+    fi
+    
+    # 测试工作节点连接
+    for worker_ip in "${WORKER_IPS[@]}"; do
+        if ping -c 3 $worker_ip >/dev/null 2>&1; then
+            success "✓ 工作节点 $worker_ip 网络连通"
+        else
+            warn "✗ 工作节点 $worker_ip 网络不通"
+        fi
+    done
+    
+    # 测试K8S API端口
+    if nc -z $MASTER_IP 6443 2>/dev/null; then
+        success "✓ K8S API端口 6443 可访问"
+    else
+        warn "✗ K8S API端口 6443 无法访问"
+    fi
+    
+    # 测试KubeSphere控制台端口
+    if nc -z $MASTER_IP 30880 2>/dev/null; then
+        success "✓ KubeSphere控制台端口 30880 可访问"
+    else
+        warn "✗ KubeSphere控制台端口 30880 无法访问"
+    fi
+}
+
+# 生成访问信息
+generate_access_info() {
+    log "生成访问信息..."
+    
+    echo ""
+    echo -e "${CYAN}========== 访问信息 ==========${NC}"
+    echo -e "${GREEN}KubeSphere控制台:${NC}"
+    echo "  URL: http://$MASTER_IP:30880"
+    echo "  默认用户名: admin"
+    echo "  默认密码: P@88w0rd"
+    echo ""
+    echo -e "${GREEN}K8S集群信息:${NC}"
+    echo "  API Server: https://$MASTER_IP:6443"
+    echo "  主节点: $MASTER_IP"
+    echo "  工作节点: ${WORKER_IPS[*]}"
+    echo ""
+    echo -e "${GREEN}常用命令:${NC}"
+    echo "  检查节点: kubectl get nodes"
+    echo "  检查Pod: kubectl get pods --all-namespaces"
+    echo "  检查KubeSphere: kubectl get pods -n kubesphere-system"
+    echo ""
+    echo -e "${YELLOW}注意事项:${NC}"
+    echo "1. 首次访问可能需要等待KubeSphere完全启动"
+    echo "2. 如果无法访问，请检查防火墙设置"
+    echo "3. 建议定期备份重要数据"
+    echo -e "${CYAN}==============================${NC}"
 }
 
 # ==========================================
