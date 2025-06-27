@@ -294,77 +294,77 @@ check_cluster_status_repair() {
     fi
     
     log "执行详细集群状态检查..."
-    run_remote_cmd "$MASTER_IP" "
-        echo '=========================================='
-        echo 'K8S集群详细状态检查报告'
-        echo '=========================================='
-        echo ''
-        echo '1. 节点状态:'
+    run_remote_cmd "$MASTER_IP" '
+        echo "=========================================="
+        echo "K8S集群详细状态检查报告"
+        echo "=========================================="
+        echo ""
+        echo "1. 节点状态:"
         kubectl get nodes -o wide
-        echo ''
-        echo '2. 系统Pod状态:'
+        echo ""
+        echo "2. 系统Pod状态:"
         kubectl get pods -n kube-system
-        echo ''
-        echo '3. 所有命名空间:'
+        echo ""
+        echo "3. 所有命名空间:"
         kubectl get ns
-        echo ''
-        echo '4. 系统服务状态:'
+        echo ""
+        echo "4. 系统服务状态:"
         kubectl get svc -n kube-system
-        echo ''
-        echo '5. 存储类:'
-        kubectl get storageclass 2>/dev/null || echo '未配置存储类'
-        echo ''
-        echo '6. 持久卷:'
-        kubectl get pv 2>/dev/null || echo '未配置持久卷'
-        echo ''
-        echo '7. 事件信息:'
-        kubectl get events --sort-by=.metadata.creationTimestamp | tail -20 2>/dev/null || echo '无法获取事件信息'
-        echo ''
-        echo '8. 集群信息:'
-        kubectl cluster-info 2>/dev/null || echo '无法获取集群信息'
-        echo ''
-        echo '9. 系统资源使用:'
-        kubectl top nodes 2>/dev/null || echo 'metrics-server未安装或未运行'
-        echo ''
-        echo '10. 网络插件状态:'
-        kubectl get pods -n kube-system | grep -E '(flannel|calico|weave|cilium)' || echo '未找到网络插件'
-        echo ''
-        echo '=========================================='
-        echo '检查完成'
-        echo '=========================================='
-    " || true
+        echo ""
+        echo "5. 存储类:"
+        kubectl get storageclass 2>/dev/null || echo "未配置存储类"
+        echo ""
+        echo "6. 持久卷:"
+        kubectl get pv 2>/dev/null || echo "未配置持久卷"
+        echo ""
+        echo "7. 事件信息:"
+        kubectl get events --sort-by=.metadata.creationTimestamp | tail -20 2>/dev/null || echo "无法获取事件信息"
+        echo ""
+        echo "8. 集群信息:"
+        kubectl cluster-info 2>/dev/null || echo "无法获取集群信息"
+        echo ""
+        echo "9. 系统资源使用:"
+        kubectl top nodes 2>/dev/null || echo "metrics-server未安装或未运行"
+        echo ""
+        echo "10. 网络插件状态:"
+        kubectl get pods -n kube-system | grep -E "(flannel|calico|weave|cilium)" || echo "未找到网络插件"
+        echo ""
+        echo "=========================================="
+        echo "检查完成"
+        echo "=========================================="
+    ' || true
     
     # 检查KubeSphere状态（如果存在）
     log "检查KubeSphere状态..."
-    run_remote_cmd "$MASTER_IP" "
+    run_remote_cmd "$MASTER_IP" '
         if kubectl get ns kubesphere-system 2>/dev/null; then
-            echo '=========================================='
-            echo 'KubeSphere状态检查'
-            echo '=========================================='
-            echo ''
-            echo '1. KubeSphere Pod状态:'
+            echo "=========================================="
+            echo "KubeSphere状态检查"
+            echo "=========================================="
+            echo ""
+            echo "1. KubeSphere Pod状态:"
             kubectl get pods -n kubesphere-system
-            echo ''
-            echo '2. KubeSphere服务:'
+            echo ""
+            echo "2. KubeSphere服务:"
             kubectl get svc -n kubesphere-system
-            echo ''
-            echo '3. 安装器状态:'
-            INSTALLER_POD=\$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo '')
-            if [ -n \"\$INSTALLER_POD\" ]; then
-                echo '安装器Pod: '\$INSTALLER_POD
-                kubectl logs -n kubesphere-system \$INSTALLER_POD --tail=10 2>/dev/null || echo '无法获取安装日志'
+            echo ""
+            echo "3. 安装器状态:"
+            INSTALLER_POD=$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "")
+            if [ -n "$INSTALLER_POD" ]; then
+                echo "安装器Pod: $INSTALLER_POD"
+                kubectl logs -n kubesphere-system $INSTALLER_POD --tail=10 2>/dev/null || echo "无法获取安装日志"
             else
-                echo '未找到安装器Pod'
+                echo "未找到安装器Pod"
             fi
-            echo ''
-            echo '4. 控制台访问:'
-            kubectl get svc -n kubesphere-system ks-console 2>/dev/null || echo '控制台服务不存在'
-            echo ''
-            echo '=========================================='
+            echo ""
+            echo "4. 控制台访问:"
+            kubectl get svc -n kubesphere-system ks-console 2>/dev/null || echo "控制台服务不存在"
+            echo ""
+            echo "=========================================="
         else
-            echo 'KubeSphere未安装或命名空间不存在'
+            echo "KubeSphere未安装或命名空间不存在"
         fi
-    " || true
+    ' || true
     
     log "集群状态检查完成"
 }
