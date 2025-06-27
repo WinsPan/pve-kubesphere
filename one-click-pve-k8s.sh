@@ -409,26 +409,30 @@ fix_api_server() {
     ' || true
     
     log "重启kubelet和containerd服务..."
+    
+    # 分步重启，避免连接中断
+    log "步骤1: 重启containerd服务..."
+    run_remote_cmd "$MASTER_IP" 'systemctl restart containerd' || true
+    sleep 15
+    
+    log "步骤2: 重启kubelet服务..."
+    run_remote_cmd "$MASTER_IP" 'systemctl restart kubelet' || true
+    sleep 20
+    
+    log "步骤3: 检查服务状态..."
     run_remote_cmd "$MASTER_IP" '
-        echo "=== 重启相关服务 ==="
-        echo "1. 重启containerd..."
-        systemctl restart containerd
-        sleep 10
+        echo "=== 服务状态检查 ==="
+        echo "containerd状态: $(systemctl is-active containerd)"
+        echo "kubelet状态: $(systemctl is-active kubelet)"
         
-        echo "2. 重启kubelet..."
-        systemctl restart kubelet
-        sleep 20
-        
-        echo "3. 检查服务状态..."
-        systemctl is-active containerd kubelet
-        
-        echo "4. 等待API服务器启动..."
+        echo ""
+        echo "=== 等待API服务器启动 ==="
         sleep 30
         
-        echo "5. 检查API服务器容器:"
+        echo "=== 检查API服务器容器 ==="
         export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
         export IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock
-        crictl ps | grep kube-apiserver 2>/dev/null || echo "crictl连接问题，检查Pod状态..."
+        crictl ps | grep kube-apiserver 2>/dev/null || echo "crictl连接问题，但不影响API服务器运行"
     ' || true
     
     log "等待API服务器完全启动..."
@@ -550,7 +554,10 @@ fix_calico_network() {
         echo "6. 检查Calico Pod错误日志:"
         for pod in $(kubectl get pods -n kube-system | grep calico-node | awk "{print \$1}"); do
             echo "Pod $pod 日志:"
-            kubectl logs -n kube-system $pod --tail=5 2>/dev/null || echo "无法获取日志"
+            kubectl logs -n kube-system $pod --tail=10 2>/dev/null || echo "无法获取日志"
+            echo ""
+            echo "Pod $pod 前一个容器日志:"
+            kubectl logs -n kube-system $pod --previous --tail=5 2>/dev/null || echo "无前一个容器日志"
             echo ""
         done
     ' || true
@@ -774,6 +781,16 @@ fix_calico_network() {
         echo ""
         echo "4. Pod网络测试:"
         kubectl get pods -n kube-system -o wide | head -5
+        echo ""
+        echo "5. Calico Pod详细错误日志:"
+        for pod in $(kubectl get pods -n kube-system | grep calico-node | grep -v Running | awk "{print \$1}"); do
+            echo "--- Pod $pod 当前日志 ---"
+            kubectl logs -n kube-system $pod --tail=15 2>/dev/null || echo "无法获取当前日志"
+            echo ""
+            echo "--- Pod $pod 前一个容器日志 ---"
+            kubectl logs -n kube-system $pod --previous --tail=10 2>/dev/null || echo "无前一个容器日志"
+            echo ""
+        done
     ' || true
     
     # 检查API服务器状态
