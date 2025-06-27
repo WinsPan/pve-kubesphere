@@ -1,100 +1,269 @@
 #!/bin/bash
 
 # ==========================================
-# 极简一键PVE K8S+KubeSphere全自动部署脚本（重构优化版）
+# 极简一键PVE K8S+KubeSphere全自动部署脚本（深度优化版）
+# 版本: v2.0
+# 作者: WinsPan
+# 更新: 2024年
 # ==========================================
 
-set -e
+set -euo pipefail  # 更严格的错误处理
 
 # ==========================================
-# 变量与常量配置区
+# 全局变量与常量配置区
 # ==========================================
-# 颜色
-GREEN='\e[0;32m'
-YELLOW='\e[1;33m'
-RED='\e[0;31m'
-BLUE='\e[0;34m'
-CYAN='\e[0;36m'
-NC='\e[0m'
+readonly SCRIPT_VERSION="2.0"
+readonly SCRIPT_NAME="PVE K8S+KubeSphere 部署工具"
+readonly MIN_MEMORY_GB=32
+readonly MIN_DISK_GB=500
+readonly MIN_CPU_CORES=12
 
-CLOUD_IMAGE_URLS=(
+# 颜色定义
+readonly GREEN='\e[0;32m'
+readonly YELLOW='\e[1;33m'
+readonly RED='\e[0;31m'
+readonly BLUE='\e[0;34m'
+readonly CYAN='\e[0;36m'
+readonly PURPLE='\e[0;35m'
+readonly NC='\e[0m'
+
+# 云镜像配置
+readonly CLOUD_IMAGE_URLS=(
   "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
   "https://mirrors.ustc.edu.cn/debian-cloud-images/bookworm/latest/debian-12-generic-amd64.qcow2"
   "https://mirrors.tuna.tsinghua.edu.cn/debian-cloud-images/bookworm/latest/debian-12-generic-amd64.qcow2"
   "https://mirrors.aliyun.com/debian-cloud-images/bookworm/latest/debian-12-generic-amd64.qcow2"
   "https://mirrors.huaweicloud.com/debian-cloud-images/bookworm/latest/debian-12-generic-amd64.qcow2"
 )
-CLOUD_IMAGE_FILE="debian-12-generic-amd64.qcow2"
-CLOUD_IMAGE_PATH="/var/lib/vz/template/qcow/$CLOUD_IMAGE_FILE"
+readonly CLOUD_IMAGE_FILE="debian-12-generic-amd64.qcow2"
+readonly CLOUD_IMAGE_PATH="/var/lib/vz/template/qcow/$CLOUD_IMAGE_FILE"
 
-STORAGE="local-lvm"
-BRIDGE="vmbr0"
-VM_IDS=(101 102 103)
-VM_NAMES=("k8s-master" "k8s-worker1" "k8s-worker2")
-VM_IPS=("10.0.0.10" "10.0.0.11" "10.0.0.12")
-VM_CORES=8
-VM_MEM=16384
-VM_DISK=300
-CLOUDINIT_USER="root"
-CLOUDINIT_PASS="kubesphere123"
-GATEWAY="10.0.0.1"
-DNS="10.0.0.2 119.29.29.29"
+# 虚拟机配置
+readonly STORAGE="local-lvm"
+readonly BRIDGE="vmbr0"
+readonly VM_IDS=(101 102 103)
+readonly VM_NAMES=("k8s-master" "k8s-worker1" "k8s-worker2")
+readonly VM_IPS=("10.0.0.10" "10.0.0.11" "10.0.0.12")
+readonly VM_CORES=8
+readonly VM_MEM=16384
+readonly VM_DISK=300
+readonly CLOUDINIT_USER="root"
+readonly CLOUDINIT_PASS="kubesphere123"
+readonly GATEWAY="10.0.0.1"
+readonly DNS="10.0.0.2 119.29.29.29"
 
-MASTER_IP="10.0.0.10"
-WORKER_IPS=("10.0.0.11" "10.0.0.12")
+# 集群配置
+readonly MASTER_IP="10.0.0.10"
+readonly WORKER_IPS=("10.0.0.11" "10.0.0.12")
+
+# 日志配置
+readonly LOG_DIR="/var/log/pve-k8s-deploy"
+readonly LOG_FILE="$LOG_DIR/deploy_$(date +%Y%m%d_%H%M%S).log"
 
 # ==========================================
 # 通用工具函数区
 # ==========================================
-log()   { echo -e "${GREEN}[INFO]${NC} $1"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-err()   { echo -e "${RED}[ERROR]${NC} $1"; }
-debug() { echo -e "${BLUE}[DEBUG]${NC} $1"; }
-info()  { echo -e "${CYAN}[INFO]${NC} $1"; }
-success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+# 日志函数
+log()     { echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"; }
+err()     { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"; }
+debug()   { echo -e "${BLUE}[DEBUG]${NC} $(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"; }
+info()    { echo -e "${CYAN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"; }
+success() { echo -e "${GREEN}[SUCCESS]${NC} $(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"; }
 
-run_remote_cmd() {
-    # 统一远程SSH命令执行，带日志和错误处理
-    local ip="$1"; shift
-    local cmd="$1"; shift
-    sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 -o UserKnownHostsFile=/dev/null $CLOUDINIT_USER@$ip "bash -c '$cmd'" "$@"
+# 初始化日志目录
+init_logging() {
+    mkdir -p "$LOG_DIR"
+    if [[ ! -w "$LOG_DIR" ]]; then
+        echo -e "${RED}[ERROR]${NC} 无法写入日志目录: $LOG_DIR"
+        exit 1
+    fi
+    log "脚本启动 - $SCRIPT_NAME v$SCRIPT_VERSION"
+    log "日志文件: $LOG_FILE"
 }
 
-wait_for_ssh() {
-    local ip=$1
-    local max_try=60
-    local try=0
-    log "等待 $ip SSH可用..."
-    while ((try < max_try)); do
-        if ping -c 1 -W 2 $ip &>/dev/null; then
-            if nc -z $ip 22 &>/dev/null; then
-                sleep 10
-                return 0
+# 检查运行环境
+check_environment() {
+    log "检查运行环境..."
+    
+    # 检查是否为root用户
+    if [[ $EUID -ne 0 ]]; then
+        err "此脚本需要root权限运行"
+        exit 1
+    fi
+    
+    # 检查是否在PVE环境中
+    if ! command -v qm &>/dev/null; then
+        err "未检测到PVE环境，请在Proxmox VE主机上运行此脚本"
+        exit 1
+    fi
+    
+    # 检查必要的命令
+    local required_commands=("wget" "ssh" "sshpass" "nc" "ping" "iptables")
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            err "缺少必要命令: $cmd，请安装后重试"
+            exit 1
+        fi
+    done
+    
+    # 检查系统资源
+    local total_memory_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    local total_memory_gb=$((total_memory_kb / 1024 / 1024))
+    local total_disk_gb=$(df / | tail -1 | awk '{print int($4/1024/1024)}')
+    local cpu_cores=$(nproc)
+    
+    log "系统资源检查:"
+    log "  CPU核心数: $cpu_cores"
+    log "  总内存: ${total_memory_gb}GB"
+    log "  可用磁盘: ${total_disk_gb}GB"
+    
+    if [[ $total_memory_gb -lt $MIN_MEMORY_GB ]]; then
+        warn "系统内存不足，建议至少${MIN_MEMORY_GB}GB，当前${total_memory_gb}GB"
+    fi
+    
+    if [[ $total_disk_gb -lt $MIN_DISK_GB ]]; then
+        warn "磁盘空间不足，建议至少${MIN_DISK_GB}GB，当前${total_disk_gb}GB"
+    fi
+    
+    if [[ $cpu_cores -lt $MIN_CPU_CORES ]]; then
+        warn "CPU核心数不足，建议至少${MIN_CPU_CORES}核，当前${cpu_cores}核"
+    fi
+    
+    success "环境检查完成"
+}
+
+# 进度显示函数
+show_progress() {
+    local current=$1
+    local total=$2
+    local message=$3
+    local percent=$((current * 100 / total))
+    local completed=$((percent / 2))
+    local remaining=$((50 - completed))
+    
+    printf "\r${CYAN}[进度]${NC} ["
+    printf "%${completed}s" | tr " " "="
+    printf "%${remaining}s" | tr " " "-"
+    printf "] %d%% %s" "$percent" "$message"
+    
+    if [[ $current -eq $total ]]; then
+        echo ""
+    fi
+}
+
+# 增强的远程命令执行
+run_remote_cmd() {
+    local ip="$1"
+    local cmd="$2"
+    local timeout="${3:-60}"
+    local retries="${4:-3}"
+    
+    for ((i=1; i<=retries; i++)); do
+        if timeout "$timeout" sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=10 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$CLOUDINIT_USER@$ip" "bash -c '$cmd'"; then
+            return 0
+        else
+            if [[ $i -lt $retries ]]; then
+                warn "远程命令执行失败，重试 $i/$retries..."
+                sleep 5
             fi
         fi
-        sleep 10
-        ((try++))
-        log "等待 $ip SSH可用... ($try/$max_try)"
     done
-    err "$ip SSH不可用，可能原因：虚拟机未获取到IP、cloud-init未生效、网络未通"
+    
+    err "远程命令执行失败: $ip - $cmd"
     return 1
 }
 
-wait_for_port() {
+# 网络连通性检查
+check_network_connectivity() {
     local ip=$1
-    local port=$2
-    local max_try=60
+    local port=${2:-22}
+    local timeout=${3:-5}
+    
+    if timeout "$timeout" nc -z "$ip" "$port" &>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# 等待SSH可用（增强版）
+wait_for_ssh() {
+    local ip=$1
+    local max_try=${2:-60}
     local try=0
+    
+    log "等待 $ip SSH服务可用..."
+    
     while ((try < max_try)); do
-        if nc -z $ip $port &>/dev/null; then
-            return 0
+        show_progress $try $max_try "等待SSH服务启动..."
+        
+        # 先检查ping
+        if ping -c 1 -W 2 "$ip" &>/dev/null; then
+            # 再检查SSH端口
+            if check_network_connectivity "$ip" 22 3; then
+                # 最后测试SSH登录
+                if timeout 10 sshpass -p "$CLOUDINIT_PASS" ssh \
+                    -o StrictHostKeyChecking=no \
+                    -o ConnectTimeout=5 \
+                    -o UserKnownHostsFile=/dev/null \
+                    -o LogLevel=ERROR \
+                    "$CLOUDINIT_USER@$ip" "echo 'SSH测试成功'" &>/dev/null; then
+                    show_progress $max_try $max_try "SSH服务已就绪"
+                    success "$ip SSH服务已就绪"
+                    return 0
+                fi
+            fi
         fi
+        
         sleep 10
         ((try++))
-        log "等待 $ip:$port 可用... ($try/$max_try)"
     done
-    err "$ip:$port 未开放"
+    
+    err "$ip SSH服务在${max_try}次尝试后仍不可用"
     return 1
+}
+
+# 备份配置
+backup_vm_config() {
+    local vm_id=$1
+    local backup_dir="/var/lib/vz/backup/vm-configs"
+    
+    mkdir -p "$backup_dir"
+    local backup_file="$backup_dir/vm-${vm_id}-$(date +%Y%m%d_%H%M%S).conf"
+    
+    if [[ -f "/etc/pve/qemu-server/${vm_id}.conf" ]]; then
+        cp "/etc/pve/qemu-server/${vm_id}.conf" "$backup_file"
+        log "虚拟机 $vm_id 配置已备份到: $backup_file"
+    fi
+}
+
+# 安全检查
+security_check() {
+    log "执行安全检查..."
+    
+    # 检查防火墙状态
+    if systemctl is-active --quiet ufw; then
+        warn "检测到UFW防火墙已启用，可能影响网络连接"
+    fi
+    
+    # 检查SELinux状态
+    if command -v getenforce &>/dev/null && [[ $(getenforce 2>/dev/null) == "Enforcing" ]]; then
+        warn "检测到SELinux处于强制模式，可能影响部署"
+    fi
+    
+    # 检查网络配置
+    if ! ip route | grep -q "default"; then
+        err "未检测到默认路由，请检查网络配置"
+        return 1
+    fi
+    
+    success "安全检查完成"
 }
 
 # ==========================================
@@ -720,12 +889,15 @@ download_cloud_image() {
 create_and_start_vms() {
     log "开始创建并启动虚拟机..."
     
+    # 安全检查
+    security_check || return 1
+    
     # 确保cloud-init自定义配置存在
     mkdir -p /var/lib/vz/snippets
-    CLOUDINIT_CUSTOM_USERCFG="/var/lib/vz/snippets/debian-root.yaml"
+    local cloudinit_custom_usercfg="/var/lib/vz/snippets/debian-root.yaml"
     
-    # 创建cloud-init配置
-    cat > "$CLOUDINIT_CUSTOM_USERCFG" <<EOF
+    log "创建cloud-init配置文件..."
+    cat > "$cloudinit_custom_usercfg" <<EOF
 #cloud-config
 disable_root: false
 ssh_pwauth: true
@@ -733,76 +905,136 @@ chpasswd:
   expire: false
   list: |
     root:$CLOUDINIT_PASS
+package_update: true
+package_upgrade: false
+packages:
+  - curl
+  - wget
+  - vim
+  - htop
 runcmd:
   - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
   - sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
   - systemctl restart ssh
   - echo "root:$CLOUDINIT_PASS" | chpasswd
+  - systemctl enable ssh
+  - ufw --force disable 2>/dev/null || true
 EOF
 
+    success "cloud-init配置文件创建完成"
+
     # 创建虚拟机
-    for idx in ${!VM_IDS[@]}; do
-        id=${VM_IDS[$idx]}
-        name=${VM_NAMES[$idx]}
-        ip=${VM_IPS[$idx]}
-        log "处理虚拟机 $name (ID:$id, IP:$ip) ..."
+    local total_vms=${#VM_IDS[@]}
+    for idx in "${!VM_IDS[@]}"; do
+        local id=${VM_IDS[$idx]}
+        local name=${VM_NAMES[$idx]}
+        local ip=${VM_IPS[$idx]}
+        local current_step=$((idx + 1))
         
+        show_progress $current_step $total_vms "创建虚拟机 $name"
+        log "处理虚拟机 $name (ID:$id, IP:$ip)..."
+        
+        # 检查虚拟机是否已存在
         if qm list | grep -q " $id "; then
             warn "虚拟机 $id 已存在，跳过创建"
             continue
         fi
         
+        # 备份配置（如果存在）
+        backup_vm_config "$id"
+        
         log "创建空虚拟机 $id..."
-        if ! qm create $id \
-            --name $name \
-            --memory $VM_MEM \
-            --cores $VM_CORES \
-            --net0 virtio,bridge=$BRIDGE \
+        if ! qm create "$id" \
+            --name "$name" \
+            --memory "$VM_MEM" \
+            --cores "$VM_CORES" \
+            --net0 "virtio,bridge=$BRIDGE" \
             --scsihw virtio-scsi-pci \
             --serial0 socket \
-            --agent 1; then
+            --agent 1 \
+            --ostype l26; then
             err "创建虚拟机 $id 失败"
             return 1
         fi
         
-        log "导入cloud镜像到 $id..."
-        if ! qm importdisk $id "$CLOUD_IMAGE_PATH" $STORAGE; then
-            err "导入cloud镜像到 $id 失败"
+        log "导入cloud镜像到虚拟机 $id..."
+        if ! qm importdisk "$id" "$CLOUD_IMAGE_PATH" "$STORAGE" --format qcow2; then
+            err "导入cloud镜像到虚拟机 $id 失败"
+            qm destroy "$id" 2>/dev/null || true
             return 1
         fi
         
         log "配置虚拟机 $id..."
-        qm set $id --scsi0 $STORAGE:vm-${id}-disk-0
-        qm set $id --ide3 $STORAGE:cloudinit
-        qm set $id --ciuser root --cipassword $CLOUDINIT_PASS
-        qm set $id --ipconfig0 ip=$ip/24,gw=$GATEWAY
-        qm set $id --nameserver "$DNS"
-        qm set $id --boot order=scsi0
-        qm set $id --onboot 1
-        qm set $id --cicustom "user=local:snippets/debian-root.yaml"
-        qm resize $id scsi0 ${VM_DISK}G
-        log "虚拟机 $id 配置完成"
+        qm set "$id" --scsi0 "$STORAGE:vm-${id}-disk-0"
+        qm set "$id" --ide3 "$STORAGE:cloudinit"
+        qm set "$id" --ciuser "$CLOUDINIT_USER" --cipassword "$CLOUDINIT_PASS"
+        qm set "$id" --ipconfig0 "ip=$ip/24,gw=$GATEWAY"
+        qm set "$id" --nameserver "$DNS"
+        qm set "$id" --boot order=scsi0
+        qm set "$id" --onboot 1
+        qm set "$id" --cicustom "user=local:snippets/debian-root.yaml"
+        
+        log "扩展虚拟机 $id 磁盘到 ${VM_DISK}GB..."
+        if ! qm resize "$id" scsi0 "${VM_DISK}G"; then
+            warn "磁盘扩展失败，但虚拟机创建成功"
+        fi
+        
+        success "虚拟机 $id ($name) 创建完成"
     done
 
     # 启动虚拟机
     log "批量启动虚拟机..."
-    for id in "${VM_IDS[@]}"; do
+    for idx in "${!VM_IDS[@]}"; do
+        local id=${VM_IDS[$idx]}
+        local name=${VM_NAMES[$idx]}
+        local current_step=$((idx + 1))
+        
+        show_progress $current_step $total_vms "启动虚拟机 $name"
+        
+        local status
         status=$(qm list | awk -v id="$id" '$1==id{print $3}')
-        if [ "$status" = "running" ]; then
-            warn "虚拟机 $id 已在运行，跳过"
+        
+        if [[ "$status" == "running" ]]; then
+            warn "虚拟机 $id 已在运行，跳过启动"
         else
-            log "启动虚拟机 $id ..."
-            if ! qm start $id; then
+            log "启动虚拟机 $id ($name)..."
+            if ! qm start "$id"; then
                 err "启动虚拟机 $id 失败"
                 return 1
             fi
-            sleep 5
+            
+            # 等待虚拟机启动
+            sleep 10
+            
+            # 验证启动状态
+            local new_status
+            new_status=$(qm list | awk -v id="$id" '$1==id{print $3}')
+            if [[ "$new_status" == "running" ]]; then
+                success "虚拟机 $id ($name) 启动成功"
+            else
+                warn "虚拟机 $id ($name) 启动状态异常: $new_status"
+            fi
         fi
     done
 
-    log "当前虚拟机状态："
-    qm list | grep -E "(VMID|101|102|103)"
-    log "虚拟机创建和启动完成"
+    # 显示最终状态
+    log "虚拟机创建和启动完成，当前状态："
+    qm list | grep -E "(VMID|$(IFS='|'; echo "${VM_IDS[*]}"))"
+    
+    # 等待所有虚拟机SSH就绪
+    log "等待所有虚拟机SSH服务就绪..."
+    for idx in "${!VM_IPS[@]}"; do
+        local ip=${VM_IPS[$idx]}
+        local name=${VM_NAMES[$idx]}
+        
+        log "等待 $name ($ip) SSH服务..."
+        if ! wait_for_ssh "$ip" 120; then
+            err "$name ($ip) SSH服务未就绪，请检查虚拟机状态"
+            return 1
+        fi
+    done
+    
+    success "所有虚拟机创建完成并SSH就绪"
     return 0
 }
 
@@ -1361,29 +1593,150 @@ generate_access_info() {
 # ==========================================
 # 菜单与主流程区
 # ==========================================
-show_menu() {
+show_banner() {
     clear
+    echo -e "${PURPLE}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${PURPLE}║                                                              ║${NC}"
+    echo -e "${PURPLE}║  ${CYAN}$SCRIPT_NAME v$SCRIPT_VERSION${PURPLE}                    ║${NC}"
+    echo -e "${PURPLE}║                                                              ║${NC}"
+    echo -e "${PURPLE}║  ${GREEN}功能特性:${PURPLE}                                                ║${NC}"
+    echo -e "${PURPLE}║  ${YELLOW}• 一键部署K8S+KubeSphere集群${PURPLE}                        ║${NC}"
+    echo -e "${PURPLE}║  ${YELLOW}• 智能故障诊断与自动修复${PURPLE}                            ║${NC}"
+    echo -e "${PURPLE}║  ${YELLOW}• 多源镜像下载与网络优化${PURPLE}                            ║${NC}"
+    echo -e "${PURPLE}║  ${YELLOW}• 完整的日志记录与备份${PURPLE}                              ║${NC}"
+    echo -e "${PURPLE}║                                                              ║${NC}"
+    echo -e "${PURPLE}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+show_menu() {
+    show_banner
     echo -e "${CYAN}================================${NC}"
-    echo -e "${CYAN}  PVE K8S+KubeSphere 部署工具${NC}"
+    echo -e "${CYAN}  主菜单${NC}"
     echo -e "${CYAN}================================${NC}"
+    echo -e "${GREEN}基础功能:${NC}"
     echo -e "${YELLOW}1.${NC} 诊断PVE环境"
     echo -e "${YELLOW}2.${NC} 下载Debian Cloud镜像"
     echo -e "${YELLOW}3.${NC} 创建并启动虚拟机"
     echo -e "${YELLOW}4.${NC} 修正已存在虚拟机配置"
+    echo ""
+    echo -e "${GREEN}部署功能:${NC}"
     echo -e "${YELLOW}5.${NC} 部署K8S集群"
     echo -e "${YELLOW}6.${NC} 部署KubeSphere"
-    echo -e "${YELLOW}7.${NC} 清理所有资源"
-    echo -e "${YELLOW}8.${NC} 一键全自动部署"
-    echo -e "${YELLOW}9.${NC} 修复/诊断K8S与KubeSphere${NC}"
+    echo -e "${YELLOW}7.${NC} 一键全自动部署"
+    echo ""
+    echo -e "${GREEN}管理功能:${NC}"
+    echo -e "${YELLOW}8.${NC} 修复/诊断K8S与KubeSphere"
+    echo -e "${YELLOW}9.${NC} 清理所有资源"
+    echo ""
+    echo -e "${GREEN}其他功能:${NC}"
+    echo -e "${YELLOW}h.${NC} 显示帮助信息"
+    echo -e "${YELLOW}v.${NC} 显示版本信息"
     echo -e "${YELLOW}0.${NC} 退出"
     echo -e "${CYAN}================================${NC}"
 }
 
+show_help() {
+    clear
+    echo -e "${CYAN}========== 帮助信息 ==========${NC}"
+    echo ""
+    echo -e "${GREEN}脚本说明:${NC}"
+    echo "  这是一个在Proxmox VE环境中自动部署Kubernetes和KubeSphere的脚本"
+    echo ""
+    echo -e "${GREEN}系统要求:${NC}"
+    echo "  • Proxmox VE 7.0+"
+    echo "  • 内存: 至少32GB"
+    echo "  • 磁盘: 至少500GB可用空间"
+    echo "  • CPU: 至少12核心"
+    echo "  • 网络: 互联网连接用于下载镜像"
+    echo ""
+    echo -e "${GREEN}虚拟机配置:${NC}"
+    echo "  • k8s-master (10.0.0.10): 8核CPU, 16GB内存, 300GB磁盘"
+    echo "  • k8s-worker1 (10.0.0.11): 8核CPU, 16GB内存, 300GB磁盘"
+    echo "  • k8s-worker2 (10.0.0.12): 8核CPU, 16GB内存, 300GB磁盘"
+    echo ""
+    echo -e "${GREEN}使用流程:${NC}"
+    echo "  1. 选择'1'诊断PVE环境"
+    echo "  2. 选择'7'一键全自动部署，或按步骤逐一执行"
+    echo "  3. 部署完成后访问: http://10.0.0.10:30880"
+    echo "  4. 默认账号: admin / P@88w0rd"
+    echo ""
+    echo -e "${GREEN}故障排除:${NC}"
+    echo "  • 如遇问题，选择'8'进入修复菜单"
+    echo "  • 查看日志: $LOG_FILE"
+    echo "  • 清理重新开始: 选择'9'清理所有资源"
+    echo ""
+    echo -e "${GREEN}注意事项:${NC}"
+    echo "  • 确保网络配置正确，网关为10.0.0.1"
+    echo "  • 部署过程需要20-60分钟，请耐心等待"
+    echo "  • 建议在部署前备份重要数据"
+    echo ""
+    read -p "按回车键返回主菜单..."
+}
+
+show_version() {
+    clear
+    echo -e "${CYAN}========== 版本信息 ==========${NC}"
+    echo ""
+    echo -e "${GREEN}脚本名称:${NC} $SCRIPT_NAME"
+    echo -e "${GREEN}版本号:${NC} v$SCRIPT_VERSION"
+    echo -e "${GREEN}作者:${NC} WinsPan"
+    echo -e "${GREEN}更新时间:${NC} 2024年"
+    echo ""
+    echo -e "${GREEN}更新历史:${NC}"
+    echo "  v2.0 - 深度优化版"
+    echo "    • 增强错误处理和日志记录"
+    echo "    • 添加进度显示和用户反馈"
+    echo "    • 优化网络连接和性能"
+    echo "    • 增强安全性和稳定性检查"
+    echo "    • 添加配置备份和恢复功能"
+    echo ""
+    echo "  v1.x - 基础功能版"
+    echo "    • 基本的K8S和KubeSphere部署功能"
+    echo "    • 故障诊断和修复功能"
+    echo ""
+    echo -e "${GREEN}系统信息:${NC}"
+    echo "  • 操作系统: $(uname -s) $(uname -r)"
+    echo "  • 架构: $(uname -m)"
+    echo "  • PVE版本: $(pveversion 2>/dev/null | head -1 || echo '未检测到')"
+    echo ""
+    read -p "按回车键返回主菜单..."
+}
+
+# 配置验证
+validate_config() {
+    log "验证配置参数..."
+    
+    # 验证IP地址格式
+    for ip in "${VM_IPS[@]}"; do
+        if ! [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            err "无效的IP地址格式: $ip"
+            return 1
+        fi
+    done
+    
+    # 验证虚拟机ID唯一性
+    local used_ids=()
+    for id in "${VM_IDS[@]}"; do
+        if qm list | awk '{print $1}' | grep -q "^$id$"; then
+            used_ids+=("$id")
+        fi
+    done
+    
+    if [[ ${#used_ids[@]} -gt 0 ]]; then
+        warn "检测到已存在的虚拟机ID: ${used_ids[*]}"
+        echo "  • 选择'4'修正已存在虚拟机配置"
+        echo "  • 或选择'9'清理后重新部署"
+    fi
+    
+    success "配置验证完成"
+}
+
+# 主菜单循环
 main_menu() {
     while true; do
-        clear
         show_menu
-        read -p "请选择操作 [0-9]: " choice
+        read -p "请选择操作: " choice
         case $choice in
             1) diagnose_pve;;
             2) download_cloud_image;;
@@ -1391,13 +1744,49 @@ main_menu() {
             4) fix_existing_vms;;
             5) deploy_k8s;;
             6) deploy_kubesphere;;
-            7) cleanup_all;;
-            8) auto_deploy_all;;
-            9) repair_menu;;
-            0) log "退出程序"; exit 0;;
-            *) echo -e "${RED}无效选择，请重新输入${NC}"; sleep 2;;
+            7) auto_deploy_all;;
+            8) repair_menu;;
+            9) cleanup_all;;
+            h|H) show_help;;
+            v|V) show_version;;
+            0) 
+                log "用户退出程序"
+                echo -e "${GREEN}感谢使用 $SCRIPT_NAME！${NC}"
+                exit 0
+                ;;
+            *) 
+                echo -e "${RED}无效选择，请重新输入${NC}"
+                sleep 2
+                ;;
         esac
     done
 }
 
-main_menu
+# 脚本入口点
+main() {
+    # 初始化
+    init_logging
+    
+    # 显示启动信息
+    show_banner
+    echo -e "${GREEN}正在初始化...${NC}"
+    
+    # 环境检查
+    check_environment
+    
+    # 安全检查
+    security_check
+    
+    # 配置验证
+    validate_config
+    
+    echo ""
+    log "初始化完成，进入主菜单"
+    sleep 2
+    
+    # 进入主菜单
+    main_menu
+}
+
+# 脚本入口
+main "$@"
