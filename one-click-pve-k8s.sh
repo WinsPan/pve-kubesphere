@@ -110,50 +110,50 @@ fix_flannel_network() {
     fi
     
     log "检查当前网络插件状态..."
-    run_remote_cmd "$MASTER_IP" "
-        echo '=== 当前网络插件状态 ==='
-        kubectl get pods -n kube-system | grep -E '(flannel|calico|weave)' || echo '未找到网络插件Pod'
-        echo ''
-        echo '=== 网络接口状态 ==='
-        ip a | grep -E '(cni|flannel|calico)' || echo '未找到CNI网络接口'
-        echo ''
-        echo '=== 路由表 ==='
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== 当前网络插件状态 ==="
+        kubectl get pods -n kube-system | grep -E "(flannel|calico|weave)" || echo "未找到网络插件Pod"
+        echo ""
+        echo "=== 网络接口状态 ==="
+        ip a | grep -E "(cni|flannel|calico)" || echo "未找到CNI网络接口"
+        echo ""
+        echo "=== 路由表 ==="
         ip route | head -10
-    " || true
+    ' || true
     
     log "清理Flannel网络配置..."
-    run_remote_cmd "$MASTER_IP" "
-        echo '清理Flannel网络...'
+    run_remote_cmd "$MASTER_IP" '
+        echo "清理Flannel网络..."
         kubectl delete -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml 2>/dev/null || true
         kubectl delete -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/k8s-manifests/kube-flannel-rbac.yml 2>/dev/null || true
         ip link delete cni0 2>/dev/null || true
         ip link delete flannel.1 2>/dev/null || true
         rm -rf /var/lib/cni/flannel 2>/dev/null || true
         rm -rf /run/flannel 2>/dev/null || true
-        echo 'Flannel清理完成'
-    " || true
+        echo "Flannel清理完成"
+    ' || true
     
     log "安装Calico网络插件..."
-    run_remote_cmd "$MASTER_IP" "
-        echo '安装Calico网络插件...'
+    run_remote_cmd "$MASTER_IP" '
+        echo "安装Calico网络插件..."
         kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
-        echo 'Calico安装完成'
-    " || true
+        echo "Calico安装完成"
+    ' || true
     
     log "等待网络插件就绪..."
     sleep 30
     
     log "检查网络修复结果..."
-    run_remote_cmd "$MASTER_IP" "
-        echo '=== 修复后网络状态 ==='
-        kubectl get pods -n kube-system | grep -E '(calico|flannel)' || echo '未找到网络插件Pod'
-        echo ''
-        echo '=== 节点网络状态 ==='
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== 修复后网络状态 ==="
+        kubectl get pods -n kube-system | grep -E "(calico|flannel)" || echo "未找到网络插件Pod"
+        echo ""
+        echo "=== 节点网络状态 ==="
         kubectl get nodes -o wide
-        echo ''
-        echo '=== 网络连通性测试 ==='
+        echo ""
+        echo "=== 网络连通性测试 ==="
         kubectl get pods -n kube-system -o wide | head -5
-    " || true
+    ' || true
     
     log "Flannel网络修复完成"
 }
@@ -283,6 +283,92 @@ fix_kubesphere_installation() {
     log "KubeSphere安装修复完成"
 }
 
+# 检查KubeSphere控制台访问
+check_kubesphere_console() {
+    log "检查KubeSphere控制台访问..."
+    
+    # 检查K8S集群状态
+    if ! run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
+        err "K8S集群未就绪，无法检查KubeSphere"
+        return 1
+    fi
+    
+    log "检查KubeSphere安装状态..."
+    run_remote_cmd "$MASTER_IP" '
+        echo "=== KubeSphere安装状态检查 ==="
+        echo ""
+        echo "1. 命名空间状态:"
+        kubectl get ns | grep kubesphere || echo "kubesphere-system命名空间不存在"
+        echo ""
+        echo "2. 安装器Pod状态:"
+        kubectl get pods -n kubesphere-system -l app=ks-install 2>/dev/null || echo "未找到安装器Pod"
+        echo ""
+        echo "3. 所有KubeSphere Pod:"
+        kubectl get pods -n kubesphere-system 2>/dev/null || echo "kubesphere-system命名空间不存在"
+        echo ""
+        echo "4. 安装器日志:"
+        INSTALLER_POD=$(kubectl get pod -n kubesphere-system -l app=ks-install -o jsonpath="{.items[0].metadata.name}" 2>/dev/null || echo "")
+        if [ -n "$INSTALLER_POD" ]; then
+            echo "安装器Pod: $INSTALLER_POD"
+            kubectl logs -n kubesphere-system $INSTALLER_POD --tail=20 2>/dev/null || echo "无法获取安装日志"
+        else
+            echo "未找到安装器Pod"
+        fi
+        echo ""
+        echo "5. 控制台服务:"
+        kubectl get svc -n kubesphere-system ks-console 2>/dev/null || echo "控制台服务不存在"
+        echo ""
+        echo "6. 端口监听状态:"
+        netstat -tlnp | grep :30880 || echo "30880端口未监听"
+        echo ""
+        echo "7. 防火墙状态:"
+        iptables -L | grep 30880 || echo "防火墙规则中未找到30880端口"
+    ' || true
+    
+    # 检查端口访问
+    log "检查30880端口访问..."
+    if nc -z $MASTER_IP 30880 2>/dev/null; then
+        log "✓ 30880端口可访问"
+    else
+        warn "✗ 30880端口无法访问"
+        log "尝试诊断端口问题..."
+        
+        # 检查防火墙
+        run_remote_cmd "$MASTER_IP" '
+            echo "=== 防火墙检查 ==="
+            iptables -L INPUT -n | grep 30880 || echo "防火墙INPUT链中未找到30880规则"
+            iptables -L FORWARD -n | grep 30880 || echo "防火墙FORWARD链中未找到30880规则"
+            echo ""
+            echo "=== 网络接口检查 ==="
+            ip a | grep -E "(10\.0\.0\.10|eth|ens)" || echo "未找到相关网络接口"
+        ' || true
+    fi
+    
+    # 如果KubeSphere未完全安装，尝试重新启动安装
+    log "检查是否需要重新启动KubeSphere安装..."
+    run_remote_cmd "$MASTER_IP" '
+        if ! kubectl get pod -n kubesphere-system -l app=ks-install 2>/dev/null | grep -q Running; then
+            echo "KubeSphere安装器未运行，尝试重新启动..."
+            kubectl delete pod -n kubesphere-system -l app=ks-install --force --grace-period=0 2>/dev/null || true
+            echo "安装器Pod已删除，等待重新创建..."
+        else
+            echo "KubeSphere安装器正在运行"
+        fi
+    ' || true
+    
+    log "KubeSphere控制台检查完成"
+    echo ""
+    echo "如果30880端口无法访问，可能的原因："
+    echo "1. KubeSphere安装未完成"
+    echo "2. 防火墙阻止了端口访问"
+    echo "3. 网络配置问题"
+    echo ""
+    echo "建议操作："
+    echo "1. 等待KubeSphere安装完成（可能需要10-30分钟）"
+    echo "2. 检查防火墙设置：iptables -I INPUT -p tcp --dport 30880 -j ACCEPT"
+    echo "3. 重新运行修复功能"
+}
+
 # 检查集群状态
 check_cluster_status_repair() {
     log "开始检查集群状态..."
@@ -377,15 +463,17 @@ repair_menu() {
         echo -e "${YELLOW}2.${NC} 修复kube-controller-manager崩溃"
         echo -e "${YELLOW}3.${NC} 修复KubeSphere安装问题"
         echo -e "${YELLOW}4.${NC} 检查集群状态"
-        echo -e "${YELLOW}5.${NC} 一键修复所有问题"
+        echo -e "${YELLOW}5.${NC} 检查KubeSphere控制台访问"
+        echo -e "${YELLOW}6.${NC} 一键修复所有问题"
         echo -e "${YELLOW}0.${NC} 返回主菜单"
-        read -p "请选择修复操作 (0-5): " repair_choice
+        read -p "请选择修复操作 (0-6): " repair_choice
         case $repair_choice in
             1) fix_flannel_network;;
             2) fix_controller_manager;;
             3) fix_kubesphere_installation;;
             4) check_cluster_status_repair;;
-            5) fix_flannel_network; fix_controller_manager; fix_kubesphere_installation; check_cluster_status_repair;;
+            5) check_kubesphere_console;;
+            6) fix_flannel_network; fix_controller_manager; fix_kubesphere_installation; check_kubesphere_console; check_cluster_status_repair;;
             0) break;;
             *) err "无效选择，请重新输入";;
         esac
@@ -775,8 +863,8 @@ echo "=== 检查完成 ==="
 '
     
     if run_remote_cmd "$MASTER_IP" "$cluster_check_cmd"; then
-        READY_NODES=$(run_remote_cmd "$MASTER_IP" "kubectl get nodes --no-headers | grep -c ' Ready ' 2>/dev/null || echo '0'")
-        TOTAL_NODES=$(run_remote_cmd "$MASTER_IP" "kubectl get nodes --no-headers | wc -l 2>/dev/null || echo '0'")
+        READY_NODES=$(run_remote_cmd "$MASTER_IP" "kubectl get nodes --no-headers | grep -c \" Ready \" 2>/dev/null || echo \"0\"")
+        TOTAL_NODES=$(run_remote_cmd "$MASTER_IP" "kubectl get nodes --no-headers | wc -l 2>/dev/null || echo \"0\"")
         
         log "集群节点状态: $READY_NODES/$TOTAL_NODES 节点就绪"
         
