@@ -141,7 +141,7 @@ wait_for_ssh() {
 fix_k8s_network() {
     log "修复K8S网络问题..."
     
-    run_remote_cmd "$MASTER_IP" '
+    if ! run_remote_cmd "$MASTER_IP" '
         echo "=== 修复K8S网络组件 ==="
         
         # 1. 创建必要的ServiceAccount
@@ -323,16 +323,20 @@ EOF
         kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml
         
         echo "网络修复完成"
-    ' || warn "网络修复部分失败"
-    
-    success "K8S网络修复完成"
+    '; then
+        success "K8S网络修复完成"
+        return 0
+    else
+        err "K8S网络修复失败"
+        return 1
+    fi
 }
 
 # 修复KubeSphere安装
 fix_kubesphere() {
     log "修复KubeSphere安装..."
     
-    run_remote_cmd "$MASTER_IP" '
+    if run_remote_cmd "$MASTER_IP" '
         echo "=== 修复KubeSphere ==="
         
         # 清理现有安装
@@ -348,9 +352,13 @@ fix_kubesphere() {
         kubectl apply -f https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml
         
         echo "KubeSphere重新安装完成"
-    ' || warn "KubeSphere修复部分失败"
-    
-    success "KubeSphere修复完成"
+    '; then
+        success "KubeSphere修复完成"
+        return 0
+    else
+        err "KubeSphere修复失败"
+        return 1
+    fi
 }
 
 # 检查集群状态
@@ -359,22 +367,124 @@ check_cluster_status() {
     
     run_remote_cmd "$MASTER_IP" '
         echo "=== 集群状态 ==="
-        kubectl get nodes
+        kubectl get nodes -o wide
         echo ""
         echo "=== 系统Pod状态 ==="
-        kubectl get pods -n kube-system | grep -E "(kube-proxy|coredns|calico)"
+        kubectl get pods -n kube-system | grep -E "(kube-proxy|coredns|calico)" || echo "关键Pod未找到"
         echo ""
         echo "=== KubeSphere状态 ==="
         kubectl get pods -n kubesphere-system 2>/dev/null || echo "KubeSphere未安装"
         echo ""
         echo "=== 端口检查 ==="
         netstat -tlnp | grep -E ":30880|:6443" || echo "关键端口未监听"
+        echo ""
+        echo "=== 服务状态 ==="
+        kubectl get svc -n kubesphere-system 2>/dev/null | grep -E "ks-console|ks-apiserver" || echo "KubeSphere服务未找到"
     ' || true
 }
 
 # ==========================================
 # 部署功能
 # ==========================================
+
+# 创建Cloud-init用户数据文件
+create_cloudinit_userdata() {
+    log "创建Cloud-init配置文件..."
+    
+    local snippets_dir="/var/lib/vz/snippets"
+    local userdata_file="$snippets_dir/user-data-k8s.yml"
+    
+    # 确保目录存在
+    mkdir -p "$snippets_dir"
+    
+    # 创建用户数据文件
+    cat > "$userdata_file" << 'EOF'
+#cloud-config
+# PVE K8S部署专用Cloud-init配置
+
+# 系统配置
+locale: en_US.UTF-8
+timezone: Asia/Shanghai
+
+# 软件包管理
+package_update: true
+package_upgrade: false
+
+# 用户配置
+users:
+  - name: root
+    lock_passwd: false
+    shell: /bin/bash
+    ssh_authorized_keys: []
+
+# SSH配置 - 启用root登录
+ssh_pwauth: true
+disable_root: false
+ssh_deletekeys: false
+
+# 系统配置文件修改
+write_files:
+  # SSH配置 - 允许root登录
+  - path: /etc/ssh/sshd_config.d/99-root-login.conf
+    content: |
+      PermitRootLogin yes
+      PasswordAuthentication yes
+      PubkeyAuthentication yes
+      AuthorizedKeysFile .ssh/authorized_keys
+    permissions: '0644'
+    owner: root:root
+  
+  # 内核模块配置
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+    permissions: '0644'
+    owner: root:root
+  
+  # 内核参数配置
+  - path: /etc/sysctl.d/99-k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward = 1
+      net.ipv4.conf.all.forwarding = 1
+    permissions: '0644'
+    owner: root:root
+
+# 运行命令
+runcmd:
+  # 重启SSH服务以应用配置
+  - systemctl restart sshd
+  
+  # 加载内核模块
+  - modprobe overlay
+  - modprobe br_netfilter
+  
+  # 应用内核参数
+  - sysctl --system
+  
+  # 禁用swap
+  - swapoff -a
+  - sed -i '/swap/d' /etc/fstab
+  
+  # 安装基础软件包
+  - apt-get update
+  - apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+  
+  # 配置时区
+  - timedatectl set-timezone Asia/Shanghai
+  
+  # 设置主机名解析
+  - echo "127.0.0.1 $(hostname)" >> /etc/hosts
+
+# 最终消息
+final_message: "Cloud-init setup completed. SSH root login enabled."
+EOF
+    
+    success "Cloud-init配置文件创建完成: $userdata_file"
+}
+
 # 下载云镜像
 download_cloud_image() {
     if [[ -f "$CLOUD_IMAGE_PATH" ]]; then
@@ -403,6 +513,9 @@ download_cloud_image() {
 create_vms() {
     log "创建虚拟机..."
     
+    # 创建Cloud-init用户数据文件
+    create_cloudinit_userdata
+    
     for i in "${!VM_IDS[@]}"; do
         local vm_id="${VM_IDS[$i]}"
         local vm_name="${VM_NAMES[$i]}"
@@ -429,6 +542,7 @@ create_vms() {
             --nameserver "$DNS" \
             --ciuser "$CLOUDINIT_USER" \
             --cipassword "$CLOUDINIT_PASS" \
+            --cicustom "user=local:snippets/user-data-k8s.yml" \
             --agent enabled=1; then
             
             log "虚拟机 $vm_id 创建成功，导入云镜像..."
@@ -650,12 +764,20 @@ main() {
             8) check_cluster_status ;;
             9)
                 log "开始一键修复..."
-                fix_k8s_network
-                sleep 60
-                fix_kubesphere
-                sleep 30
-                check_cluster_status
-                success "一键修复完成！"
+                if fix_k8s_network; then
+                    log "K8S网络修复完成，等待Pod重启..."
+                    sleep 60
+                    if fix_kubesphere; then
+                        log "KubeSphere修复完成，等待服务启动..."
+                        sleep 30
+                        check_cluster_status
+                        success "一键修复完成！"
+                    else
+                        err "KubeSphere修复失败"
+                    fi
+                else
+                    err "K8S网络修复失败"
+                fi
                 ;;
             10) cleanup_all ;;
             0) 
