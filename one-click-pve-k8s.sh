@@ -34,7 +34,7 @@ readonly VM_DISK=300
 readonly CLOUDINIT_USER="root"
 readonly CLOUDINIT_PASS="kubesphere123"
 readonly GATEWAY="10.0.0.1"
-readonly DNS="10.0.0.2 119.29.29.29"
+readonly DNS="10.0.0.1"
 
 # 集群配置
 readonly MASTER_IP="10.0.0.10"
@@ -413,40 +413,68 @@ create_vms() {
         # 删除现有虚拟机
         qm stop "$vm_id" 2>/dev/null || true
         qm destroy "$vm_id" 2>/dev/null || true
+        sleep 2
         
         # 创建新虚拟机
-        qm create "$vm_id" \
+        if qm create "$vm_id" \
             --name "$vm_name" \
             --memory "$VM_MEM" \
             --cores "$VM_CORES" \
             --net0 "virtio,bridge=$BRIDGE" \
             --scsihw virtio-scsi-pci \
-            --scsi0 "$STORAGE:$VM_DISK,format=qcow2" \
             --ide2 "$STORAGE:cloudinit" \
-            --boot c --bootdisk scsi0 \
-            --serial0 socket --vga serial0 \
+            --serial0 socket \
+            --vga serial0 \
             --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY" \
             --nameserver "$DNS" \
             --ciuser "$CLOUDINIT_USER" \
             --cipassword "$CLOUDINIT_PASS" \
-            --sshkeys <(echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC...") \
-            --agent enabled=1
-        
-        # 导入云镜像
-        qm importdisk "$vm_id" "$CLOUD_IMAGE_PATH" "$STORAGE" --format qcow2
-        qm set "$vm_id" --scsi0 "$STORAGE:vm-$vm_id-disk-0"
-        
-        # 启动虚拟机
-        qm start "$vm_id"
-        
-        success "虚拟机 $vm_name 创建完成"
+            --agent enabled=1; then
+            
+            log "虚拟机 $vm_id 创建成功，导入云镜像..."
+            
+            # 导入云镜像并设置启动盘
+            if qm importdisk "$vm_id" "$CLOUD_IMAGE_PATH" "$STORAGE" --format qcow2; then
+                qm set "$vm_id" --scsi0 "$STORAGE:vm-$vm_id-disk-0"
+                qm set "$vm_id" --boot c --bootdisk scsi0
+                
+                # 启动虚拟机
+                if qm start "$vm_id"; then
+                    success "虚拟机 $vm_name 创建并启动成功"
+                else
+                    err "虚拟机 $vm_name 启动失败"
+                    return 1
+                fi
+            else
+                err "虚拟机 $vm_name 云镜像导入失败"
+                return 1
+            fi
+        else
+            err "虚拟机 $vm_name 创建失败"
+            return 1
+        fi
     done
+    
+    success "所有虚拟机创建完成"
 }
 
 # 等待虚拟机启动
 wait_for_vms() {
     log "等待虚拟机启动..."
     
+    # 首先检查虚拟机是否真的存在
+    log "检查虚拟机状态..."
+    for vm_id in "${VM_IDS[@]}"; do
+        if qm status "$vm_id" &>/dev/null; then
+            local status=$(qm status "$vm_id" | awk '{print $2}')
+            log "虚拟机 $vm_id 状态: $status"
+        else
+            err "虚拟机 $vm_id 不存在！"
+            return 1
+        fi
+    done
+    
+    # 等待SSH服务
     for ip in "${VM_IPS[@]}"; do
         wait_for_ssh "$ip"
     done
