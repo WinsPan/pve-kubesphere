@@ -390,7 +390,10 @@ fix_api_server() {
         systemctl status kubelet | head -10
         echo ""
         echo "2. 检查API服务器容器:"
-        crictl ps | grep kube-apiserver || echo "未找到API服务器容器"
+        # 修复crictl配置
+        export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+        export IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock
+        crictl ps | grep kube-apiserver 2>/dev/null || echo "crictl无法连接，但这不影响API服务器运行"
         echo ""
         echo "3. 检查API服务器Pod:"
         kubectl get pods -n kube-system | grep apiserver 2>/dev/null || echo "无法连接API服务器"
@@ -423,7 +426,9 @@ fix_api_server() {
         sleep 30
         
         echo "5. 检查API服务器容器:"
-        crictl ps | grep kube-apiserver || echo "API服务器容器未启动"
+        export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+        export IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock
+        crictl ps | grep kube-apiserver 2>/dev/null || echo "crictl连接问题，检查Pod状态..."
     ' || true
     
     log "等待API服务器完全启动..."
@@ -434,25 +439,71 @@ fix_api_server() {
     local max_retries=5
     
     while [ $retry_count -lt $max_retries ]; do
-        if run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
-            success "✓ API服务器已恢复正常"
-            run_remote_cmd "$MASTER_IP" '
-                echo "=== API服务器恢复后状态 ==="
-                echo "1. 集群节点状态:"
-                kubectl get nodes
-                echo ""
-                echo "2. 系统Pod状态:"
-                kubectl get pods -n kube-system | grep -E "apiserver|etcd|scheduler|controller"
-                echo ""
-                echo "3. API服务器端口:"
-                netstat -tlnp | grep :6443
-            ' || true
-            break
-        else
-            retry_count=$((retry_count + 1))
-            warn "API服务器尚未恢复，重试 $retry_count/$max_retries..."
-            sleep 30
+        # 先检查API服务器Pod和端口状态
+        local api_status=$(run_remote_cmd "$MASTER_IP" '
+            echo "检查API服务器状态..."
+            kubectl get pods -n kube-system | grep kube-apiserver | grep Running >/dev/null 2>&1 && echo "pod_running" || echo "pod_not_running"
+            netstat -tlnp | grep :6443 >/dev/null 2>&1 && echo "port_listening" || echo "port_not_listening"
+        ' 2>/dev/null)
+        
+        if echo "$api_status" | grep -q "pod_running" && echo "$api_status" | grep -q "port_listening"; then
+            log "API服务器Pod和端口都正常，测试kubectl连接..."
+            if run_remote_cmd "$MASTER_IP" "kubectl get nodes" 2>/dev/null; then
+                success "✓ API服务器已恢复正常"
+                run_remote_cmd "$MASTER_IP" '
+                    echo "=== API服务器恢复后状态 ==="
+                    echo "1. 集群节点状态:"
+                    kubectl get nodes
+                    echo ""
+                    echo "2. 系统Pod状态:"
+                    kubectl get pods -n kube-system | grep -E "apiserver|etcd|scheduler|controller"
+                    echo ""
+                    echo "3. API服务器端口:"
+                    netstat -tlnp | grep :6443
+                ' || true
+                break
+            else
+                warn "API服务器Pod运行正常但kubectl连接失败，可能是网络或证书问题..."
+                # 尝试修复kubectl连接
+                run_remote_cmd "$MASTER_IP" '
+                    echo "尝试修复kubectl连接..."
+                    
+                    # 1. 检查kubectl配置文件
+                    if [ -f /etc/kubernetes/admin.conf ]; then
+                        echo "✓ kubectl配置文件存在"
+                        export KUBECONFIG=/etc/kubernetes/admin.conf
+                    else
+                        echo "✗ kubectl配置文件不存在"
+                    fi
+                    
+                    # 2. 检查证书文件
+                    if [ -d /etc/kubernetes/pki ]; then
+                        echo "✓ 证书目录存在"
+                        ls -la /etc/kubernetes/pki/ | head -5
+                    else
+                        echo "✗ 证书目录不存在"
+                    fi
+                    
+                    # 3. 尝试直接访问API服务器
+                    curl -k https://localhost:6443/api/v1/nodes 2>/dev/null | head -1 || echo "直接API访问失败"
+                    
+                    # 4. 检查网络连接
+                    netstat -an | grep 6443 || echo "6443端口状态异常"
+                    
+                    # 5. 重新生成kubectl配置（如果需要）
+                    if ! kubectl get nodes 2>/dev/null; then
+                        echo "重新配置kubectl..."
+                        mkdir -p $HOME/.kube
+                        cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
+                        chown $(id -u):$(id -g) $HOME/.kube/config
+                    fi
+                ' || true
+            fi
         fi
+        
+        retry_count=$((retry_count + 1))
+        warn "API服务器尚未完全恢复，重试 $retry_count/$max_retries..."
+        sleep 30
     done
     
     if [ $retry_count -eq $max_retries ]; then
