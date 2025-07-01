@@ -125,10 +125,15 @@ run_remote_cmd() {
 # 等待SSH可用
 wait_for_ssh() {
     local ip=$1
-    local max_try=${2:-30}
+    local max_try=${2:-60}  # 增加到60次，10分钟
     
     log "等待 $ip SSH服务启动..."
     for ((i=1; i<=max_try; i++)); do
+        # 每10次显示一次进度
+        if [[ $((i % 10)) -eq 0 ]]; then
+            log "$ip SSH等待中... ($i/$max_try)"
+        fi
+        
         if nc -z "$ip" 22 &>/dev/null; then
             log "$ip SSH端口已开放，测试登录..."
             # 测试SSH登录
@@ -138,12 +143,64 @@ wait_for_ssh() {
             else
                 warn "$ip SSH端口开放但登录失败，继续等待..."
             fi
+        else
+            # 检查虚拟机是否还在运行
+            local vm_id
+            for j in "${!VM_IPS[@]}"; do
+                if [[ "${VM_IPS[$j]}" == "$ip" ]]; then
+                    vm_id="${VM_IDS[$j]}"
+                    break
+                fi
+            done
+            
+            if [[ -n "$vm_id" ]]; then
+                local vm_status=$(qm status "$vm_id" 2>/dev/null | awk '{print $2}')
+                if [[ "$vm_status" != "running" ]]; then
+                    err "$ip 对应的虚拟机 $vm_id 状态异常: $vm_status"
+                    return 1
+                fi
+            fi
         fi
         sleep 10
     done
     
     err "$ip SSH服务启动超时"
-    return 1
+    
+    # 提供手动诊断选项
+    echo ""
+    echo -e "${YELLOW}SSH连接超时，请选择处理方式：${NC}"
+    echo -e "  ${CYAN}1.${NC} 继续等待 (再等5分钟)"
+    echo -e "  ${CYAN}2.${NC} 跳过此节点继续"
+    echo -e "  ${CYAN}3.${NC} 详细诊断此节点"
+    echo -e "  ${CYAN}4.${NC} 退出脚本"
+    
+    while true; do
+        read -p "请选择 [1-4]: " ssh_choice
+        case $ssh_choice in
+            1)
+                log "继续等待 $ip SSH服务..."
+                wait_for_ssh "$ip" 30  # 再等5分钟
+                return $?
+                ;;
+            2)
+                warn "跳过节点 $ip，继续执行..."
+                return 1
+                ;;
+            3)
+                diagnose_ssh_detailed "$ip"
+                echo ""
+                echo "诊断完成，请根据诊断结果处理问题后重新运行脚本"
+                return 1
+                ;;
+            4)
+                log "用户选择退出"
+                exit 1
+                ;;
+            *)
+                warn "无效选择，请重新输入"
+                ;;
+        esac
+    done
 }
 
 # 测试SSH登录
@@ -161,6 +218,7 @@ test_ssh_login() {
             return 0
         else
             if [[ $i -lt $max_try ]]; then
+                log "$ip SSH登录测试失败，重试 $i/$max_try..."
                 sleep 5
             fi
         fi
@@ -393,8 +451,8 @@ EOF
         return 0
     else
         err "K8S网络修复失败"
-        return 1
-    fi
+            return 1
+        fi
 }
 
 # 修复KubeSphere安装
@@ -422,8 +480,8 @@ fix_kubesphere() {
         return 0
     else
         err "KubeSphere修复失败"
-        return 1
-    fi
+                return 1
+            fi
 }
 
 # 检查集群状态
@@ -690,8 +748,8 @@ wait_for_vms() {
             log "虚拟机 $vm_id 状态: $status"
         else
             err "虚拟机 $vm_id 不存在！"
-            return 1
-        fi
+        return 1
+    fi
     done
     
     # 等待SSH服务
@@ -832,9 +890,9 @@ diagnose_vms() {
             echo -e "网络连通性: ${GREEN}正常${NC}"
         else
             echo -e "网络连通性: ${RED}失败${NC}"
-            continue
-        fi
-        
+                continue
+            fi
+            
         # 3. 检查SSH端口
         if nc -z "$vm_ip" 22 2>/dev/null; then
             echo -e "SSH端口: ${GREEN}开放${NC}"
@@ -1061,14 +1119,14 @@ main() {
     init_logging
     check_environment
     
-    while true; do
+        while true; do
         clear
         show_banner
-        show_menu
+            show_menu
         
         read -p "请选择操作 [0-12]: " choice
         
-        case $choice in
+            case $choice in
             1)
                 log "开始一键全自动部署..."
                 download_cloud_image && \
@@ -1078,7 +1136,7 @@ main() {
                 deploy_kubesphere
                 success "一键部署完成！"
                 ;;
-            2) download_cloud_image ;;
+                2) download_cloud_image ;;
             3) create_vms ;;
             4) deploy_k8s ;;
             5) deploy_kubesphere ;;
@@ -1121,5 +1179,5 @@ main() {
 
 # 脚本入口
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
+main "$@" 
 fi 
