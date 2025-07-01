@@ -539,6 +539,8 @@ users:
     lock_passwd: false
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
+    passwd: $CLOUDINIT_PASS
+    plain_text_passwd: $CLOUDINIT_PASS
 
 # SSH配置 - 强制启用root登录
 ssh_pwauth: true
@@ -546,6 +548,10 @@ disable_root: false
 ssh_deletekeys: false
 chpasswd:
   expire: false
+  users:
+    - name: root
+      password: $CLOUDINIT_PASS
+      type: text
 
 # 系统配置文件修改
 write_files:
@@ -616,8 +622,11 @@ runcmd:
   - systemctl enable ssh
   - systemctl enable sshd
   
-  # 强制设置root密码
+  # 强制设置root密码 - 多种方式确保成功
   - echo "root:$CLOUDINIT_PASS" | chpasswd
+  - passwd -d root
+  - echo -e "$CLOUDINIT_PASS\n$CLOUDINIT_PASS" | passwd root
+  - usermod -U root
   
   # 确保SSH服务配置正确
   - systemctl stop ssh
