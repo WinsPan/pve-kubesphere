@@ -599,19 +599,45 @@ write_files:
     permissions: '0644'
     owner: root:root
 
+# 软件包安装 - 确保SSH服务可用
+packages:
+  - openssh-server
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+
 # 运行命令 - 确保SSH配置生效
 runcmd:
+  # 首先确保SSH服务已安装并启动
+  - apt-get update
+  - apt-get install -y openssh-server
+  - systemctl enable ssh
+  - systemctl enable sshd
+  
   # 强制设置root密码
   - echo "root:$CLOUDINIT_PASS" | chpasswd
   
   # 确保SSH服务配置正确
+  - systemctl stop ssh
   - systemctl stop sshd
-  - sleep 2
-  - systemctl start sshd
-  - systemctl enable sshd
+  - sleep 3
   
   # 验证SSH配置
-  - sshd -t
+  - sshd -t || echo "SSH配置验证失败，但继续启动"
+  
+  # 启动SSH服务
+  - systemctl start ssh
+  - systemctl start sshd
+  - sleep 3
+  
+  # 检查SSH服务状态
+  - systemctl status ssh || echo "SSH服务状态异常"
+  - systemctl status sshd || echo "SSHD服务状态异常"
+  
+  # 确保SSH端口监听
+  - netstat -tlnp | grep :22 || echo "SSH端口未监听"
   
   # 加载内核模块
   - modprobe overlay
@@ -624,23 +650,18 @@ runcmd:
   - swapoff -a
   - sed -i '/swap/d' /etc/fstab
   
-  # 安装基础软件包
-  - apt-get update
-  - apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release openssh-server
-  
-  # 确保SSH服务正在运行
-  - systemctl restart sshd
-  - systemctl status sshd
-  
   # 配置时区
   - timedatectl set-timezone Asia/Shanghai
   
   # 设置主机名解析
   - echo "127.0.0.1 $(hostname)" >> /etc/hosts
   
-  # 最后再次重启SSH确保配置生效
+  # 最后再次确保SSH服务运行
   - sleep 5
+  - systemctl restart ssh
   - systemctl restart sshd
+  - systemctl status ssh
+  - systemctl status sshd
 
 # 最终消息
 final_message: "Cloud-init setup completed. SSH root login enabled with password authentication."
@@ -1073,6 +1094,73 @@ fix_ssh_connection() {
     success "SSH连接修复完成"
 }
 
+# 强制重新创建虚拟机（用于修复Cloud-init问题）
+recreate_vms() {
+    log "强制重新创建虚拟机..."
+    
+    # 先停止并删除所有虚拟机
+    for vm_id in "${VM_IDS[@]}"; do
+        log "删除虚拟机 $vm_id..."
+        qm stop "$vm_id" 2>/dev/null || true
+        sleep 2
+        qm destroy "$vm_id" 2>/dev/null || true
+    done
+    
+    # 重新创建Cloud-init配置
+    create_cloudinit_userdata
+    
+    # 重新创建虚拟机
+    for i in "${!VM_IDS[@]}"; do
+        local vm_id="${VM_IDS[$i]}"
+        local vm_name="${VM_NAMES[$i]}"
+        local vm_ip="${VM_IPS[$i]}"
+        
+        log "重新创建虚拟机: $vm_name (ID: $vm_id, IP: $vm_ip)"
+        
+        # 创建新虚拟机
+        if qm create "$vm_id" \
+            --name "$vm_name" \
+            --memory "$VM_MEM" \
+            --cores "$VM_CORES" \
+            --net0 "virtio,bridge=$BRIDGE" \
+            --scsihw virtio-scsi-pci \
+            --ide2 "$STORAGE:cloudinit" \
+            --serial0 socket \
+            --vga std \
+            --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY" \
+            --nameserver "$DNS" \
+            --ciuser "$CLOUDINIT_USER" \
+            --cipassword "$CLOUDINIT_PASS" \
+            --cicustom "user=local:snippets/user-data-k8s.yml" \
+            --agent enabled=1; then
+            
+            log "虚拟机 $vm_id 创建成功，导入云镜像..."
+            
+            # 导入云镜像并设置启动盘
+            if qm importdisk "$vm_id" "$CLOUD_IMAGE_PATH" "$STORAGE" --format qcow2; then
+                qm set "$vm_id" --scsi0 "$STORAGE:vm-$vm_id-disk-0"
+                qm set "$vm_id" --boot c --bootdisk scsi0
+                
+                # 启动虚拟机
+                if qm start "$vm_id"; then
+                    success "虚拟机 $vm_name 重新创建并启动成功"
+                else
+                    err "虚拟机 $vm_name 启动失败"
+                    return 1
+                fi
+            else
+                err "虚拟机 $vm_name 云镜像导入失败"
+                return 1
+            fi
+        else
+            err "虚拟机 $vm_name 创建失败"
+            return 1
+        fi
+    done
+    
+    success "所有虚拟机重新创建完成"
+}
+
 # ==========================================
 # 界面显示
 # ==========================================
@@ -1108,6 +1196,7 @@ show_menu() {
     echo ""
     echo -e "${RED}管理功能：${NC}"
     echo -e "  ${CYAN}10.${NC} 清理所有资源"
+    echo -e "  ${CYAN}13.${NC} 重新创建虚拟机"
     echo -e "  ${CYAN}0.${NC} 退出"
     echo -e "${YELLOW}══════════════════════════════════════${NC}"
 }
@@ -1124,7 +1213,7 @@ main() {
         show_banner
             show_menu
         
-        read -p "请选择操作 [0-12]: " choice
+        read -p "请选择操作 [0-13]: " choice
         
             case $choice in
             1)
@@ -1163,6 +1252,7 @@ main() {
             10) cleanup_all ;;
             11) diagnose_vms ;;
             12) fix_ssh_connection ;;
+            13) recreate_vms ;;
             0) 
                 log "退出脚本"
                 exit 0 
