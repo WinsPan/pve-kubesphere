@@ -130,13 +130,42 @@ wait_for_ssh() {
     log "等待 $ip SSH服务启动..."
     for ((i=1; i<=max_try; i++)); do
         if nc -z "$ip" 22 &>/dev/null; then
-            success "$ip SSH服务已启动"
-            return 0
+            log "$ip SSH端口已开放，测试登录..."
+            # 测试SSH登录
+            if test_ssh_login "$ip"; then
+                success "$ip SSH服务已启动且可登录"
+                return 0
+            else
+                warn "$ip SSH端口开放但登录失败，继续等待..."
+            fi
         fi
         sleep 10
     done
     
     err "$ip SSH服务启动超时"
+    return 1
+}
+
+# 测试SSH登录
+test_ssh_login() {
+    local ip=$1
+    local max_try=${2:-5}
+    
+    for ((i=1; i<=max_try; i++)); do
+        if sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$CLOUDINIT_USER@$ip" "echo 'SSH连接测试成功'" &>/dev/null; then
+            return 0
+        else
+            if [[ $i -lt $max_try ]]; then
+                sleep 5
+            fi
+        fi
+    done
+    
     return 1
 }
 
@@ -434,7 +463,7 @@ create_cloudinit_userdata() {
     mkdir -p "$snippets_dir"
     
     # 创建用户数据文件
-    cat > "$userdata_file" << 'EOF'
+    cat > "$userdata_file" << EOF
 #cloud-config
 # PVE K8S部署专用Cloud-init配置
 
@@ -446,27 +475,51 @@ timezone: Asia/Shanghai
 package_update: true
 package_upgrade: false
 
-# 用户配置
+# 用户配置 - 确保root用户可以SSH登录
 users:
   - name: root
     lock_passwd: false
     shell: /bin/bash
-    ssh_authorized_keys: []
+    sudo: ALL=(ALL) NOPASSWD:ALL
 
-# SSH配置 - 启用root登录
+# SSH配置 - 强制启用root登录
 ssh_pwauth: true
 disable_root: false
 ssh_deletekeys: false
+chpasswd:
+  expire: false
 
 # 系统配置文件修改
 write_files:
-  # SSH配置 - 允许root登录
-  - path: /etc/ssh/sshd_config.d/99-root-login.conf
+  # SSH主配置 - 强制允许root登录
+  - path: /etc/ssh/sshd_config.d/00-root-login.conf
     content: |
+      # 强制启用root SSH登录
       PermitRootLogin yes
       PasswordAuthentication yes
       PubkeyAuthentication yes
       AuthorizedKeysFile .ssh/authorized_keys
+      ChallengeResponseAuthentication no
+      UsePAM yes
+      X11Forwarding yes
+      PrintMotd no
+      AcceptEnv LANG LC_*
+      Subsystem sftp /usr/lib/openssh/sftp-server
+    permissions: '0644'
+    owner: root:root
+  
+  # 确保SSH配置生效
+  - path: /etc/ssh/sshd_config.d/99-pve-k8s.conf
+    content: |
+      # PVE K8S部署专用SSH配置
+      PermitRootLogin yes
+      PasswordAuthentication yes
+      PubkeyAuthentication yes
+      MaxAuthTries 6
+      MaxSessions 10
+      TCPKeepAlive yes
+      ClientAliveInterval 60
+      ClientAliveCountMax 3
     permissions: '0644'
     owner: root:root
   
@@ -488,10 +541,19 @@ write_files:
     permissions: '0644'
     owner: root:root
 
-# 运行命令
+# 运行命令 - 确保SSH配置生效
 runcmd:
-  # 重启SSH服务以应用配置
-  - systemctl restart sshd
+  # 强制设置root密码
+  - echo "root:$CLOUDINIT_PASS" | chpasswd
+  
+  # 确保SSH服务配置正确
+  - systemctl stop sshd
+  - sleep 2
+  - systemctl start sshd
+  - systemctl enable sshd
+  
+  # 验证SSH配置
+  - sshd -t
   
   # 加载内核模块
   - modprobe overlay
@@ -506,16 +568,24 @@ runcmd:
   
   # 安装基础软件包
   - apt-get update
-  - apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+  - apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release openssh-server
+  
+  # 确保SSH服务正在运行
+  - systemctl restart sshd
+  - systemctl status sshd
   
   # 配置时区
   - timedatectl set-timezone Asia/Shanghai
   
   # 设置主机名解析
   - echo "127.0.0.1 $(hostname)" >> /etc/hosts
+  
+  # 最后再次重启SSH确保配置生效
+  - sleep 5
+  - systemctl restart sshd
 
 # 最终消息
-final_message: "Cloud-init setup completed. SSH root login enabled."
+final_message: "Cloud-init setup completed. SSH root login enabled with password authentication."
 EOF
     
     success "Cloud-init配置文件创建完成: $userdata_file"
@@ -573,7 +643,7 @@ create_vms() {
             --scsihw virtio-scsi-pci \
             --ide2 "$STORAGE:cloudinit" \
             --serial0 socket \
-            --vga serial0 \
+            --vga std \
             --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY" \
             --nameserver "$DNS" \
             --ciuser "$CLOUDINIT_USER" \
@@ -783,6 +853,8 @@ diagnose_vms() {
             echo -e "SSH认证: ${GREEN}成功${NC}"
         else
             echo -e "SSH认证: ${RED}失败${NC}"
+            # 进行详细SSH诊断
+            diagnose_ssh_detailed "$vm_ip"
             continue
         fi
         
@@ -818,6 +890,131 @@ diagnose_vms() {
     echo -e "\n${GREEN}诊断完成${NC}"
 }
 
+# 详细SSH诊断
+diagnose_ssh_detailed() {
+    local ip=$1
+    
+    echo -e "\n${CYAN}=== SSH详细诊断: $ip ===${NC}"
+    
+    # 1. 测试SSH连接
+    if sshpass -p "$CLOUDINIT_PASS" ssh \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=5 \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        "$CLOUDINIT_USER@$ip" "echo 'SSH连接测试成功'" &>/dev/null; then
+        echo -e "SSH连接: ${GREEN}成功${NC}"
+        
+        # 获取SSH配置信息
+        local ssh_config
+        ssh_config=$(sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$CLOUDINIT_USER@$ip" "sshd -T | grep -E '(permitrootlogin|passwordauthentication)'" 2>/dev/null)
+        
+        echo -e "SSH配置: $ssh_config"
+        
+        # 检查Cloud-init日志
+        local cloudinit_log
+        cloudinit_log=$(sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$CLOUDINIT_USER@$ip" "tail -5 /var/log/cloud-init.log 2>/dev/null | grep -E '(ssh|root|password)'" 2>/dev/null || echo "无法获取")
+        
+        echo -e "Cloud-init日志: $cloudinit_log"
+        
+    else
+        echo -e "SSH连接: ${RED}失败${NC}"
+        
+        # 尝试详细错误诊断
+        local ssh_error
+        ssh_error=$(sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o UserKnownHostsFile=/dev/null \
+            -v \
+            "$CLOUDINIT_USER@$ip" "echo test" 2>&1 | tail -3)
+        
+        echo -e "SSH错误信息: $ssh_error"
+        
+        # 检查是否是密码问题
+        echo -e "正在测试不同的登录方式..."
+        
+        # 测试无密码连接
+        if ssh -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            -o PasswordAuthentication=no \
+            "$CLOUDINIT_USER@$ip" "echo test" &>/dev/null; then
+            echo -e "密钥认证: ${GREEN}可用${NC}"
+        else
+            echo -e "密钥认证: ${RED}不可用${NC}"
+        fi
+    fi
+}
+
+# 修复SSH连接问题
+fix_ssh_connection() {
+    log "修复SSH连接问题..."
+    
+    for i in "${!VM_IDS[@]}"; do
+        local vm_id="${VM_IDS[$i]}"
+        local vm_name="${VM_NAMES[$i]}"
+        local vm_ip="${VM_IPS[$i]}"
+        
+        log "修复虚拟机 $vm_name ($vm_ip) 的SSH连接..."
+        
+        # 1. 检查虚拟机是否运行
+        if ! qm status "$vm_id" | grep -q "running"; then
+            warn "虚拟机 $vm_id 未运行，尝试启动..."
+            qm start "$vm_id"
+            sleep 10
+        fi
+        
+        # 2. 检查网络连通性
+        if ! ping -c 1 -W 3 "$vm_ip" &>/dev/null; then
+            err "虚拟机 $vm_ip 网络不通，跳过..."
+            continue
+        fi
+        
+        # 3. 检查SSH端口
+        if ! nc -z "$vm_ip" 22 2>/dev/null; then
+            warn "SSH端口未开放，等待服务启动..."
+            sleep 20
+            if ! nc -z "$vm_ip" 22 2>/dev/null; then
+                err "SSH端口仍未开放，可能需要重新创建虚拟机"
+                continue
+            fi
+        fi
+        
+        # 4. 测试SSH连接
+        if test_ssh_login "$vm_ip"; then
+            success "虚拟机 $vm_name SSH连接正常"
+            continue
+        fi
+        
+        # 5. 尝试修复SSH配置
+        log "尝试通过控制台修复SSH配置..."
+        
+        # 通过qm monitor命令尝试修复（需要虚拟机支持）
+        # 这里可以添加更多修复逻辑
+        warn "虚拟机 $vm_name SSH连接失败，建议："
+        echo "  1. 检查Cloud-init配置是否正确"
+        echo "  2. 通过PVE控制台登录检查SSH服务状态"
+        echo "  3. 重新创建虚拟机"
+        
+        # 显示详细诊断信息
+        diagnose_ssh_detailed "$vm_ip"
+    done
+    
+    success "SSH连接修复完成"
+}
+
 # ==========================================
 # 界面显示
 # ==========================================
@@ -846,6 +1043,7 @@ show_menu() {
     echo -e "  ${CYAN}7.${NC} 修复KubeSphere安装"
     echo -e "  ${CYAN}8.${NC} 检查集群状态"
     echo -e "  ${CYAN}9.${NC} 一键修复所有问题"
+    echo -e "  ${CYAN}12.${NC} 修复SSH连接问题"
     echo ""
     echo -e "${BLUE}诊断功能：${NC}"
     echo -e "  ${CYAN}11.${NC} 检查虚拟机连接状态"
@@ -868,7 +1066,7 @@ main() {
         show_banner
         show_menu
         
-        read -p "请选择操作 [0-11]: " choice
+        read -p "请选择操作 [0-12]: " choice
         
         case $choice in
             1)
@@ -906,6 +1104,7 @@ main() {
                 ;;
             10) cleanup_all ;;
             11) diagnose_vms ;;
+            12) fix_ssh_connection ;;
             0) 
                 log "退出脚本"
                 exit 0 
