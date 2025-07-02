@@ -378,9 +378,11 @@ download_cloud_image() {
 # Cloud-init配置
 # ==========================================
 create_cloudinit_config() {
-    local userdata_file="/var/lib/vz/snippets/user-data-k8s.yml"
+    local vm_ip="$1"
+    local vm_id="$2"
+    local userdata_file="/var/lib/vz/snippets/user-data-k8s-${vm_id}.yml"
     
-    log "创建Cloud-init配置..."
+    log "创建虚拟机 $vm_id 的Cloud-init配置..."
     
     cat > "$userdata_file" << EOF
 #cloud-config
@@ -391,6 +393,21 @@ chpasswd:
     - name: root
       password: $CLOUDINIT_PASS
       type: text
+
+# 网络配置
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: false
+      addresses:
+        - ${vm_ip}/24
+      gateway4: $GATEWAY
+      nameservers:
+        addresses:
+          - 119.29.29.29
+          - 8.8.8.8
+          - 1.1.1.1
 
 write_files:
   - path: /etc/ssh/sshd_config.d/00-root-login.conf
@@ -422,11 +439,18 @@ write_files:
     permissions: '0644'
     owner: root:root
   
-  - path: /etc/resolv.conf.backup
+  - path: /etc/systemd/network/10-eth0.network
     content: |
-      nameserver 119.29.29.29
-      nameserver 8.8.8.8
-      nameserver 1.1.1.1
+      [Match]
+      Name=eth0
+
+      [Network]
+      DHCP=no
+      Address=${vm_ip}/24
+      Gateway=$GATEWAY
+      DNS=119.29.29.29
+      DNS=8.8.8.8
+      DNS=1.1.1.1
     permissions: '0644'
     owner: root:root
 
@@ -437,8 +461,14 @@ packages:
   - curl
   - gnupg
   - net-tools
+  - systemd-resolved
 
 runcmd:
+  # 网络配置
+  - systemctl enable systemd-networkd systemd-resolved
+  - systemctl start systemd-networkd systemd-resolved
+  - ip link set eth0 up
+  
   # DNS配置
   - |
     cat > /etc/resolv.conf << "EOF"
@@ -475,7 +505,8 @@ runcmd:
 final_message: "Cloud-init配置完成"
 EOF
     
-    success "Cloud-init配置创建完成"
+    success "虚拟机 $vm_id 的Cloud-init配置创建完成: $userdata_file"
+    echo "$userdata_file"
 }
 
 # ==========================================
@@ -509,7 +540,7 @@ create_vm() {
         --nameserver "$DNS" \
         --ciuser "$CLOUDINIT_USER" \
         --cipassword "$CLOUDINIT_PASS" \
-        --cicustom "user=local:snippets/user-data-k8s.yml" \
+        --cicustom "user=local:snippets/user-data-k8s-${vm_id}.yml" \
         --agent enabled=1; then
         
         # 导入云镜像
@@ -532,9 +563,9 @@ create_vm() {
 create_all_vms() {
     log "创建所有虚拟机..."
     
-    create_cloudinit_config
-    
     for vm_id in "${!VM_CONFIGS[@]}"; do
+        local vm_ip=$(parse_vm_config "$vm_id" "ip")
+        create_cloudinit_config "$vm_ip" "$vm_id"
         create_vm "$vm_id"
     done
     
@@ -774,7 +805,7 @@ cleanup_all() {
         qm destroy "$vm_id" 2>/dev/null || true
     done
     
-    rm -f /var/lib/vz/snippets/user-data-k8s.yml
+    rm -f /var/lib/vz/snippets/user-data-k8s-*.yml
     success "资源清理完成"
 }
 
