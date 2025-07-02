@@ -394,20 +394,9 @@ chpasswd:
       password: $CLOUDINIT_PASS
       type: text
 
-# 网络配置
+# 禁用cloud-init网络配置，使用手动配置
 network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: false
-      addresses:
-        - ${vm_ip}/24
-      gateway4: $GATEWAY
-      nameservers:
-        addresses:
-          - 119.29.29.29
-          - 8.8.8.8
-          - 1.1.1.1
+  config: disabled
 
 write_files:
   - path: /etc/ssh/sshd_config.d/00-root-login.conf
@@ -439,21 +428,6 @@ write_files:
     permissions: '0644'
     owner: root:root
   
-  - path: /etc/systemd/network/10-eth0.network
-    content: |
-      [Match]
-      Name=eth0
-
-      [Network]
-      DHCP=no
-      Address=${vm_ip}/24
-      Gateway=$GATEWAY
-      DNS=119.29.29.29
-      DNS=8.8.8.8
-      DNS=1.1.1.1
-    permissions: '0644'
-    owner: root:root
-  
   - path: /etc/network/interfaces.d/eth0
     content: |
       auto eth0
@@ -472,47 +446,36 @@ packages:
   - curl
   - gnupg
   - net-tools
-  - systemd-resolved
   - ifupdown
 
 runcmd:
-  # 网络配置修复
-  - systemctl enable systemd-networkd systemd-resolved
-  - systemctl stop networking 2>/dev/null || true
-  - systemctl disable networking 2>/dev/null || true
-  - ip link set eth0 up
-  - systemctl restart systemd-networkd
-  - sleep 3
-  - networkctl reload
-  - networkctl reconfigure eth0
-  - sleep 2
+  # 禁用可能冲突的网络服务
+  - systemctl stop systemd-networkd systemd-networkd-wait-online 2>/dev/null || true
+  - systemctl disable systemd-networkd systemd-networkd-wait-online 2>/dev/null || true
+  - systemctl mask systemd-networkd-wait-online 2>/dev/null || true
   
-  # 检查网络配置并使用备用方案
+  # 使用传统网络配置
+  - systemctl enable networking
+  - ip link set eth0 up
+  - ifup eth0
+  - sleep 3
+  
+  # 验证并手动配置（如果需要）
   - |
-    echo "Checking network configuration..."
-    sleep 5
+    echo "Configuring network interface..."
     if ! ip addr show eth0 | grep -q "inet ${vm_ip}"; then
-      echo "systemd-networkd failed, trying ifupdown..."
-      systemctl stop systemd-networkd
-      systemctl enable networking
-      ifup eth0
-      sleep 3
-      
-      # 如果还是失败，手动配置
-      if ! ip addr show eth0 | grep -q "inet ${vm_ip}"; then
-        echo "ifupdown failed, using manual configuration"
-        ip addr flush dev eth0
-        ip addr add ${vm_ip}/24 dev eth0
-        ip route add default via $GATEWAY dev eth0 2>/dev/null || true
-      fi
+      echo "ifupdown failed, using manual configuration"
+      ip addr flush dev eth0 2>/dev/null || true
+      ip addr add ${vm_ip}/24 dev eth0
+      ip route add default via $GATEWAY dev eth0 2>/dev/null || true
     fi
     
     # 验证网络连接
     echo "Testing network connectivity..."
-    if ping -c 2 $GATEWAY >/dev/null 2>&1; then
-      echo "Network configuration successful"
+    if ping -c 3 $GATEWAY >/dev/null 2>&1; then
+      echo "Network configuration successful - IP: ${vm_ip}"
     else
-      echo "Network configuration failed, but continuing..."
+      echo "Network test failed, but continuing..."
     fi
   
   # DNS配置
