@@ -453,6 +453,17 @@ write_files:
       DNS=1.1.1.1
     permissions: '0644'
     owner: root:root
+  
+  - path: /etc/network/interfaces.d/eth0
+    content: |
+      auto eth0
+      iface eth0 inet static
+        address ${vm_ip}
+        netmask 255.255.255.0
+        gateway $GATEWAY
+        dns-nameservers 119.29.29.29 8.8.8.8 1.1.1.1
+    permissions: '0644'
+    owner: root:root
 
 packages:
   - openssh-server
@@ -462,12 +473,47 @@ packages:
   - gnupg
   - net-tools
   - systemd-resolved
+  - ifupdown
 
 runcmd:
-  # 网络配置
+  # 网络配置修复
   - systemctl enable systemd-networkd systemd-resolved
-  - systemctl start systemd-networkd systemd-resolved
+  - systemctl stop networking 2>/dev/null || true
+  - systemctl disable networking 2>/dev/null || true
   - ip link set eth0 up
+  - systemctl restart systemd-networkd
+  - sleep 3
+  - networkctl reload
+  - networkctl reconfigure eth0
+  - sleep 2
+  
+  # 检查网络配置并使用备用方案
+  - |
+    echo "Checking network configuration..."
+    sleep 5
+    if ! ip addr show eth0 | grep -q "inet ${vm_ip}"; then
+      echo "systemd-networkd failed, trying ifupdown..."
+      systemctl stop systemd-networkd
+      systemctl enable networking
+      ifup eth0
+      sleep 3
+      
+      # 如果还是失败，手动配置
+      if ! ip addr show eth0 | grep -q "inet ${vm_ip}"; then
+        echo "ifupdown failed, using manual configuration"
+        ip addr flush dev eth0
+        ip addr add ${vm_ip}/24 dev eth0
+        ip route add default via $GATEWAY dev eth0 2>/dev/null || true
+      fi
+    fi
+    
+    # 验证网络连接
+    echo "Testing network connectivity..."
+    if ping -c 2 $GATEWAY >/dev/null 2>&1; then
+      echo "Network configuration successful"
+    else
+      echo "Network configuration failed, but continuing..."
+    fi
   
   # DNS配置
   - |
