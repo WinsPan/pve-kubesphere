@@ -26,7 +26,7 @@ readonly NC='\e[0m'
 readonly STORAGE="local-lvm"
 readonly BRIDGE="vmbr0"
 readonly GATEWAY="10.0.0.1"
-readonly DNS="10.0.0.1"
+readonly DNS="119.29.29.29,8.8.8.8,10.0.0.2"
 
 # 虚拟机配置 - 使用数组存储配置
 declare -A VM_CONFIGS=(
@@ -41,8 +41,8 @@ readonly CLOUDINIT_PASS="kubesphere123"
 
 # 云镜像配置
 readonly CLOUD_IMAGE_URLS=(
-    "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
     "https://mirrors.ustc.edu.cn/debian-cloud-images/bookworm/latest/debian-12-generic-amd64.qcow2"
+    "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
 )
 readonly CLOUD_IMAGE_FILE="debian-12-generic-amd64.qcow2"
 readonly CLOUD_IMAGE_PATH="/var/lib/vz/template/qcow/$CLOUD_IMAGE_FILE"
@@ -54,6 +54,10 @@ readonly POD_SUBNET="10.244.0.0/16"
 # 日志配置
 readonly LOG_DIR="/var/log/pve-k8s-deploy"
 readonly LOG_FILE="$LOG_DIR/deploy_$(date +%Y%m%d_%H%M%S).log"
+
+# 超时配置
+readonly SSH_TIMEOUT=600
+readonly CLOUDINIT_TIMEOUT=900
 
 # ==========================================
 # 日志和工具函数
@@ -196,7 +200,7 @@ test_ssh_connection() {
 
 wait_for_ssh() {
     local ip="$1"
-    local max_wait="${2:-300}"
+    local max_wait="${2:-$SSH_TIMEOUT}"
     
     log "等待 $ip SSH服务..."
     
@@ -215,6 +219,69 @@ wait_for_ssh() {
     
     error "$ip SSH服务超时"
     return 1
+}
+
+# 检查网络连接
+check_network_connectivity() {
+    local ip="$1"
+    log "检查 $ip 网络连接..."
+    
+    local network_check_script='
+        # 检查DNS解析
+        echo "检查DNS解析..."
+        if ! nslookup debian.org >/dev/null 2>&1 && ! nslookup google.com >/dev/null 2>&1; then
+            echo "DNS解析失败，配置备用DNS..."
+            cat > /etc/resolv.conf << "EOF"
+nameserver 119.29.29.29
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF
+        fi
+        
+        # 测试网络连接
+        echo "测试网络连接..."
+        if ! ping -c 2 119.29.29.29 >/dev/null 2>&1 && ! ping -c 2 8.8.8.8 >/dev/null 2>&1; then
+            echo "网络连接失败"
+            exit 1
+        fi
+        
+        echo "网络连接正常"
+    '
+    
+    execute_remote_command "$ip" "$network_check_script"
+}
+
+# 等待Cloud-init完成（增强版）
+wait_for_cloudinit() {
+    local ip="$1"
+    local max_wait="${2:-$CLOUDINIT_TIMEOUT}"
+    
+    log "等待 $ip Cloud-init完成..."
+    
+    for ((i=0; i<max_wait; i+=30)); do
+        local status=""
+        if status=$(execute_remote_command "$ip" "cloud-init status" 1 2>/dev/null); then
+            echo -n "."
+            if [[ "$status" == *"done"* ]]; then
+                success "$ip Cloud-init完成"
+                return 0
+            elif [[ "$status" == *"error"* ]]; then
+                warn "$ip Cloud-init出现错误，但继续执行"
+                return 0
+            fi
+        else
+            echo -n "x"
+        fi
+        
+        if [[ $((i % 120)) -eq 0 ]] && [[ $i -gt 0 ]]; then
+            log "$ip Cloud-init等待中... (${i}s/${max_wait}s)"
+        fi
+        
+        sleep 30
+    done
+    
+    warn "$ip Cloud-init超时，但继续执行"
+    return 0
 }
 
 # ==========================================
@@ -354,6 +421,14 @@ write_files:
       net.ipv4.ip_forward = 1
     permissions: '0644'
     owner: root:root
+  
+  - path: /etc/resolv.conf.backup
+    content: |
+      nameserver 119.29.29.29
+      nameserver 8.8.8.8
+      nameserver 1.1.1.1
+    permissions: '0644'
+    owner: root:root
 
 packages:
   - openssh-server
@@ -364,6 +439,15 @@ packages:
   - net-tools
 
 runcmd:
+  # DNS配置
+  - |
+    cat > /etc/resolv.conf << "EOF"
+    nameserver 119.29.29.29
+    nameserver 8.8.8.8
+    nameserver 1.1.1.1
+    EOF
+  
+  # 基础系统配置
   - apt-get update -y
   - systemctl enable ssh sshd
   - echo "root:$CLOUDINIT_PASS" | chpasswd
@@ -384,6 +468,9 @@ runcmd:
   - swapoff -a
   - sed -i '/swap/d' /etc/fstab
   - timedatectl set-timezone Asia/Shanghai
+  
+  # 网络连接测试
+  - ping -c 2 119.29.29.29 || ping -c 2 8.8.8.8 || echo "网络连接可能有问题"
 
 final_message: "Cloud-init配置完成"
 EOF
@@ -459,14 +546,19 @@ wait_for_all_vms() {
     
     local all_ips=($(get_all_ips))
     
+    # 等待SSH连接
     for ip in "${all_ips[@]}"; do
         wait_for_ssh "$ip"
     done
     
+    # 检查网络连接
+    for ip in "${all_ips[@]}"; do
+        check_network_connectivity "$ip" || warn "$ip 网络连接检查失败，但继续执行"
+    done
+    
     # 等待Cloud-init完成
     for ip in "${all_ips[@]}"; do
-        log "等待 $ip Cloud-init完成..."
-        execute_remote_command "$ip" "cloud-init status --wait" 3 || warn "$ip Cloud-init超时"
+        wait_for_cloudinit "$ip"
     done
     
     success "所有虚拟机启动完成"
@@ -480,20 +572,38 @@ install_docker_k8s() {
     log "在 $ip 安装Docker和K8S..."
     
     local install_script='
+        # 配置国内镜像源
+        echo "配置镜像源..."
+        cat > /etc/apt/sources.list << "EOF"
+deb https://mirrors.ustc.edu.cn/debian/ bookworm main contrib non-free non-free-firmware
+deb https://mirrors.ustc.edu.cn/debian/ bookworm-updates main contrib non-free non-free-firmware
+deb https://mirrors.ustc.edu.cn/debian/ bookworm-backports main contrib non-free non-free-firmware
+deb https://mirrors.ustc.edu.cn/debian-security/ bookworm-security main contrib non-free non-free-firmware
+EOF
+        
         # 安装Docker
+        echo "安装Docker..."
+        curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/debian/gpg | apt-key add - || \
         curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
-        echo "deb [arch=amd64] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list
+        
+        echo "deb [arch=amd64] https://mirrors.aliyun.com/docker-ce/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list
+        
         apt-get update -y
         apt-get install -y docker-ce docker-ce-cli containerd.io
         
-        # 配置Docker
+        # 配置Docker镜像加速
         mkdir -p /etc/docker
         cat > /etc/docker/daemon.json << "EOF"
 {
   "exec-opts": ["native.cgroupdriver=systemd"],
   "log-driver": "json-file",
   "log-opts": {"max-size": "100m"},
-  "storage-driver": "overlay2"
+  "storage-driver": "overlay2",
+  "registry-mirrors": [
+    "https://docker.mirrors.ustc.edu.cn",
+    "https://hub-mirror.c.163.com",
+    "https://mirror.baidubce.com"
+  ]
 }
 EOF
         
@@ -501,19 +611,26 @@ EOF
         mkdir -p /etc/containerd
         containerd config default > /etc/containerd/config.toml
         sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
+        sed -i "s|registry.k8s.io/pause:3.6|registry.aliyuncs.com/google_containers/pause:3.6|g" /etc/containerd/config.toml
         
         systemctl daemon-reload
         systemctl enable docker containerd
         systemctl restart docker containerd
         
         # 安装K8S
+        echo "安装K8S..."
+        curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | apt-key add - || \
         curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
-        echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+        
+        echo "deb https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+        
         apt-get update -y
         apt-get install -y kubelet=1.28.2-00 kubeadm=1.28.2-00 kubectl=1.28.2-00
         apt-mark hold kubelet kubeadm kubectl
         
         systemctl enable kubelet
+        
+        echo "Docker和K8S安装完成"
     '
     
     execute_remote_command "$ip" "$install_script"
@@ -524,19 +641,33 @@ init_k8s_master() {
     log "初始化K8S主节点..."
     
     local init_script="
-        kubeadm reset -f 2>/dev/null || true
+        echo '开始初始化K8S主节点...'
         
+        # 清理之前的配置
+        kubeadm reset -f 2>/dev/null || true
+        rm -rf /etc/kubernetes/manifests/* 2>/dev/null || true
+        rm -rf /var/lib/etcd/* 2>/dev/null || true
+        
+        # 使用国内镜像初始化
         kubeadm init \
             --apiserver-advertise-address=$master_ip \
             --pod-network-cidr=$POD_SUBNET \
             --kubernetes-version=$K8S_VERSION \
+            --image-repository=registry.aliyuncs.com/google_containers \
             --ignore-preflight-errors=all
         
         mkdir -p /root/.kube
         cp /etc/kubernetes/admin.conf /root/.kube/config
         
-        # 安装Calico
-        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+        echo '下载Calico配置文件...'
+        # 下载并修改Calico配置
+        wget -O calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml || \
+        curl -o calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+        
+        # 应用Calico网络
+        kubectl apply -f calico.yaml
+        
+        echo 'K8S主节点初始化完成'
     "
     
     execute_remote_command "$master_ip" "$init_script"
