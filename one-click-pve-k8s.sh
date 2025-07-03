@@ -3964,6 +3964,21 @@ check_status() {
 cleanup_all() {
     log "清理所有资源..."
     
+    echo -e "${YELLOW}警告：此操作将删除所有虚拟机和相关配置文件！${NC}"
+    echo -e "${YELLOW}这包括：${NC}"
+    echo -e "  - 所有K8S虚拟机 (ID: $(get_all_vm_ids | tr '\n' ' '))"
+    echo -e "  - 相关的cloud-init配置文件"
+    echo -e "  - 所有集群数据和配置"
+    echo ""
+    
+    read -p "确认继续清理所有资源？输入 'YES' 确认: " confirm
+    if [[ "$confirm" != "YES" ]]; then
+        log "清理操作已取消"
+        return 0
+    fi
+    
+    log "开始清理所有资源..."
+    
     for vm_id in "${!VM_CONFIGS[@]}"; do
         local vm_name=$(parse_vm_config "$vm_id" "name")
         log "删除虚拟机: $vm_name (ID: $vm_id)"
@@ -4111,7 +4126,7 @@ show_deploy_menu() {
     echo ""
     
     read -p "请选择操作 [0-5]: " deploy_choice
-    return $deploy_choice
+    return $((100 + deploy_choice))
 }
 
 # 修复功能菜单
@@ -4130,7 +4145,7 @@ show_fix_menu() {
     echo ""
     
     read -p "请选择操作 [0-9]: " fix_choice
-    return $fix_choice
+    return $((200 + fix_choice))
 }
 
 # 诊断功能菜单
@@ -4149,7 +4164,7 @@ show_diagnose_menu() {
     echo ""
     
     read -p "请选择操作 [0-6]: " diagnose_choice
-    return $diagnose_choice
+    return $((300 + diagnose_choice))
 }
 
 # 高级功能菜单
@@ -4166,7 +4181,7 @@ show_advanced_menu() {
     echo ""
     
     read -p "请选择操作 [0-4]: " advanced_choice
-    return $advanced_choice
+    return $((400 + advanced_choice))
 }
 
 # 管理功能菜单
@@ -4181,7 +4196,7 @@ show_manage_menu() {
     echo ""
     
     read -p "请选择操作 [0-2]: " manage_choice
-    return $manage_choice
+    return $((500 + manage_choice))
 }
 
 # 传统菜单（兼容模式）
@@ -4392,18 +4407,17 @@ interactive_main() {
         show_banner
         
         if [[ "$use_interactive_menu" == "true" ]]; then
-            if show_interactive_menu; then
-                local menu_result=$?
-                case $menu_result in
-                    1) break ;; # 退出
-                    2) continue ;; # 无效选择，重新显示
-                esac
-                
-                # 处理子菜单选择
-                handle_submenu_choice $?
-            else
-                break
-            fi
+            show_interactive_menu
+            local menu_result=$?
+            case $menu_result in
+                1) break ;; # 退出
+                2) continue ;; # 无效选择，重新显示
+                0) continue ;; # 返回主菜单
+                *) 
+                    # 处理子菜单选择
+                    handle_submenu_choice $menu_result
+                    ;;
+            esac
         else
             show_menu
             
@@ -4446,43 +4460,98 @@ interactive_main() {
 handle_submenu_choice() {
     local choice=$1
     
-    case $choice in
-        # 部署菜单
-        1) execute_function 1 ;;  # 一键部署
-        2) execute_function 2 ;;  # 下载云镜像
-        3) execute_function 3 ;;  # 创建虚拟机
-        4) execute_function 4 ;;  # 部署K8S
-        5) execute_function 5 ;;  # 部署KubeSphere
+    # 检查是否是子菜单返回值
+    if [[ $choice -ge 100 ]]; then
+        # 解析子菜单选择：菜单类型*100 + 选择项
+        local menu_type=$((choice / 100))
+        local sub_choice=$((choice % 100))
         
-        # 修复菜单
-        6) execute_function 6 ;;  # 修复Docker/K8S
-        7) execute_function 7 ;;  # 修复K8S集群
-        8) execute_function 8 ;;  # 修复网络
-        9) execute_function 9 ;;  # 修复SSH
-        23) execute_function 23 ;; # 修复K8S仓库
-        12) execute_function 12 ;; # 一键修复
-        
-        # 诊断菜单
-        10) execute_function 10 ;; # 系统诊断
-        11) execute_function 11 ;; # 检查状态
-        21) execute_function 21 ;; # 健康检查
-        15) execute_function 15 ;; # 查看日志
-        16) execute_function 16 ;; # 生成报告
-        17) execute_function 17 ;; # 修复手册
-        
-        # 高级菜单
-        18) execute_function 18 ;; # 性能监控
-        19) execute_function 19 ;; # 备份配置
-        20) execute_function 20 ;; # 高级配置
-        22) execute_function 22 ;; # 自动化运维
-        
-        # 管理菜单
-        13) execute_function 13 ;; # 重建集群
-        14) execute_function 14 ;; # 清理资源
-        
-        0) return 0 ;;  # 返回主菜单
-        *) log_warn "无效选择: $choice" ;;
-    esac
+        case $menu_type in
+            1) # 部署菜单
+                case $sub_choice in
+                    1) execute_function 1 ;;  # 一键部署
+                    2) execute_function 2 ;;  # 下载云镜像
+                    3) execute_function 3 ;;  # 创建虚拟机
+                    4) execute_function 4 ;;  # 部署K8S
+                    5) execute_function 5 ;;  # 部署KubeSphere
+                    0) return 0 ;;  # 返回主菜单
+                    *) log_warn "无效选择: $sub_choice" ;;
+                esac
+                ;;
+            2) # 修复菜单
+                case $sub_choice in
+                    1) execute_function 6 ;;  # 修复Docker/K8S
+                    2) execute_function 7 ;;  # 修复K8S集群
+                    3) execute_function 8 ;;  # 修复网络
+                    4) execute_function 9 ;;  # 修复SSH
+                    5) execute_function 23 ;; # 修复K8S仓库
+                    9) execute_function 12 ;; # 一键修复
+                    0) return 0 ;;  # 返回主菜单
+                    *) log_warn "无效选择: $sub_choice" ;;
+                esac
+                ;;
+            3) # 诊断菜单
+                case $sub_choice in
+                    1) execute_function 10 ;; # 系统诊断
+                    2) execute_function 11 ;; # 检查状态
+                    3) execute_function 21 ;; # 健康检查
+                    4) execute_function 15 ;; # 查看日志
+                    5) execute_function 16 ;; # 生成报告
+                    6) execute_function 17 ;; # 修复手册
+                    0) return 0 ;;  # 返回主菜单
+                    *) log_warn "无效选择: $sub_choice" ;;
+                esac
+                ;;
+            4) # 高级菜单
+                case $sub_choice in
+                    1) execute_function 18 ;; # 性能监控
+                    2) execute_function 19 ;; # 备份配置
+                    3) execute_function 20 ;; # 高级配置
+                    4) execute_function 22 ;; # 自动化运维
+                    0) return 0 ;;  # 返回主菜单
+                    *) log_warn "无效选择: $sub_choice" ;;
+                esac
+                ;;
+            5) # 管理菜单
+                case $sub_choice in
+                    1) execute_function 13 ;; # 重建集群
+                    2) execute_function 14 ;; # 清理资源
+                    0) return 0 ;;  # 返回主菜单
+                    *) log_warn "无效选择: $sub_choice" ;;
+                esac
+                ;;
+            *) log_warn "无效菜单类型: $menu_type" ;;
+        esac
+    else
+        # 兼容旧的直接选择方式
+        case $choice in
+            1) execute_function 1 ;;  # 一键部署
+            2) execute_function 2 ;;  # 下载云镜像
+            3) execute_function 3 ;;  # 创建虚拟机
+            4) execute_function 4 ;;  # 部署K8S
+            5) execute_function 5 ;;  # 部署KubeSphere
+            6) execute_function 6 ;;  # 修复Docker/K8S
+            7) execute_function 7 ;;  # 修复K8S集群
+            8) execute_function 8 ;;  # 修复网络
+            9) execute_function 9 ;;  # 修复SSH
+            10) execute_function 10 ;; # 系统诊断
+            11) execute_function 11 ;; # 检查状态
+            12) execute_function 12 ;; # 一键修复
+            13) execute_function 13 ;; # 重建集群
+            14) execute_function 14 ;; # 清理资源
+            15) execute_function 15 ;; # 查看日志
+            16) execute_function 16 ;; # 生成报告
+            17) execute_function 17 ;; # 修复手册
+            18) execute_function 18 ;; # 性能监控
+            19) execute_function 19 ;; # 备份配置
+            20) execute_function 20 ;; # 高级配置
+            21) execute_function 21 ;; # 健康检查
+            22) execute_function 22 ;; # 自动化运维
+            23) execute_function 23 ;; # 修复K8S仓库
+            0) return 0 ;;  # 返回主菜单
+            *) log_warn "无效选择: $choice" ;;
+        esac
+    fi
 }
 
 # 安全退出处理
