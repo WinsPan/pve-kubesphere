@@ -2713,6 +2713,9 @@ diagnose_system() {
 fix_all_issues() {
     log "开始一键修复所有问题..."
     
+    # 临时关闭严格错误处理
+    set +e
+    
     # 先诊断问题
     diagnose_system
     local issues_count=$?
@@ -2722,19 +2725,19 @@ fix_all_issues() {
         
         # 修复网络连接
         log "第1步：修复网络连接..."
-        fix_network_connectivity
+        fix_network_connectivity || warn "网络连接修复失败，但继续执行"
         
         # 修复SSH配置
         log "第2步：修复SSH配置..."
-        fix_all_ssh_configs
+        fix_all_ssh_configs || warn "SSH配置修复失败，但继续执行"
         
         # 修复Docker和K8S安装
         log "第3步：修复Docker和K8S安装..."
-        fix_docker_k8s
+        fix_docker_k8s || warn "Docker/K8S修复失败，但继续执行"
         
         # 修复K8S集群
         log "第4步：修复K8S集群..."
-        fix_k8s_cluster
+        fix_k8s_cluster || warn "K8S集群修复失败，但继续执行"
         
         # 再次诊断
         log "修复完成，重新诊断..."
@@ -2748,6 +2751,11 @@ fix_all_issues() {
         fi
     else
         success "系统状态正常，无需修复"
+    fi
+    
+    # 恢复严格错误处理
+    if [[ "${SCRIPT_TEST_MODE:-false}" != "true" ]]; then
+        set -eE
     fi
 }
 
@@ -4015,6 +4023,9 @@ check_status() {
 cleanup_all() {
     log "清理所有资源..."
     
+    # 临时关闭严格错误处理
+    set +e
+    
     echo -e "${YELLOW}警告：此操作将删除所有虚拟机和相关配置文件！${NC}"
     echo -e "${YELLOW}这包括：${NC}"
     
@@ -4034,6 +4045,10 @@ cleanup_all() {
     read -p "确认继续清理所有资源？输入 'YES' 确认: " confirm
     if [[ "$confirm" != "YES" ]]; then
         log "清理操作已取消"
+        # 恢复严格错误处理
+        if [[ "${SCRIPT_TEST_MODE:-false}" != "true" ]]; then
+            set -eE
+        fi
         return 0
     fi
     
@@ -4050,9 +4065,9 @@ cleanup_all() {
         
         log "删除虚拟机: $vm_name (ID: $vm_id)"
         if command -v qm &>/dev/null; then
-            qm stop "$vm_id" 2>/dev/null || true
+            qm stop "$vm_id" 2>/dev/null || warn "停止VM $vm_id 失败，但继续执行"
             sleep 2
-            qm destroy "$vm_id" 2>/dev/null || true
+            qm destroy "$vm_id" 2>/dev/null || warn "删除VM $vm_id 失败，但继续执行"
         else
             warn "未检测到PVE环境，跳过虚拟机删除操作"
         fi
@@ -4063,7 +4078,23 @@ cleanup_all() {
         rm -f /var/lib/vz/snippets/user-data-k8s-*.yml 2>/dev/null || true
     fi
     
+    # 清理工作目录
+    log "清理工作目录..."
+    rm -rf "$WORK_DIR" 2>/dev/null || true
+    
+    # 清理日志文件（可选）
+    read -p "是否清理日志文件？[y/N]: " clean_logs
+    if [[ "$clean_logs" =~ ^[Yy]$ ]]; then
+        rm -f "$LOG_DIR"/*.log 2>/dev/null || true
+        log "日志文件已清理"
+    fi
+    
     success "资源清理完成"
+    
+    # 恢复严格错误处理
+    if [[ "${SCRIPT_TEST_MODE:-false}" != "true" ]]; then
+        set -eE
+    fi
 }
 
 # ==========================================
