@@ -686,12 +686,21 @@ EOF
         
         # 安装Docker
         echo "安装Docker..."
-        if ! curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/debian/gpg | apt-key add -; then
-            echo "尝试备用Docker GPG密钥..."
-            curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
-        fi
+        # 安装GPG密钥管理工具
+        apt-get install -y gnupg2 software-properties-common
         
-        echo "deb [arch=amd64] https://mirrors.aliyun.com/docker-ce/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list
+        # 创建keyrings目录
+        mkdir -p /etc/apt/keyrings
+        
+        # 下载并安装Docker GPG密钥（新方式）
+        if ! curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/debian/gpg -o /etc/apt/keyrings/docker.gpg; then
+            echo "尝试备用Docker GPG密钥..."
+            curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.gpg
+        fi
+        chmod a+r /etc/apt/keyrings/docker.gpg
+        
+        # 添加Docker仓库（新格式）
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list
         
         apt-get update -y
         if ! apt-get install -y docker-ce docker-ce-cli containerd.io; then
@@ -734,12 +743,15 @@ EOF
         
         # 安装K8S
         echo "安装K8S..."
-        if ! curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | apt-key add -; then
+        # 下载并安装K8S GPG密钥（新方式）
+        if ! curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg; then
             echo "尝试备用K8S GPG密钥..."
-            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg
         fi
+        chmod a+r /etc/apt/keyrings/kubernetes.gpg
         
-        echo "deb https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+        # 添加K8S仓库（新格式）
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
         
         apt-get update -y
         if ! apt-get install -y kubelet=1.28.2-00 kubeadm=1.28.2-00 kubectl=1.28.2-00; then
@@ -769,6 +781,7 @@ EOF
             apt-get remove --purge -y docker-ce docker-ce-cli containerd.io kubelet kubeadm kubectl 2>/dev/null || true
             apt-get autoremove -y
             rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/kubernetes.list
+            rm -f /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/kubernetes.gpg
             
             echo "重新安装..."
         '
