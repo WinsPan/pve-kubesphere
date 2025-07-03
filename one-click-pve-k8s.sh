@@ -325,20 +325,117 @@ check_environment() {
 download_debian_image() {
     local image_url="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
     local image_path="/var/lib/vz/template/iso/debian-12-generic-amd64.qcow2"
+    local temp_file="${image_path}.tmp"
+    
+    # 信号处理函数
+    cleanup_download() {
+        log ""
+        warn "下载被中断，正在清理临时文件..."
+        rm -f "$temp_file"
+        exit 1
+    }
+    
+    # 设置信号处理
+    trap cleanup_download INT TERM
     
     if [[ -f "$image_path" ]]; then
         log "Debian云镜像已存在: $image_path"
+        local file_size=$(du -h "$image_path" | cut -f1)
+        log "文件大小: $file_size"
         return 0
     fi
     
     log "下载Debian 12云镜像..."
+    log "镜像URL: $image_url"
+    log "保存路径: $image_path"
     mkdir -p "$(dirname "$image_path")"
     
-    if curl -fsSL --connect-timeout 30 --max-time 1800 --progress-bar "$image_url" -o "$image_path"; then
+    # 检查网络连接
+    log "检查网络连接..."
+    if ! curl -s --connect-timeout 10 --max-time 10 -I "https://cloud.debian.org" >/dev/null 2>&1; then
+        error "无法连接到Debian官方镜像站点"
+        log "请检查网络连接或防火墙设置"
+        return 1
+    fi
+    
+    # 检查磁盘空间
+    local available_space=$(df "$(dirname "$image_path")" | awk 'NR==2 {print $4}')
+    local required_space=524288  # 512MB in KB
+    if [[ $available_space -lt $required_space ]]; then
+        error "磁盘空间不足，需要至少512MB空间"
+        log "可用空间: $(($available_space / 1024))MB"
+        return 1
+    fi
+    log "磁盘空间检查通过: $(($available_space / 1024))MB 可用"
+    
+    # 显示下载进度
+    log "开始下载，请耐心等待..."
+    log "提示: 镜像文件约500MB，根据网速可能需要几分钟到十几分钟"
+    
+    # 记录开始时间
+    local start_time=$(date +%s)
+    
+    # 使用wget显示进度，如果失败则使用curl
+    if command -v wget >/dev/null 2>&1; then
+        log "使用wget下载（显示进度）..."
+        log "按 Ctrl+C 可以取消下载"
+        
+        # 使用已定义的临时文件
+        
+        if timeout 3600 wget --timeout=60 --tries=3 --progress=bar:force "$image_url" -O "$temp_file" 2>&1; then
+            # 下载成功，移动到最终位置
+            mv "$temp_file" "$image_path"
+            success "Debian云镜像下载完成"
+            local file_size=$(du -h "$image_path" | cut -f1)
+            local end_time=$(date +%s)
+            local duration=$((end_time - start_time))
+            log "文件大小: $file_size"
+            log "下载耗时: ${duration}秒"
+            # 清理信号处理
+            trap - INT TERM
+            return 0
+        else
+            # 清理临时文件
+            rm -f "$temp_file"
+            warn "wget下载失败，尝试使用curl..."
+        fi
+    fi
+    
+    # 备用下载方法：curl with progress
+    log "使用curl下载..."
+    log "按 Ctrl+C 可以取消下载"
+    
+    if curl -L --connect-timeout 30 --max-time 3600 \
+            --progress-bar \
+            --retry 3 \
+            --retry-delay 5 \
+            "$image_url" -o "$temp_file"; then
+        # 下载成功，移动到最终位置
+        mv "$temp_file" "$image_path"
         success "Debian云镜像下载完成"
+        local file_size=$(du -h "$image_path" | cut -f1)
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        log "文件大小: $file_size"
+        log "下载耗时: ${duration}秒"
+        # 清理信号处理
+        trap - INT TERM
         return 0
     else
+        # 清理临时文件
+        rm -f "$temp_file"
+        # 清理信号处理
+        trap - INT TERM
         error "Debian云镜像下载失败"
+        log "请检查网络连接或手动下载镜像到: $image_path"
+        log ""
+        log "手动下载命令："
+        log "wget $image_url -O $image_path"
+        log "或者："
+        log "curl -L $image_url -o $image_path"
+        log ""
+        log "如果网络较慢，可以尝试使用国内镜像源："
+        log "wget https://mirrors.aliyun.com/debian-cd/current/amd64/iso-cd/debian-12.8.0-amd64-netinst.iso -O /var/lib/vz/template/iso/debian-12-netinst.iso"
         return 1
     fi
 }
@@ -458,30 +555,135 @@ create_vm() {
         qm destroy "$vm_id" >/dev/null 2>&1 || true
     fi
     
-    # 创建VM
+        # 根据存储类型确定磁盘格式
+    local disk_format="qcow2"
+    local image_path="/var/lib/vz/template/iso/debian-12-generic-amd64.qcow2"
+    
+    if [[ "$STORAGE" == *"lvm"* ]]; then
+        disk_format="raw"
+        log "检测到LVM存储，将使用raw格式"
+        
+        # 检查是否需要转换镜像
+        local raw_image_path="/var/lib/vz/template/iso/debian-12-generic-amd64.raw"
+        if [[ ! -f "$raw_image_path" ]]; then
+            log "转换qcow2镜像为raw格式..."
+            
+            # 检查磁盘空间
+            local available_space=$(df /var/lib/vz/template/iso | awk 'NR==2 {print $4}')
+            local required_space=1048576  # 1GB in KB
+            if [[ $available_space -lt $required_space ]]; then
+                error "磁盘空间不足，需要至少1GB空间进行镜像转换"
+                log "可用空间: $(($available_space / 1024))MB"
+                return 1
+            fi
+            
+            # 确保qemu-img可用
+            if ! command -v qemu-img >/dev/null 2>&1; then
+                log "安装qemu-utils..."
+                if ! apt-get update >/dev/null 2>&1; then
+                    error "更新软件包列表失败"
+                    return 1
+                fi
+                if ! apt-get install -y qemu-utils >/dev/null 2>&1; then
+                    error "安装qemu-utils失败"
+                    return 1
+                fi
+                success "qemu-utils安装完成"
+            fi
+            
+            # 转换镜像格式
+            log "正在转换镜像格式，请稍等..."
+            if qemu-img convert -f qcow2 -O raw -p "$image_path" "$raw_image_path" 2>&1; then
+                success "镜像格式转换完成"
+                local raw_size=$(du -h "$raw_image_path" | cut -f1)
+                log "转换后文件大小: $raw_size"
+            else
+                error "镜像格式转换失败"
+                rm -f "$raw_image_path"
+                return 1
+            fi
+        fi
+        image_path="$raw_image_path"
+    fi
+    
+    log "使用存储: $STORAGE, 磁盘格式: $disk_format"
+
+    # 创建VM（不预分配磁盘）
     qm create "$vm_id" \
         --name "$vm_name" \
         --cores "$vm_cores" \
         --memory "$vm_memory" \
         --net0 "virtio,bridge=${DETECTED_BRIDGE:-$BRIDGE}" \
         --scsihw virtio-scsi-pci \
-        --scsi0 "$STORAGE:$vm_disk,format=qcow2" \
         --ide2 "$STORAGE:cloudinit" \
         --boot c --bootdisk scsi0 \
         --serial0 socket --vga serial0 \
         --agent enabled=1 \
         --ostype l26
-    
+
     # 导入云镜像
-    local temp_disk=$(qm importdisk "$vm_id" /var/lib/vz/template/iso/debian-12-generic-amd64.qcow2 "$STORAGE" --format qcow2 | grep "unused0" | awk '{print $3}')
-    qm set "$vm_id" --scsi0 "$temp_disk"
+    log "导入云镜像到VM $vm_id..."
+    log "镜像路径: $image_path"
+    log "存储: $STORAGE, 格式: $disk_format"
+    
+    local temp_disk
+    local import_output
+    import_output=$(qm importdisk "$vm_id" "$image_path" "$STORAGE" --format "$disk_format" 2>&1)
+    
+    if [[ $? -eq 0 ]]; then
+        temp_disk=$(echo "$import_output" | grep "unused0" | awk '{print $3}')
+        if [[ -n "$temp_disk" ]]; then
+            success "磁盘导入成功: $temp_disk"
+        else
+            error "导入磁盘失败：无法解析磁盘路径"
+            log "导入输出: $import_output"
+            log "清理失败的VM..."
+            qm destroy "$vm_id" >/dev/null 2>&1 || true
+            return 1
+        fi
+    else
+        error "导入磁盘失败"
+        log "错误输出: $import_output"
+        log "清理失败的VM..."
+        qm destroy "$vm_id" >/dev/null 2>&1 || true
+        return 1
+    fi
+    
+    # 设置主磁盘
+    if ! qm set "$vm_id" --scsi0 "$temp_disk"; then
+        error "设置主磁盘失败"
+        log "清理失败的VM..."
+        qm destroy "$vm_id" >/dev/null 2>&1 || true
+        return 1
+    fi
+    
+    # 调整磁盘大小
+    log "调整磁盘大小到 ${vm_disk}G..."
+    qm resize "$vm_id" scsi0 "${vm_disk}G" || {
+        warn "调整磁盘大小失败，继续使用默认大小"
+    }
     
     # 配置cloud-init
-    qm set "$vm_id" --cicustom "user=local:snippets/user-data-$vm_id.yml"
-    qm set "$vm_id" --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY"
+    if ! qm set "$vm_id" --cicustom "user=local:snippets/user-data-$vm_id.yml"; then
+        error "配置cloud-init失败"
+        log "清理失败的VM..."
+        qm destroy "$vm_id" >/dev/null 2>&1 || true
+        return 1
+    fi
+    
+    if ! qm set "$vm_id" --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY"; then
+        error "配置网络失败"
+        log "清理失败的VM..."
+        qm destroy "$vm_id" >/dev/null 2>&1 || true
+        return 1
+    fi
     
     # 启动VM
-    qm start "$vm_id"
+    log "启动VM $vm_id..."
+    if ! qm start "$vm_id"; then
+        error "启动VM失败"
+        return 1
+    fi
     
     success "虚拟机 $vm_name 创建并启动完成"
 }
