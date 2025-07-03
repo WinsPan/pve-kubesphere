@@ -1502,6 +1502,876 @@ show_quick_fix_guide() {
     echo ""
 }
 
+# 性能监控
+monitor_cluster_performance() {
+    log "监控集群性能..."
+    
+    local master_ip=$(get_master_ip)
+    local all_ips=($(get_all_ips))
+    
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║                     集群性能监控                             ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    # 节点资源使用情况
+    echo -e "${YELLOW}节点资源使用情况：${NC}"
+    for ip in "${all_ips[@]}"; do
+        local vm_name=$(get_vm_name_by_ip "$ip")
+        echo -e "${GREEN}=== $vm_name ($ip) ===${NC}"
+        
+        execute_remote_command "$ip" "
+            echo 'CPU使用率:'
+            top -bn1 | grep 'Cpu(s)' | sed 's/.*, *\([0-9.]*\)%* id.*/\1/' | awk '{print 100 - \$1\"%\"}'
+            echo 'Memory使用情况:'
+            free -h | grep '^Mem'
+            echo 'Disk使用情况:'
+            df -h | grep -E '^/dev/'
+            echo 'Load Average:'
+            uptime
+        " || warn "$vm_name 无法获取性能数据"
+        echo ""
+    done
+    
+    # K8S集群资源使用
+    echo -e "${YELLOW}K8S集群资源使用：${NC}"
+    execute_remote_command "$master_ip" "
+        echo '=== 节点资源使用 ==='
+        kubectl top nodes 2>/dev/null || echo 'metrics-server未安装'
+        echo ''
+        echo '=== Pod资源使用 ==='
+        kubectl top pods --all-namespaces 2>/dev/null || echo 'metrics-server未安装'
+        echo ''
+        echo '=== 集群事件 ==='
+        kubectl get events --sort-by=.metadata.creationTimestamp | tail -10
+    " || warn "无法获取K8S集群性能数据"
+    
+    echo ""
+    echo -e "${CYAN}提示：如需详细监控，建议安装 metrics-server 或 Prometheus${NC}"
+}
+
+# 备份集群配置
+backup_cluster_config() {
+    log "备份集群配置..."
+    
+    local backup_dir="/tmp/k8s-backup-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup_dir"
+    
+    local master_ip=$(get_master_ip)
+    
+    # 备份K8S配置
+    log "备份K8S配置文件..."
+    execute_remote_command "$master_ip" "
+        mkdir -p /tmp/k8s-config-backup
+        cp -r /etc/kubernetes /tmp/k8s-config-backup/ 2>/dev/null || true
+        kubectl get all --all-namespaces -o yaml > /tmp/k8s-config-backup/all-resources.yaml 2>/dev/null || true
+        kubectl get nodes -o yaml > /tmp/k8s-config-backup/nodes.yaml 2>/dev/null || true
+        kubectl get configmaps --all-namespaces -o yaml > /tmp/k8s-config-backup/configmaps.yaml 2>/dev/null || true
+        kubectl get secrets --all-namespaces -o yaml > /tmp/k8s-config-backup/secrets.yaml 2>/dev/null || true
+        tar -czf /tmp/k8s-config-backup.tar.gz -C /tmp k8s-config-backup
+    "
+    
+    # 下载备份文件到本地
+    log "下载备份文件到本地..."
+    sshpass -p "$CLOUDINIT_PASS" scp -o StrictHostKeyChecking=no \
+        "$CLOUDINIT_USER@$master_ip:/tmp/k8s-config-backup.tar.gz" \
+        "$backup_dir/k8s-config-backup.tar.gz" 2>/dev/null || warn "备份文件下载失败"
+    
+    # 备份脚本配置
+    log "备份脚本配置..."
+    cat > "$backup_dir/vm-configs.txt" << EOF
+# K8S集群虚拟机配置备份
+# 生成时间: $(date)
+# 脚本版本: $SCRIPT_VERSION
+
+VM_CONFIGS:
+EOF
+    
+    for vm_id in "${!VM_CONFIGS[@]}"; do
+        echo "VM_$vm_id=${VM_CONFIGS[$vm_id]}" >> "$backup_dir/vm-configs.txt"
+    done
+    
+    # 备份网络配置
+    cat > "$backup_dir/network-config.txt" << EOF
+# 网络配置备份
+BRIDGE_NAME=$BRIDGE_NAME
+NETWORK_CIDR=$NETWORK_CIDR
+GATEWAY=$GATEWAY
+DNS_SERVERS=$DNS_SERVERS
+POD_SUBNET=$POD_SUBNET
+SERVICE_SUBNET=$SERVICE_SUBNET
+EOF
+    
+    success "集群配置备份完成: $backup_dir"
+    echo -e "${CYAN}备份内容：${NC}"
+    echo -e "  - K8S配置文件和资源定义"
+    echo -e "  - 虚拟机配置信息"
+    echo -e "  - 网络配置参数"
+    echo -e "  - 备份路径: $backup_dir"
+}
+
+# 安装metrics-server
+install_metrics_server() {
+    log "安装metrics-server..."
+    
+    local master_ip=$(get_master_ip)
+    
+    local install_script='
+        echo "下载metrics-server配置..."
+        wget -O metrics-server.yaml https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+        
+        # 修改配置以支持不安全的TLS
+        sed -i "/- --cert-dir=\/tmp/a\        - --kubelet-insecure-tls" metrics-server.yaml
+        sed -i "/- --secure-port=4443/a\        - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname" metrics-server.yaml
+        
+        # 部署metrics-server
+        kubectl apply -f metrics-server.yaml
+        
+        echo "等待metrics-server就绪..."
+        kubectl wait --for=condition=ready pod -l k8s-app=metrics-server -n kube-system --timeout=300s
+        
+        echo "验证metrics-server..."
+        kubectl top nodes
+    '
+    
+    if execute_remote_command "$master_ip" "$install_script"; then
+        success "metrics-server安装成功"
+    else
+        error "metrics-server安装失败"
+    fi
+}
+
+# 高级配置选项
+advanced_config() {
+    log "高级配置选项..."
+    
+    echo -e "${YELLOW}请选择高级配置选项：${NC}"
+    echo -e "  ${CYAN}1.${NC} 安装metrics-server（性能监控）"
+    echo -e "  ${CYAN}2.${NC} 配置Ingress控制器"
+    echo -e "  ${CYAN}3.${NC} 安装存储类（StorageClass）"
+    echo -e "  ${CYAN}4.${NC} 配置网络策略"
+    echo -e "  ${CYAN}5.${NC} 安装Helm包管理器"
+    echo -e "  ${CYAN}0.${NC} 返回主菜单"
+    
+    read -p "请选择 [0-5]: " config_choice
+    
+    case $config_choice in
+        1)
+            install_metrics_server
+            ;;
+        2)
+            install_ingress_controller
+            ;;
+        3)
+            install_storage_class
+            ;;
+        4)
+            configure_network_policy
+            ;;
+        5)
+            install_helm
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            warn "无效选择"
+            ;;
+    esac
+}
+
+# 安装Ingress控制器
+install_ingress_controller() {
+    log "安装Ingress控制器..."
+    
+    local master_ip=$(get_master_ip)
+    
+    local install_script='
+        echo "安装NGINX Ingress控制器..."
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/cloud/deploy.yaml
+        
+        echo "等待Ingress控制器就绪..."
+        kubectl wait --namespace ingress-nginx \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/component=controller \
+            --timeout=300s
+        
+        echo "验证Ingress控制器..."
+        kubectl get pods -n ingress-nginx
+    '
+    
+    if execute_remote_command "$master_ip" "$install_script"; then
+        success "Ingress控制器安装成功"
+    else
+        error "Ingress控制器安装失败"
+    fi
+}
+
+# 安装存储类
+install_storage_class() {
+    log "安装本地存储类..."
+    
+    local master_ip=$(get_master_ip)
+    
+    local install_script='
+        echo "创建本地存储类..."
+        cat > local-storage-class.yaml << "EOF"
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-storage
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+EOF
+        
+        kubectl apply -f local-storage-class.yaml
+        
+        echo "验证存储类..."
+        kubectl get storageclass
+    '
+    
+    if execute_remote_command "$master_ip" "$install_script"; then
+        success "存储类安装成功"
+    else
+        error "存储类安装失败"
+    fi
+}
+
+# 配置网络策略
+configure_network_policy() {
+    log "配置网络策略..."
+    
+    local master_ip=$(get_master_ip)
+    
+    local install_script='
+        echo "创建默认网络策略..."
+        cat > default-network-policy.yaml << "EOF"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: default
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: default
+EOF
+        
+        kubectl apply -f default-network-policy.yaml
+        
+        echo "验证网络策略..."
+        kubectl get networkpolicy
+    '
+    
+    if execute_remote_command "$master_ip" "$install_script"; then
+        success "网络策略配置成功"
+    else
+        error "网络策略配置失败"
+    fi
+}
+
+# 安装Helm
+install_helm() {
+    log "安装Helm包管理器..."
+    
+    local master_ip=$(get_master_ip)
+    
+    local install_script='
+        echo "下载并安装Helm..."
+        curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        chmod 700 get_helm.sh
+        ./get_helm.sh
+        
+        echo "验证Helm安装..."
+        helm version
+        
+        echo "添加常用Helm仓库..."
+        helm repo add stable https://charts.helm.sh/stable
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+        helm repo update
+        
+        echo "列出可用仓库..."
+        helm repo list
+    '
+    
+    if execute_remote_command "$master_ip" "$install_script"; then
+        success "Helm安装成功"
+    else
+        error "Helm安装失败"
+    fi
+}
+
+# 集群健康检查
+cluster_health_check() {
+    log "执行集群健康检查..."
+    
+    local master_ip=$(get_master_ip)
+    local all_ips=($(get_all_ips))
+    local health_score=0
+    local max_score=100
+    
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║                     集群健康检查                             ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    # 1. 虚拟机状态检查 (20分)
+    echo -e "${YELLOW}1. 虚拟机状态检查...${NC}"
+    local vm_healthy=0
+    local vm_total=0
+    for vm_id in "${!VM_CONFIGS[@]}"; do
+        local vm_name=$(parse_vm_config "$vm_id" "name")
+        local vm_status=$(qm status "$vm_id" 2>/dev/null | grep -o "status: [^,]*" | cut -d' ' -f2)
+        ((vm_total++))
+        
+        if [[ "$vm_status" == "running" ]]; then
+            echo -e "   ✓ $vm_name 运行正常"
+            ((vm_healthy++))
+        else
+            echo -e "   ✗ $vm_name 状态异常: $vm_status"
+        fi
+    done
+    
+    local vm_score=$((vm_healthy * 20 / vm_total))
+    health_score=$((health_score + vm_score))
+    echo -e "   评分: $vm_score/20"
+    echo ""
+    
+    # 2. SSH连接检查 (15分)
+    echo -e "${YELLOW}2. SSH连接检查...${NC}"
+    local ssh_healthy=0
+    local ssh_total=0
+    for ip in "${all_ips[@]}"; do
+        local vm_name=$(get_vm_name_by_ip "$ip")
+        ((ssh_total++))
+        
+        if test_ssh_connection "$ip"; then
+            echo -e "   ✓ $vm_name ($ip) SSH连接正常"
+            ((ssh_healthy++))
+        else
+            echo -e "   ✗ $vm_name ($ip) SSH连接失败"
+        fi
+    done
+    
+    local ssh_score=$((ssh_healthy * 15 / ssh_total))
+    health_score=$((health_score + ssh_score))
+    echo -e "   评分: $ssh_score/15"
+    echo ""
+    
+    # 3. Docker和K8S服务检查 (25分)
+    echo -e "${YELLOW}3. Docker和K8S服务检查...${NC}"
+    local service_healthy=0
+    local service_total=0
+    for ip in "${all_ips[@]}"; do
+        local vm_name=$(get_vm_name_by_ip "$ip")
+        
+        # 检查Docker
+        ((service_total++))
+        if execute_remote_command "$ip" "systemctl is-active docker" 1 >/dev/null 2>&1; then
+            echo -e "   ✓ $vm_name Docker服务正常"
+            ((service_healthy++))
+        else
+            echo -e "   ✗ $vm_name Docker服务异常"
+        fi
+        
+        # 检查containerd
+        ((service_total++))
+        if execute_remote_command "$ip" "systemctl is-active containerd" 1 >/dev/null 2>&1; then
+            echo -e "   ✓ $vm_name containerd服务正常"
+            ((service_healthy++))
+        else
+            echo -e "   ✗ $vm_name containerd服务异常"
+        fi
+        
+        # 检查kubelet
+        ((service_total++))
+        if execute_remote_command "$ip" "systemctl is-active kubelet" 1 >/dev/null 2>&1; then
+            echo -e "   ✓ $vm_name kubelet服务正常"
+            ((service_healthy++))
+        else
+            echo -e "   ✗ $vm_name kubelet服务异常"
+        fi
+    done
+    
+    local service_score=$((service_healthy * 25 / service_total))
+    health_score=$((health_score + service_score))
+    echo -e "   评分: $service_score/25"
+    echo ""
+    
+    # 4. K8S集群状态检查 (25分)
+    echo -e "${YELLOW}4. K8S集群状态检查...${NC}"
+    local cluster_score=0
+    
+    # 检查集群连通性
+    if execute_remote_command "$master_ip" "kubectl get nodes" 1 >/dev/null 2>&1; then
+        echo -e "   ✓ K8S API服务器可访问"
+        cluster_score=$((cluster_score + 10))
+        
+        # 检查节点状态
+        local ready_nodes=$(execute_remote_command "$master_ip" "kubectl get nodes --no-headers | grep -c Ready" 1 2>/dev/null || echo "0")
+        local total_nodes=$(execute_remote_command "$master_ip" "kubectl get nodes --no-headers | wc -l" 1 2>/dev/null || echo "0")
+        
+        if [[ "$ready_nodes" -eq "$total_nodes" ]] && [[ "$total_nodes" -gt 0 ]]; then
+            echo -e "   ✓ 所有节点状态Ready ($ready_nodes/$total_nodes)"
+            cluster_score=$((cluster_score + 15))
+        else
+            echo -e "   ✗ 部分节点状态异常 ($ready_nodes/$total_nodes Ready)"
+            cluster_score=$((cluster_score + ready_nodes * 15 / total_nodes))
+        fi
+    else
+        echo -e "   ✗ K8S API服务器不可访问"
+    fi
+    
+    health_score=$((health_score + cluster_score))
+    echo -e "   评分: $cluster_score/25"
+    echo ""
+    
+    # 5. 系统资源检查 (15分)
+    echo -e "${YELLOW}5. 系统资源检查...${NC}"
+    local resource_score=0
+    local resource_checks=0
+    
+    for ip in "${all_ips[@]}"; do
+        local vm_name=$(get_vm_name_by_ip "$ip")
+        
+        # 检查内存使用率
+        local mem_usage=$(execute_remote_command "$ip" "free | grep Mem | awk '{printf \"%.0f\", \$3/\$2 * 100}'" 1 2>/dev/null || echo "100")
+        ((resource_checks++))
+        
+        if [[ "$mem_usage" -lt 80 ]]; then
+            echo -e "   ✓ $vm_name 内存使用率正常 (${mem_usage}%)"
+            ((resource_score += 3))
+        else
+            echo -e "   ⚠ $vm_name 内存使用率较高 (${mem_usage}%)"
+            ((resource_score += 1))
+        fi
+        
+        # 检查磁盘使用率
+        local disk_usage=$(execute_remote_command "$ip" "df / | tail -1 | awk '{print \$5}' | sed 's/%//'" 1 2>/dev/null || echo "100")
+        ((resource_checks++))
+        
+        if [[ "$disk_usage" -lt 80 ]]; then
+            echo -e "   ✓ $vm_name 磁盘使用率正常 (${disk_usage}%)"
+            ((resource_score += 2))
+        else
+            echo -e "   ⚠ $vm_name 磁盘使用率较高 (${disk_usage}%)"
+            ((resource_score += 1))
+        fi
+    done
+    
+    # 标准化资源评分到15分
+    resource_score=$((resource_score * 15 / (resource_checks * 5)))
+    health_score=$((health_score + resource_score))
+    echo -e "   评分: $resource_score/15"
+    echo ""
+    
+    # 总体健康评估
+    echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}集群健康评分: $health_score/$max_score${NC}"
+    
+    if [[ $health_score -ge 90 ]]; then
+        echo -e "${GREEN}✓ 集群状态优秀！${NC}"
+    elif [[ $health_score -ge 70 ]]; then
+        echo -e "${YELLOW}⚠ 集群状态良好，但有改进空间${NC}"
+    elif [[ $health_score -ge 50 ]]; then
+        echo -e "${YELLOW}⚠ 集群状态一般，建议进行优化${NC}"
+    else
+        echo -e "${RED}✗ 集群状态较差，需要立即修复${NC}"
+        echo -e "${CYAN}建议运行菜单选项 12 - 一键修复所有问题${NC}"
+    fi
+    
+    echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+}
+
+# 自动化运维
+automation_ops() {
+    log "自动化运维功能..."
+    
+    echo -e "${YELLOW}请选择自动化运维选项：${NC}"
+    echo -e "  ${CYAN}1.${NC} 设置定时健康检查"
+    echo -e "  ${CYAN}2.${NC} 设置定时备份"
+    echo -e "  ${CYAN}3.${NC} 设置资源监控报警"
+    echo -e "  ${CYAN}4.${NC} 查看定时任务状态"
+    echo -e "  ${CYAN}5.${NC} 清理定时任务"
+    echo -e "  ${CYAN}0.${NC} 返回主菜单"
+    
+    read -p "请选择 [0-5]: " auto_choice
+    
+    case $auto_choice in
+        1)
+            setup_health_check_cron
+            ;;
+        2)
+            setup_backup_cron
+            ;;
+        3)
+            setup_monitoring_alerts
+            ;;
+        4)
+            show_cron_status
+            ;;
+        5)
+            cleanup_cron_jobs
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            warn "无效选择"
+            ;;
+    esac
+}
+
+# 设置定时健康检查
+setup_health_check_cron() {
+    log "设置定时健康检查..."
+    
+    echo -e "${YELLOW}选择健康检查频率：${NC}"
+    echo -e "  ${CYAN}1.${NC} 每小时检查一次"
+    echo -e "  ${CYAN}2.${NC} 每4小时检查一次"
+    echo -e "  ${CYAN}3.${NC} 每天检查一次"
+    echo -e "  ${CYAN}4.${NC} 自定义频率"
+    
+    read -p "请选择 [1-4]: " freq_choice
+    
+    local cron_schedule=""
+    case $freq_choice in
+        1)
+            cron_schedule="0 * * * *"
+            ;;
+        2)
+            cron_schedule="0 */4 * * *"
+            ;;
+        3)
+            cron_schedule="0 2 * * *"
+            ;;
+        4)
+            read -p "请输入cron表达式（例如：0 */6 * * *）: " cron_schedule
+            ;;
+        *)
+            warn "无效选择"
+            return 1
+            ;;
+    esac
+    
+    # 创建健康检查脚本
+    local health_script="/usr/local/bin/k8s-health-check.sh"
+    cat > "$health_script" << 'EOF'
+#!/bin/bash
+# K8S集群健康检查脚本
+
+LOGFILE="/var/log/k8s-health-check.log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 日志函数
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE"
+}
+
+# 执行健康检查
+log "开始集群健康检查..."
+cd /root
+./one-click-pve-k8s.sh 21 >> "$LOGFILE" 2>&1
+
+# 检查结果并发送通知（如果配置了）
+if [[ -f "/etc/k8s-alert-config" ]]; then
+    source /etc/k8s-alert-config
+    if [[ -n "$WEBHOOK_URL" ]]; then
+        # 发送Webhook通知
+        curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"K8S集群健康检查完成，详情请查看日志: $LOGFILE\"}" \
+            2>/dev/null || true
+    fi
+fi
+
+log "健康检查完成"
+EOF
+    
+    chmod +x "$health_script"
+    
+    # 添加到crontab
+    (crontab -l 2>/dev/null | grep -v "k8s-health-check"; echo "$cron_schedule $health_script") | crontab -
+    
+    success "定时健康检查设置完成"
+    echo -e "${CYAN}检查频率: $cron_schedule${NC}"
+    echo -e "${CYAN}日志文件: /var/log/k8s-health-check.log${NC}"
+}
+
+# 设置定时备份
+setup_backup_cron() {
+    log "设置定时备份..."
+    
+    echo -e "${YELLOW}选择备份频率：${NC}"
+    echo -e "  ${CYAN}1.${NC} 每天备份一次"
+    echo -e "  ${CYAN}2.${NC} 每周备份一次"
+    echo -e "  ${CYAN}3.${NC} 每月备份一次"
+    echo -e "  ${CYAN}4.${NC} 自定义频率"
+    
+    read -p "请选择 [1-4]: " backup_choice
+    
+    local cron_schedule=""
+    case $backup_choice in
+        1)
+            cron_schedule="0 3 * * *"
+            ;;
+        2)
+            cron_schedule="0 3 * * 0"
+            ;;
+        3)
+            cron_schedule="0 3 1 * *"
+            ;;
+        4)
+            read -p "请输入cron表达式: " cron_schedule
+            ;;
+        *)
+            warn "无效选择"
+            return 1
+            ;;
+    esac
+    
+    # 创建备份脚本
+    local backup_script="/usr/local/bin/k8s-backup.sh"
+    cat > "$backup_script" << 'EOF'
+#!/bin/bash
+# K8S集群备份脚本
+
+LOGFILE="/var/log/k8s-backup.log"
+BACKUP_DIR="/var/backups/k8s"
+
+# 日志函数
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE"
+}
+
+# 创建备份目录
+mkdir -p "$BACKUP_DIR"
+
+# 执行备份
+log "开始集群备份..."
+cd /root
+./one-click-pve-k8s.sh 19 >> "$LOGFILE" 2>&1
+
+# 清理旧备份（保留最近7个）
+find "$BACKUP_DIR" -name "k8s-backup-*" -type d -mtime +7 -exec rm -rf {} \; 2>/dev/null || true
+
+log "备份完成"
+EOF
+    
+    chmod +x "$backup_script"
+    
+    # 添加到crontab
+    (crontab -l 2>/dev/null | grep -v "k8s-backup"; echo "$cron_schedule $backup_script") | crontab -
+    
+    success "定时备份设置完成"
+    echo -e "${CYAN}备份频率: $cron_schedule${NC}"
+    echo -e "${CYAN}备份目录: /var/backups/k8s${NC}"
+    echo -e "${CYAN}日志文件: /var/log/k8s-backup.log${NC}"
+}
+
+# 设置监控报警
+setup_monitoring_alerts() {
+    log "设置监控报警..."
+    
+    read -p "请输入Webhook URL（用于发送报警通知）: " webhook_url
+    read -p "请输入报警阈值 - CPU使用率(%) [默认: 80]: " cpu_threshold
+    read -p "请输入报警阈值 - 内存使用率(%) [默认: 80]: " mem_threshold
+    read -p "请输入报警阈值 - 磁盘使用率(%) [默认: 80]: " disk_threshold
+    
+    cpu_threshold=${cpu_threshold:-80}
+    mem_threshold=${mem_threshold:-80}
+    disk_threshold=${disk_threshold:-80}
+    
+    # 创建报警配置文件
+    cat > "/etc/k8s-alert-config" << EOF
+# K8S监控报警配置
+WEBHOOK_URL="$webhook_url"
+CPU_THRESHOLD=$cpu_threshold
+MEM_THRESHOLD=$mem_threshold
+DISK_THRESHOLD=$disk_threshold
+EOF
+    
+    # 创建监控脚本
+    local monitor_script="/usr/local/bin/k8s-monitor.sh"
+    cat > "$monitor_script" << 'EOF'
+#!/bin/bash
+# K8S集群监控脚本
+
+source /etc/k8s-alert-config
+
+LOGFILE="/var/log/k8s-monitor.log"
+
+# 日志函数
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE"
+}
+
+# 发送报警
+send_alert() {
+    local message="$1"
+    log "发送报警: $message"
+    
+    if [[ -n "$WEBHOOK_URL" ]]; then
+        curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"🚨 K8S集群报警: $message\"}" \
+            2>/dev/null || log "报警发送失败"
+    fi
+}
+
+# 检查资源使用率
+check_resources() {
+    local all_ips=(10.0.0.10 10.0.0.11 10.0.0.12)
+    
+    for ip in "${all_ips[@]}"; do
+        # 检查CPU使用率
+        local cpu_usage=$(sshpass -p "123456" ssh -o StrictHostKeyChecking=no root@$ip \
+            "top -bn1 | grep 'Cpu(s)' | sed 's/.*, *\([0-9.]*\)%* id.*/\1/' | awk '{print 100 - \$1}'" 2>/dev/null | cut -d. -f1)
+        
+        if [[ "$cpu_usage" -gt "$CPU_THRESHOLD" ]]; then
+            send_alert "节点 $ip CPU使用率过高: ${cpu_usage}%"
+        fi
+        
+        # 检查内存使用率
+        local mem_usage=$(sshpass -p "123456" ssh -o StrictHostKeyChecking=no root@$ip \
+            "free | grep Mem | awk '{printf \"%.0f\", \$3/\$2 * 100}'" 2>/dev/null)
+        
+        if [[ "$mem_usage" -gt "$MEM_THRESHOLD" ]]; then
+            send_alert "节点 $ip 内存使用率过高: ${mem_usage}%"
+        fi
+        
+        # 检查磁盘使用率
+        local disk_usage=$(sshpass -p "123456" ssh -o StrictHostKeyChecking=no root@$ip \
+            "df / | tail -1 | awk '{print \$5}' | sed 's/%//'" 2>/dev/null)
+        
+        if [[ "$disk_usage" -gt "$DISK_THRESHOLD" ]]; then
+            send_alert "节点 $ip 磁盘使用率过高: ${disk_usage}%"
+        fi
+    done
+}
+
+log "开始监控检查..."
+check_resources
+log "监控检查完成"
+EOF
+    
+    chmod +x "$monitor_script"
+    
+    # 添加到crontab（每5分钟检查一次）
+    (crontab -l 2>/dev/null | grep -v "k8s-monitor"; echo "*/5 * * * * $monitor_script") | crontab -
+    
+    success "监控报警设置完成"
+    echo -e "${CYAN}检查频率: 每5分钟${NC}"
+    echo -e "${CYAN}CPU阈值: ${cpu_threshold}%${NC}"
+    echo -e "${CYAN}内存阈值: ${mem_threshold}%${NC}"
+    echo -e "${CYAN}磁盘阈值: ${disk_threshold}%${NC}"
+    echo -e "${CYAN}Webhook URL: $webhook_url${NC}"
+}
+
+# 查看定时任务状态
+show_cron_status() {
+    log "查看定时任务状态..."
+    
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║                     定时任务状态                             ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    echo -e "${YELLOW}当前定时任务：${NC}"
+    crontab -l 2>/dev/null | grep -E "(k8s-health-check|k8s-backup|k8s-monitor)" || echo "没有K8S相关的定时任务"
+    echo ""
+    
+    echo -e "${YELLOW}脚本文件状态：${NC}"
+    for script in "/usr/local/bin/k8s-health-check.sh" "/usr/local/bin/k8s-backup.sh" "/usr/local/bin/k8s-monitor.sh"; do
+        if [[ -f "$script" ]]; then
+            echo -e "  ✓ $script 存在"
+        else
+            echo -e "  ✗ $script 不存在"
+        fi
+    done
+    echo ""
+    
+    echo -e "${YELLOW}配置文件状态：${NC}"
+    if [[ -f "/etc/k8s-alert-config" ]]; then
+        echo -e "  ✓ /etc/k8s-alert-config 存在"
+        echo -e "  配置内容："
+        cat /etc/k8s-alert-config | sed 's/^/    /'
+    else
+        echo -e "  ✗ /etc/k8s-alert-config 不存在"
+    fi
+    echo ""
+    
+    echo -e "${YELLOW}日志文件状态：${NC}"
+    for logfile in "/var/log/k8s-health-check.log" "/var/log/k8s-backup.log" "/var/log/k8s-monitor.log"; do
+        if [[ -f "$logfile" ]]; then
+            local size=$(du -h "$logfile" | cut -f1)
+            echo -e "  ✓ $logfile ($size)"
+        else
+            echo -e "  - $logfile 不存在"
+        fi
+    done
+}
+
+# 清理定时任务
+cleanup_cron_jobs() {
+    log "清理定时任务..."
+    
+    echo -e "${YELLOW}将清理以下内容：${NC}"
+    echo -e "  - 所有K8S相关的定时任务"
+    echo -e "  - 自动化脚本文件"
+    echo -e "  - 配置文件"
+    echo -e "  - 日志文件"
+    echo ""
+    
+    read -p "确认清理？[y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        # 清理定时任务
+        crontab -l 2>/dev/null | grep -v -E "(k8s-health-check|k8s-backup|k8s-monitor)" | crontab -
+        
+        # 清理脚本文件
+        rm -f /usr/local/bin/k8s-health-check.sh
+        rm -f /usr/local/bin/k8s-backup.sh
+        rm -f /usr/local/bin/k8s-monitor.sh
+        
+        # 清理配置文件
+        rm -f /etc/k8s-alert-config
+        
+        # 清理日志文件
+        rm -f /var/log/k8s-health-check.log
+        rm -f /var/log/k8s-backup.log
+        rm -f /var/log/k8s-monitor.log
+        
+        success "定时任务清理完成"
+    else
+        log "取消清理操作"
+    fi
+}
+
 # ==========================================
 # 状态检查
 # ==========================================
@@ -1575,9 +2445,16 @@ show_menu() {
     echo -e "${BLUE}诊断功能：${NC}"
     echo -e "  ${CYAN}10.${NC} 系统诊断"
     echo -e "  ${CYAN}11.${NC} 检查集群状态"
+    echo -e "  ${CYAN}21.${NC} 集群健康检查"
     echo -e "  ${CYAN}15.${NC} 查看系统日志"
     echo -e "  ${CYAN}16.${NC} 生成故障报告"
     echo -e "  ${CYAN}17.${NC} 快速修复手册"
+    echo ""
+    echo -e "${PURPLE}高级功能：${NC}"
+    echo -e "  ${CYAN}18.${NC} 性能监控"
+    echo -e "  ${CYAN}19.${NC} 备份集群配置"
+    echo -e "  ${CYAN}20.${NC} 高级配置选项"
+    echo -e "  ${CYAN}22.${NC} 自动化运维"
     echo ""
     echo -e "${RED}管理功能：${NC}"
     echo -e "  ${CYAN}13.${NC} 强制重建集群"
@@ -1600,7 +2477,7 @@ main() {
         show_banner
         show_menu
         
-        read -p "请选择操作 [0-17]: " choice
+        read -p "请选择操作 [0-22]: " choice
         
         case $choice in
             1)
@@ -1628,6 +2505,11 @@ main() {
             15) view_logs ;;
             16) generate_troubleshooting_report ;;
             17) show_quick_fix_guide ;;
+            18) monitor_cluster_performance ;;
+            19) backup_cluster_config ;;
+            20) advanced_config ;;
+            21) cluster_health_check ;;
+            22) automation_ops ;;
             0) 
                 log "退出脚本"
                 exit 0 
