@@ -23,6 +23,49 @@ readonly CYAN='\e[0;36m'
 readonly PURPLE='\e[0;35m'
 readonly NC='\e[0m'
 
+# 带进度显示的下载函数
+download_with_progress() {
+    local url="$1"
+    local output="$2"
+    local description="$3"
+    local max_retries=3
+    local retry_count=0
+    
+    echo -e "${CYAN}正在下载: ${description}${NC}"
+    echo -e "${YELLOW}URL: $url${NC}"
+    
+    while [ $retry_count -lt $max_retries ]; do
+        if [ $retry_count -gt 0 ]; then
+            echo -e "${YELLOW}重试 ($retry_count/$max_retries)...${NC}"
+            sleep 2
+        fi
+        
+        # 尝试使用curl下载
+        if command -v curl >/dev/null 2>&1; then
+            echo -e "${BLUE}使用curl下载...${NC}"
+            if curl --progress-bar --connect-timeout 30 --max-time 300 -L "$url" -o "$output"; then
+                echo -e "${GREEN}✅ $description 下载成功${NC}"
+                return 0
+            fi
+        fi
+        
+        # 如果curl失败，尝试wget
+        if command -v wget >/dev/null 2>&1; then
+            echo -e "${BLUE}使用wget下载...${NC}"
+            if wget --progress=bar:force --timeout=30 --tries=3 "$url" -O "$output"; then
+                echo -e "${GREEN}✅ $description 下载成功${NC}"
+                return 0
+            fi
+        fi
+        
+        ((retry_count++))
+        echo -e "${RED}❌ 下载失败，准备重试...${NC}"
+    done
+    
+    echo -e "${RED}❌ $description 下载失败，已重试 $max_retries 次${NC}"
+    return 1
+}
+
 # 系统配置
 readonly STORAGE="local-lvm"
 readonly BRIDGE="vmbr0"
@@ -384,7 +427,7 @@ download_cloud_image() {
     
     for url in "${CLOUD_IMAGE_URLS[@]}"; do
         log "尝试从 $url 下载..."
-        if retry_command 3 5 wget -O "$CLOUD_IMAGE_PATH" "$url"; then
+        if download_with_progress "$url" "$CLOUD_IMAGE_PATH" "Debian 12 云镜像"; then
             success "云镜像下载完成"
             return 0
         else
@@ -714,7 +757,7 @@ EOF
         cd /tmp/docker-install
         
         # 下载Docker二进制包
-        if curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-$DOCKER_VERSION.tgz" -o docker.tgz; then
+        if download_with_progress "https://download.docker.com/linux/static/stable/x86_64/docker-$DOCKER_VERSION.tgz" "docker.tgz" "Docker v$DOCKER_VERSION"; then
             echo "Docker二进制文件下载成功"
             
             # 解压并安装
@@ -785,7 +828,7 @@ EOF
         echo "安装containerd..."
         CONTAINERD_VERSION="1.7.8"
         
-        if curl -fsSL "https://github.com/containerd/containerd/releases/download/v$CONTAINERD_VERSION/containerd-$CONTAINERD_VERSION-linux-amd64.tar.gz" -o containerd.tar.gz; then
+        if download_with_progress "https://github.com/containerd/containerd/releases/download/v$CONTAINERD_VERSION/containerd-$CONTAINERD_VERSION-linux-amd64.tar.gz" "containerd.tar.gz" "containerd v$CONTAINERD_VERSION"; then
             echo "containerd下载成功"
             tar -xzf containerd.tar.gz -C /usr/local/
             
@@ -869,7 +912,7 @@ EOF
         K8S_INSTALL_SUCCESS=false
         
         # 下载kubectl
-        if curl -L "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubectl" -o kubectl; then
+        if download_with_progress "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubectl" "kubectl" "kubectl $K8S_VERSION"; then
             chmod +x kubectl
             mv kubectl /usr/local/bin/
             echo "kubectl下载安装成功"
@@ -879,7 +922,7 @@ EOF
         fi
         
         # 下载kubeadm
-        if curl -L "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubeadm" -o kubeadm; then
+        if download_with_progress "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubeadm" "kubeadm" "kubeadm $K8S_VERSION"; then
             chmod +x kubeadm
             mv kubeadm /usr/local/bin/
             echo "kubeadm下载安装成功"
@@ -889,7 +932,7 @@ EOF
         fi
         
         # 下载kubelet
-        if curl -L "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubelet" -o kubelet; then
+        if download_with_progress "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubelet" "kubelet" "kubelet $K8S_VERSION"; then
             chmod +x kubelet
             mv kubelet /usr/local/bin/
             echo "kubelet下载安装成功"
@@ -1214,21 +1257,21 @@ deploy_kubesphere() {
         # 下载配置文件，使用多个备用方案
         echo "下载KubeSphere配置文件..."
         
-        # 尝试GitHub官方源
-        if ! wget -O kubesphere-installer.yaml https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml; then
+        # 下载kubesphere-installer.yaml
+        if ! download_with_progress "https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml" "kubesphere-installer.yaml" "KubeSphere Installer"; then
             echo "GitHub下载失败，尝试国内镜像源..."
-            # 尝试使用国内镜像源
-            if ! wget -O kubesphere-installer.yaml https://gitee.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml; then
-                echo "Gitee下载失败，使用curl重试..."
-                curl -L -o kubesphere-installer.yaml https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml || exit 1
+            if ! download_with_progress "https://gitee.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml" "kubesphere-installer.yaml" "KubeSphere Installer (Gitee)"; then
+                echo "所有源下载失败"
+                exit 1
             fi
         fi
         
-        if ! wget -O cluster-configuration.yaml https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml; then
+        # 下载cluster-configuration.yaml
+        if ! download_with_progress "https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml" "cluster-configuration.yaml" "KubeSphere Cluster Configuration"; then
             echo "GitHub下载失败，尝试国内镜像源..."
-            if ! wget -O cluster-configuration.yaml https://gitee.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml; then
-                echo "Gitee下载失败，使用curl重试..."
-                curl -L -o cluster-configuration.yaml https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml || exit 1
+            if ! download_with_progress "https://gitee.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml" "cluster-configuration.yaml" "KubeSphere Cluster Configuration (Gitee)"; then
+                echo "所有源下载失败"
+                exit 1
             fi
         fi
         
