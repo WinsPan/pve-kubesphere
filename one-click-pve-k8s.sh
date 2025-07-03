@@ -378,7 +378,7 @@ init_system() {
     manage_disk_space
     
     # 系统预热
-    if [[ "$ENABLE_MONITORING" == "true" ]]; then
+    if [[ "$ENABLE_MONITORING" == "true" ]] && [[ "${DEMO_MODE:-false}" != "true" ]]; then
         warm_up_system
     fi
     
@@ -422,19 +422,27 @@ log_debug() {
 }
 
 log_info() { 
-    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
+    # 确保日志目录存在
+    [[ ! -d "$(dirname "$LOG_FILE")" ]] && mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE" 2>/dev/null || echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"
 }
 
 log_warn() { 
-    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE" "$ERROR_LOG"
+    # 确保日志目录存在
+    [[ ! -d "$(dirname "$LOG_FILE")" ]] && mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE" "$ERROR_LOG" 2>/dev/null || echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"
 }
 
 log_error() { 
-    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE" "$ERROR_LOG"
+    # 确保日志目录存在
+    [[ ! -d "$(dirname "$LOG_FILE")" ]] && mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE" "$ERROR_LOG" 2>/dev/null || echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"
 }
 
 log_success() { 
-    echo -e "${GREEN}[SUCCESS]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
+    # 确保日志目录存在
+    [[ ! -d "$(dirname "$LOG_FILE")" ]] && mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    echo -e "${GREEN}[SUCCESS]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE" 2>/dev/null || echo -e "${GREEN}[SUCCESS]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*"
 }
 
 log_performance() {
@@ -442,7 +450,9 @@ log_performance() {
 }
 
 log_audit() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') USER=$(whoami) ACTION=$*" >> "$AUDIT_LOG"
+    # 确保日志目录存在
+    [[ ! -d "$(dirname "$AUDIT_LOG")" ]] && mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null || true
+    echo "$(date '+%Y-%m-%d %H:%M:%S') USER=$(whoami) ACTION=$*" >> "$AUDIT_LOG" 2>/dev/null || true
 }
 
 # 增强的错误处理
@@ -1057,21 +1067,15 @@ optimize_memory_usage() {
     
     # 清理环境变量
     unset MAIL MAILCHECK 2>/dev/null || true
-    
-    log_debug "内存使用已优化"
 }
 
 # 磁盘空间管理
 manage_disk_space() {
     local min_free_space_gb="${1:-5}"
     local work_dir_size=$(du -sg "$WORK_DIR" 2>/dev/null | cut -f1 || echo 0)
-    local available_space=$(df "$WORK_DIR" | tail -1 | awk '{print int($4/1024/1024)}')
-    
-    log_debug "工作目录大小: ${work_dir_size}GB，可用空间: ${available_space}GB"
+    local available_space=$(df "$WORK_DIR" | tail -1 | awk '{print int($4/1024/1024)}' 2>/dev/null || echo 100)
     
     if (( available_space < min_free_space_gb )); then
-        log_warn "磁盘空间不足，开始清理..."
-        
         # 清理缓存
         cache_clear
         
@@ -1080,8 +1084,6 @@ manage_disk_space() {
         
         # 清理旧日志
         find "$LOG_DIR" -name "*.log" -mtime +7 -delete 2>/dev/null || true
-        
-        log_info "磁盘空间清理完成"
     fi
 }
 
@@ -1131,9 +1133,18 @@ trap 'handle_error ${LINENO}' ERR
 parse_vm_config() {
     local vm_id="$1"
     local field="$2"
-    local config="${VM_CONFIGS[$vm_id]}"
+    local config=""
     
-    IFS=':' read -r name ip cores memory disk <<< "$config"
+    # 兼容bash 3.x和4.x+
+    if [[ "${BASH_VERSION%%.*}" -ge 4 ]]; then
+        config="${VM_CONFIGS[$vm_id]}"
+    else
+        # bash 3.x 使用变量名拼接
+        local var_name="VM_CONFIG_$vm_id"
+        config="${!var_name}"
+    fi
+    
+    IFS='|' read -r name ip cores memory disk <<< "$config"
     
     case "$field" in
         "name") echo "$name" ;;
@@ -1145,12 +1156,35 @@ parse_vm_config() {
     esac
 }
 
+# 获取所有VM ID（兼容bash 3.x和4.x+）
+get_all_vm_ids() {
+    local vm_ids=()
+    
+    if [[ "${BASH_VERSION%%.*}" -ge 4 ]]; then
+        vm_ids=("${!VM_CONFIGS[@]}")
+    else
+        # bash 3.x 使用固定的VM ID列表
+        local all_vm_ids=(101 102 103 104)
+        for vm_id in "${all_vm_ids[@]}"; do
+            local var_name="VM_CONFIG_$vm_id"
+            if [[ -n "${!var_name}" ]]; then
+                vm_ids+=("$vm_id")
+            fi
+        done
+    fi
+    
+    echo "${vm_ids[@]}"
+}
+
 # 获取所有IP
 get_all_ips() {
     local ips=()
-    for vm_id in "${!VM_CONFIGS[@]}"; do
+    local vm_ids=($(get_all_vm_ids))
+    
+    for vm_id in "${vm_ids[@]}"; do
         ips+=($(parse_vm_config "$vm_id" "ip"))
     done
+    
     echo "${ips[@]}"
 }
 
@@ -1162,7 +1196,8 @@ get_master_ip() {
 # 根据IP获取VM名称
 get_vm_name_by_ip() {
     local target_ip="$1"
-    for vm_id in "${!VM_CONFIGS[@]}"; do
+    local vm_ids=($(get_all_vm_ids))
+    for vm_id in "${vm_ids[@]}"; do
         local ip=$(parse_vm_config "$vm_id" "ip")
         if [[ "$ip" == "$target_ip" ]]; then
             echo $(parse_vm_config "$vm_id" "name")
@@ -1202,14 +1237,23 @@ check_environment() {
     
     # 检查root权限
     if [[ $EUID -ne 0 ]]; then
-        error "此脚本需要root权限运行"
-        exit 1
+        if [[ "${DEMO_MODE:-false}" == "true" ]]; then
+            warn "当前非root用户，但DEMO_MODE已启用，继续运行"
+        else
+            error "此脚本需要root权限运行"
+            exit 1
+        fi
     fi
     
     # 检查PVE环境
     if ! command -v qm &>/dev/null; then
-        error "未检测到PVE环境"
-        exit 1
+        if [[ "${DEMO_MODE:-false}" == "true" ]]; then
+            warn "未检测到PVE环境，但DEMO_MODE已启用，继续运行"
+        else
+            error "未检测到PVE环境"
+            error "如需在非PVE环境下测试菜单，请设置 DEMO_MODE=true"
+            exit 1
+        fi
     fi
     
     # 检查必要命令
@@ -3940,10 +3984,37 @@ cleanup_all() {
 
 # 显示系统状态
 show_system_status() {
-    local cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
-    local memory_usage=$(free | grep Mem | awk '{printf "%.1f", $3/$2 * 100.0}' 2>/dev/null || echo "N/A")
-    local disk_usage=$(df / | tail -1 | awk '{print $5}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
-    local load_avg=$(uptime | awk -F'load average:' '{print $2}' | cut -d',' -f1 | xargs 2>/dev/null || echo "N/A")
+    # 兼容 macOS 和 Linux
+    local cpu_usage="N/A"
+    local memory_usage="N/A"
+    local disk_usage="N/A"
+    local load_avg="N/A"
+    
+    # CPU 使用率 (兼容不同系统)
+    if command -v top >/dev/null 2>&1; then
+        if [[ "$(uname)" == "Darwin" ]]; then
+            # macOS
+            cpu_usage=$(top -l 1 -n 0 | grep "CPU usage" | awk '{print $3}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
+        else
+            # Linux
+            cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
+        fi
+    fi
+    
+    # 内存使用率 (兼容不同系统)
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS
+        memory_usage=$(vm_stat | awk '/Pages free:/ {free=$3} /Pages active:/ {active=$3} /Pages inactive:/ {inactive=$3} /Pages speculative:/ {spec=$3} /Pages wired down:/ {wired=$4} END {total=free+active+inactive+spec+wired; used=active+inactive+wired; printf "%.1f", used/total*100}' 2>/dev/null || echo "N/A")
+    elif command -v free >/dev/null 2>&1; then
+        # Linux
+        memory_usage=$(free | grep Mem | awk '{printf "%.1f", $3/$2 * 100.0}' 2>/dev/null || echo "N/A")
+    fi
+    
+    # 磁盘使用率
+    disk_usage=$(df / | tail -1 | awk '{print $5}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
+    
+    # 负载平均值
+    load_avg=$(uptime | awk -F'load average:' '{print $2}' | cut -d',' -f1 | xargs 2>/dev/null || echo "N/A")
     
     echo -e "${BLUE}┌─ 系统状态 ─────────────────────────────────────────────────────────┐${NC}"
     echo -e "${BLUE}│${NC} CPU: ${cpu_usage}%  内存: ${memory_usage}%  磁盘: ${disk_usage}%  负载: ${load_avg}      ${BLUE}│${NC}"
@@ -4429,12 +4500,14 @@ cleanup_and_exit() {
     # 保存审计日志
     log_audit "SCRIPT_EXIT"
     
-    echo -e "${GREEN}感谢使用 $SCRIPT_NAME！${NC}"
+    echo -e "${GREEN}感谢使用 ${SCRIPT_NAME:-PVE K8S部署工具}！${NC}"
     exit 0
 }
 
 # 主程序入口
 main() {
+
+    
     # 设置信号处理
     trap cleanup_and_exit SIGINT SIGTERM
     
@@ -4451,6 +4524,8 @@ main() {
             exit 0
             ;;
     esac
+    
+
     
     # 初始化系统
     init_system
