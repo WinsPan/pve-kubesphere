@@ -675,8 +675,8 @@ install_docker_k8s() {
         # 初始化变量
         skip_docker_repo=false
         
-        # 配置国内镜像源
-        echo "配置镜像源..."
+        # 配置国内镜像源（仅基础仓库）
+        echo "配置基础镜像源..."
         cat > /etc/apt/sources.list << "EOF"
 deb https://mirrors.ustc.edu.cn/debian/ bookworm main contrib non-free non-free-firmware
 deb https://mirrors.ustc.edu.cn/debian/ bookworm-updates main contrib non-free non-free-firmware
@@ -684,8 +684,11 @@ deb https://mirrors.ustc.edu.cn/debian/ bookworm-backports main contrib non-free
 deb https://mirrors.ustc.edu.cn/debian-security/ bookworm-security main contrib non-free non-free-firmware
 EOF
         
-        # 更新包列表
-        apt-get update -y || { echo "APT更新失败"; exit 1; }
+        # 清理可能存在的旧仓库配置
+        rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/kubernetes.list
+        
+        # 更新基础包列表
+        apt-get update -y
         
         # 安装Docker
         echo "安装Docker..."
@@ -731,11 +734,23 @@ EOF
         
         # 添加Docker仓库（新格式）
         if [ "$skip_docker_repo" != "true" ]; then
+            echo "添加Docker CE仓库..."
             echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list
             
-            apt-get update -y
-            if ! apt-get install -y docker-ce docker-ce-cli containerd.io; then
-                echo "Docker CE安装失败，尝试系统默认包"
+            echo "更新包列表（包含Docker仓库）..."
+            if apt-get update -y; then
+                echo "安装Docker CE..."
+                if ! apt-get install -y docker-ce docker-ce-cli containerd.io; then
+                    echo "Docker CE安装失败，尝试系统默认包"
+                    rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.gpg
+                    apt-get update -y
+                    if ! apt-get install -y docker.io containerd; then
+                        echo "Docker安装失败"
+                        exit 1
+                    fi
+                fi
+            else
+                echo "Docker仓库更新失败，使用系统默认包"
                 rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.gpg
                 apt-get update -y
                 if ! apt-get install -y docker.io containerd; then
@@ -802,9 +817,16 @@ EOF
         fi
         
         # 添加K8S仓库（新格式）
+        echo "添加K8S仓库..."
         echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
         
-        apt-get update -y
+        echo "更新包列表（包含K8S仓库）..."
+        if ! apt-get update -y; then
+            echo "K8S仓库更新失败"
+            exit 1
+        fi
+        
+        echo "安装K8S组件..."
         if ! apt-get install -y kubelet=1.28.2-00 kubeadm=1.28.2-00 kubectl=1.28.2-00; then
             echo "K8S安装失败，尝试备用仓库..."
             rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes.gpg
