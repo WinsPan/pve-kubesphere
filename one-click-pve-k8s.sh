@@ -162,6 +162,13 @@ check_environment() {
         fi
     done
     
+    # 清理SSH环境
+    log "清理SSH环境..."
+    local all_ips=($(get_all_ips))
+    for ip in "${all_ips[@]}"; do
+        ssh-keygen -f "/root/.ssh/known_hosts" -R "$ip" 2>/dev/null || true
+    done
+    
     success "环境检查完成"
 }
 
@@ -184,6 +191,8 @@ execute_remote_command() {
         else
             if [[ $i -lt $max_retries ]]; then
                 warn "节点 $ip 命令执行失败，重试 $i/$max_retries..."
+                # 清理可能的旧SSH密钥
+                ssh-keygen -f "/root/.ssh/known_hosts" -R "$ip" 2>/dev/null || true
                 sleep 5
             fi
         fi
@@ -571,6 +580,13 @@ create_vm() {
 
 create_all_vms() {
     log "创建所有虚拟机..."
+    
+    # 清理SSH known_hosts中的旧密钥
+    log "清理SSH known_hosts中的旧密钥..."
+    local all_ips=($(get_all_ips))
+    for ip in "${all_ips[@]}"; do
+        ssh-keygen -f "/root/.ssh/known_hosts" -R "$ip" 2>/dev/null || true
+    done
     
     for vm_id in "${!VM_CONFIGS[@]}"; do
         local vm_ip=$(parse_vm_config "$vm_id" "ip")
