@@ -66,6 +66,322 @@ download_with_progress() {
     return 1
 }
 
+# GitHub文件下载函数（支持多镜像源）
+download_github_file() {
+    local github_path="$1"  # 例如: /docker/docker/releases/download/v24.0.7/docker-24.0.7.tgz
+    local output="$2"
+    local description="$3"
+    
+    echo -e "${CYAN}正在下载: ${description}${NC}"
+    
+    # 遍历所有GitHub镜像源
+    for mirror in "${GITHUB_MIRRORS[@]}"; do
+        local full_url="${mirror}${github_path}"
+        echo -e "${YELLOW}尝试镜像源: $mirror${NC}"
+        
+        if download_with_progress "$full_url" "$output" "$description"; then
+            return 0
+        fi
+        
+        echo -e "${YELLOW}当前镜像源失败，尝试下一个...${NC}"
+        rm -f "$output" 2>/dev/null || true
+    done
+    
+    echo -e "${RED}❌ 所有GitHub镜像源都失败了${NC}"
+    return 1
+}
+
+# 通用软件下载函数
+download_software() {
+    local software_name="$1"
+    local version="$2"
+    local github_repo="$3"
+    local filename="$4"
+    local output="$5"
+    
+    local github_path="/${github_repo}/releases/download/${version}/${filename}"
+    download_github_file "$github_path" "$output" "${software_name} ${version}"
+}
+
+# K8S镜像源配置
+readonly K8S_MIRRORS=(
+    "https://dl.k8s.io"
+    "https://storage.googleapis.com/kubernetes-release"
+    "https://mirror.ghproxy.com/https://storage.googleapis.com/kubernetes-release"
+)
+
+# K8S二进制文件下载函数
+download_k8s_binary() {
+    local binary_name="$1"  # kubectl, kubeadm, kubelet
+    local version="$2"      # v1.28.2
+    
+    echo -e "${CYAN}正在下载: ${binary_name} ${version}${NC}"
+    
+    # 遍历所有K8S镜像源
+    for mirror in "${K8S_MIRRORS[@]}"; do
+        local full_url="${mirror}/release/${version}/bin/linux/amd64/${binary_name}"
+        echo -e "${YELLOW}尝试镜像源: $mirror${NC}"
+        
+        if download_with_progress "$full_url" "$binary_name" "${binary_name} ${version}"; then
+            chmod +x "$binary_name"
+            mv "$binary_name" /usr/local/bin/
+            echo -e "${GREEN}✅ ${binary_name} 安装成功${NC}"
+            return 0
+        fi
+        
+        echo -e "${YELLOW}当前镜像源失败，尝试下一个...${NC}"
+        rm -f "$binary_name" 2>/dev/null || true
+    done
+    
+    echo -e "${RED}❌ 所有K8S镜像源都失败了${NC}"
+    return 1
+}
+
+# 统一安装Docker和containerd
+install_docker_containerd() {
+    echo -e "${CYAN}开始安装Docker和containerd...${NC}"
+    
+    # 创建临时目录
+    local temp_dir="/tmp/docker-install"
+    mkdir -p "$temp_dir"
+    cd "$temp_dir"
+    
+    # 下载并安装Docker
+    if download_software "Docker" "v$DOCKER_VERSION" "docker/docker" "docker-$DOCKER_VERSION.tgz" "docker.tgz"; then
+        echo -e "${GREEN}Docker二进制文件下载成功${NC}"
+        
+        # 解压并安装
+        tar -xzf docker.tgz
+        cp docker/* /usr/local/bin/
+        chmod +x /usr/local/bin/docker*
+        
+        # 创建docker用户组
+        groupadd docker 2>/dev/null || true
+        
+        echo -e "${GREEN}Docker安装完成${NC}"
+    else
+        echo -e "${RED}Docker下载失败${NC}"
+        return 1
+    fi
+    
+    # 下载并安装containerd
+    if download_software "containerd" "v$CONTAINERD_VERSION" "containerd/containerd" "containerd-$CONTAINERD_VERSION-linux-amd64.tar.gz" "containerd.tar.gz"; then
+        echo -e "${GREEN}containerd下载成功${NC}"
+        tar -xzf containerd.tar.gz -C /usr/local/
+        echo -e "${GREEN}containerd安装完成${NC}"
+    else
+        echo -e "${RED}containerd下载失败${NC}"
+        return 1
+    fi
+    
+    # 下载并安装runc
+    if download_software "runc" "v$RUNC_VERSION" "opencontainers/runc" "runc.amd64" "runc"; then
+        echo -e "${GREEN}runc下载成功${NC}"
+        chmod +x runc
+        mv runc /usr/local/bin/
+        echo -e "${GREEN}runc安装完成${NC}"
+    else
+        echo -e "${YELLOW}runc下载失败，使用系统包${NC}"
+        apt-get install -y runc || true
+    fi
+    
+    # 清理临时文件
+    cd /
+    rm -rf "$temp_dir"
+    
+    # 创建服务文件
+    create_docker_services
+    create_containerd_config
+    
+    # 启动服务
+    systemctl daemon-reload
+    systemctl enable docker containerd
+    systemctl restart docker containerd
+    
+    # 验证安装
+    if docker --version && containerd --version; then
+        echo -e "${GREEN}✅ Docker和containerd安装成功${NC}"
+        return 0
+    else
+        echo -e "${RED}❌ Docker或containerd启动失败${NC}"
+        return 1
+    fi
+}
+
+# 创建Docker服务文件
+create_docker_services() {
+    cat > /etc/systemd/system/docker.service << 'EOF'
+[Unit]
+Description=Docker Application Container Engine
+Documentation=https://docs.docker.com
+After=network-online.target docker.socket firewalld.service containerd.service time-set.target
+Wants=network-online.target containerd.service
+Requires=docker.socket containerd.service
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutStartSec=0
+RestartSec=2
+Restart=always
+StartLimitBurst=3
+StartLimitInterval=60s
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+KillMode=process
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > /etc/systemd/system/docker.socket << 'EOF'
+[Unit]
+Description=Docker Socket for the API
+
+[Socket]
+ListenStream=/var/run/docker.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=docker
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+    cat > /etc/systemd/system/containerd.service << 'EOF'
+[Unit]
+Description=containerd container runtime
+Documentation=https://containerd.io
+After=network.target local-fs.target
+
+[Service]
+ExecStartPre=-/sbin/modprobe overlay
+ExecStart=/usr/local/bin/containerd
+Type=notify
+Delegate=yes
+KillMode=process
+Restart=always
+RestartSec=5
+LimitNPROC=infinity
+LimitCORE=infinity
+LimitNOFILE=infinity
+TasksMax=infinity
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# 创建containerd配置
+create_containerd_config() {
+    mkdir -p /etc/containerd
+    containerd config default > /etc/containerd/config.toml
+    sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
+    sed -i "s|registry.k8s.io/pause:3.6|registry.aliyuncs.com/google_containers/pause:3.6|g" /etc/containerd/config.toml
+    
+    # 配置Docker镜像加速
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json << 'EOF'
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {"max-size": "100m"},
+  "storage-driver": "overlay2",
+  "registry-mirrors": [
+    "https://docker.mirrors.ustc.edu.cn",
+    "https://hub-mirror.c.163.com",
+    "https://mirror.baidubce.com"
+  ]
+}
+EOF
+}
+
+# 统一安装K8S组件
+install_k8s_components() {
+    echo -e "${CYAN}开始安装K8S组件...${NC}"
+    
+    # 创建临时目录
+    local temp_dir="/tmp/k8s-install"
+    mkdir -p "$temp_dir"
+    cd "$temp_dir"
+    
+    # 下载kubectl
+    if download_k8s_binary "kubectl" "$K8S_VERSION"; then
+        echo -e "${GREEN}kubectl安装成功${NC}"
+    else
+        echo -e "${RED}kubectl下载失败${NC}"
+        return 1
+    fi
+    
+    # 下载kubeadm
+    if download_k8s_binary "kubeadm" "$K8S_VERSION"; then
+        echo -e "${GREEN}kubeadm安装成功${NC}"
+    else
+        echo -e "${RED}kubeadm下载失败${NC}"
+        return 1
+    fi
+    
+    # 下载kubelet
+    if download_k8s_binary "kubelet" "$K8S_VERSION"; then
+        echo -e "${GREEN}kubelet安装成功${NC}"
+    else
+        echo -e "${RED}kubelet下载失败${NC}"
+        return 1
+    fi
+    
+    # 清理临时文件
+    cd /
+    rm -rf "$temp_dir"
+    
+    # 创建kubelet服务文件
+    create_kubelet_service
+    
+    # 启动服务
+    systemctl daemon-reload
+    systemctl enable kubelet
+    
+    echo -e "${GREEN}✅ K8S组件安装成功${NC}"
+    return 0
+}
+
+# 创建kubelet服务文件
+create_kubelet_service() {
+    cat > /etc/systemd/system/kubelet.service << 'EOF'
+[Unit]
+Description=kubelet: The Kubernetes Node Agent
+Documentation=https://kubernetes.io/docs/home/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/kubelet
+Restart=always
+StartLimitInterval=0
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 创建kubelet配置目录
+    mkdir -p /etc/systemd/system/kubelet.service.d
+    cat > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf << 'EOF'
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+EnvironmentFile=-/etc/default/kubelet
+ExecStart=
+ExecStart=/usr/local/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+EOF
+}
+
 # 系统配置
 readonly STORAGE="local-lvm"
 readonly BRIDGE="vmbr0"
@@ -90,6 +406,20 @@ readonly CLOUD_IMAGE_URLS=(
 )
 readonly CLOUD_IMAGE_FILE="debian-12-generic-amd64.qcow2"
 readonly CLOUD_IMAGE_PATH="/var/lib/vz/template/qcow/$CLOUD_IMAGE_FILE"
+
+# GitHub镜像源配置
+readonly GITHUB_MIRRORS=(
+    "https://github.com"
+    "https://ghproxy.com/https://github.com"
+    "https://mirror.ghproxy.com/https://github.com"
+    "https://gh.api.99988866.xyz/https://github.com"
+    "https://gitclone.com/github.com"
+)
+
+# 软件版本配置
+readonly DOCKER_VERSION="24.0.7"
+readonly CONTAINERD_VERSION="1.7.8"
+readonly RUNC_VERSION="1.1.9"
 
 # K8S配置
 readonly K8S_VERSION="v1.28.2"
@@ -715,9 +1045,6 @@ install_docker_k8s() {
     local install_script='
         set -e
         
-        # 初始化变量
-        skip_docker_repo=false
-        
         # 配置国内镜像源（仅基础仓库）
         echo "配置基础镜像源..."
         cat > /etc/apt/sources.list << "EOF"
@@ -730,46 +1057,183 @@ EOF
         # 清理可能存在的旧仓库配置
         rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/kubernetes.list
         
-        # 更新基础包列表
+        # 更新基础包列表并安装基础依赖
         apt-get update -y
-        
-        # 安装Docker
-        echo "安装Docker..."
-        # 安装GPG密钥管理工具
-        apt-get install -y gnupg2 software-properties-common
+        apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release software-properties-common
         
         # 创建keyrings目录
         mkdir -p /etc/apt/keyrings
         
-        # 直接从GitHub安装Docker（避免GPG密钥问题）
-        echo "从GitHub安装Docker..."
+        # 定义GitHub镜像源
+        GITHUB_MIRRORS=(
+            "https://github.com"
+            "https://ghproxy.com/https://github.com"
+            "https://mirror.ghproxy.com/https://github.com"
+            "https://gh.api.99988866.xyz/https://github.com"
+            "https://gitclone.com/github.com"
+        )
         
-        # 安装基础依赖
-        apt-get update -y
-        apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+        # K8S镜像源
+        K8S_MIRRORS=(
+            "https://dl.k8s.io"
+            "https://storage.googleapis.com/kubernetes-release"
+            "https://mirror.ghproxy.com/https://storage.googleapis.com/kubernetes-release"
+        )
         
-        # 下载Docker二进制文件
+        # 软件版本
         DOCKER_VERSION="24.0.7"
-        echo "下载Docker二进制文件 v$DOCKER_VERSION..."
+        CONTAINERD_VERSION="1.7.8"
+        RUNC_VERSION="1.1.9"
+        K8S_VERSION="v1.28.2"
         
-        # 创建临时目录
-        mkdir -p /tmp/docker-install
-        cd /tmp/docker-install
-        
-        # 下载Docker二进制包
-        if download_with_progress "https://download.docker.com/linux/static/stable/x86_64/docker-$DOCKER_VERSION.tgz" "docker.tgz" "Docker v$DOCKER_VERSION"; then
-            echo "Docker二进制文件下载成功"
+        # 下载函数
+        download_with_progress() {
+            local url="$1"
+            local output="$2"
+            local description="$3"
+            local max_retries=3
+            local retry_count=0
             
-            # 解压并安装
+            echo "正在下载: $description"
+            echo "URL: $url"
+            
+            while [ $retry_count -lt $max_retries ]; do
+                if [ $retry_count -gt 0 ]; then
+                    echo "重试 ($retry_count/$max_retries)..."
+                    sleep 2
+                fi
+                
+                if command -v curl >/dev/null 2>&1; then
+                    echo "使用curl下载..."
+                    if curl --progress-bar --connect-timeout 30 --max-time 300 -L "$url" -o "$output"; then
+                        echo "✅ $description 下载成功"
+                        return 0
+                    fi
+                fi
+                
+                if command -v wget >/dev/null 2>&1; then
+                    echo "使用wget下载..."
+                    if wget --progress=bar:force --timeout=30 --tries=3 "$url" -O "$output"; then
+                        echo "✅ $description 下载成功"
+                        return 0
+                    fi
+                fi
+                
+                ((retry_count++))
+                echo "❌ 下载失败，准备重试..."
+            done
+            
+            echo "❌ $description 下载失败，已重试 $max_retries 次"
+            return 1
+        }
+        
+        # GitHub文件下载函数
+        download_github_file() {
+            local github_path="$1"
+            local output="$2"
+            local description="$3"
+            
+            echo "正在下载: $description"
+            
+            for mirror in "${GITHUB_MIRRORS[@]}"; do
+                local full_url="${mirror}${github_path}"
+                echo "尝试镜像源: $mirror"
+                
+                if download_with_progress "$full_url" "$output" "$description"; then
+                    return 0
+                fi
+                
+                echo "当前镜像源失败，尝试下一个..."
+                rm -f "$output" 2>/dev/null || true
+            done
+            
+            echo "❌ 所有GitHub镜像源都失败了"
+            return 1
+        }
+        
+        # 软件下载函数
+        download_software() {
+            local software_name="$1"
+            local version="$2"
+            local github_repo="$3"
+            local filename="$4"
+            local output="$5"
+            
+            local github_path="/${github_repo}/releases/download/${version}/${filename}"
+            download_github_file "$github_path" "$output" "${software_name} ${version}"
+        }
+        
+        # K8S二进制文件下载函数
+        download_k8s_binary() {
+            local binary_name="$1"
+            local version="$2"
+            
+            echo "正在下载: ${binary_name} ${version}"
+            
+            for mirror in "${K8S_MIRRORS[@]}"; do
+                local full_url="${mirror}/release/${version}/bin/linux/amd64/${binary_name}"
+                echo "尝试镜像源: $mirror"
+                
+                if download_with_progress "$full_url" "$binary_name" "${binary_name} ${version}"; then
+                    chmod +x "$binary_name"
+                    mv "$binary_name" /usr/local/bin/
+                    echo "✅ ${binary_name} 安装成功"
+                    return 0
+                fi
+                
+                echo "当前镜像源失败，尝试下一个..."
+                rm -f "$binary_name" 2>/dev/null || true
+            done
+            
+            echo "❌ 所有K8S镜像源都失败了"
+            return 1
+        }
+        
+        # 安装Docker和containerd
+        echo "开始安装Docker和containerd..."
+        temp_dir="/tmp/docker-install"
+        mkdir -p "$temp_dir"
+        cd "$temp_dir"
+        
+        # 下载并安装Docker
+        if download_software "Docker" "v$DOCKER_VERSION" "docker/docker" "docker-$DOCKER_VERSION.tgz" "docker.tgz"; then
+            echo "Docker二进制文件下载成功"
             tar -xzf docker.tgz
             cp docker/* /usr/local/bin/
             chmod +x /usr/local/bin/docker*
-            
-            # 创建docker用户组
             groupadd docker 2>/dev/null || true
-            
-            # 创建Docker服务文件
-            cat > /etc/systemd/system/docker.service << 'EOF'
+            echo "Docker安装完成"
+        else
+            echo "Docker下载失败"
+            exit 1
+        fi
+        
+        # 下载并安装containerd
+        if download_software "containerd" "v$CONTAINERD_VERSION" "containerd/containerd" "containerd-$CONTAINERD_VERSION-linux-amd64.tar.gz" "containerd.tar.gz"; then
+            echo "containerd下载成功"
+            tar -xzf containerd.tar.gz -C /usr/local/
+            echo "containerd安装完成"
+        else
+            echo "containerd下载失败"
+            exit 1
+        fi
+        
+        # 下载并安装runc
+        if download_software "runc" "v$RUNC_VERSION" "opencontainers/runc" "runc.amd64" "runc"; then
+            echo "runc下载成功"
+            chmod +x runc
+            mv runc /usr/local/bin/
+            echo "runc安装完成"
+        else
+            echo "runc下载失败，使用系统包"
+            apt-get install -y runc || true
+        fi
+        
+        cd /
+        rm -rf "$temp_dir"
+        
+        # 创建Docker服务文件
+        cat > /etc/systemd/system/docker.service << '"'"'EOF'"'"'
 [Unit]
 Description=Docker Application Container Engine
 Documentation=https://docs.docker.com
@@ -797,9 +1261,8 @@ OOMScoreAdjust=-500
 [Install]
 WantedBy=multi-user.target
 EOF
-            
-            # 创建docker.socket文件
-            cat > /etc/systemd/system/docker.socket << 'EOF'
+
+        cat > /etc/systemd/system/docker.socket << '"'"'EOF'"'"'
 [Unit]
 Description=Docker Socket for the API
 
@@ -812,28 +1275,8 @@ SocketGroup=docker
 [Install]
 WantedBy=sockets.target
 EOF
-            
-            echo "Docker服务文件创建完成"
-            
-        else
-            echo "Docker二进制文件下载失败，尝试系统默认包"
-            apt-get update -y
-            if ! apt-get install -y docker.io; then
-                echo "Docker安装失败"
-                exit 1
-            fi
-        fi
-        
-        # 安装containerd
-        echo "安装containerd..."
-        CONTAINERD_VERSION="1.7.8"
-        
-        if download_with_progress "https://github.com/containerd/containerd/releases/download/v$CONTAINERD_VERSION/containerd-$CONTAINERD_VERSION-linux-amd64.tar.gz" "containerd.tar.gz" "containerd v$CONTAINERD_VERSION"; then
-            echo "containerd下载成功"
-            tar -xzf containerd.tar.gz -C /usr/local/
-            
-            # 创建containerd服务文件
-            cat > /etc/systemd/system/containerd.service << 'EOF'
+
+        cat > /etc/systemd/system/containerd.service << '"'"'EOF'"'"'
 [Unit]
 Description=containerd container runtime
 Documentation=https://containerd.io
@@ -856,19 +1299,16 @@ OOMScoreAdjust=-999
 [Install]
 WantedBy=multi-user.target
 EOF
-            
-        else
-            echo "containerd下载失败，尝试系统默认包"
-            apt-get install -y containerd || true
-        fi
         
-        # 清理临时文件
-        cd /
-        rm -rf /tmp/docker-install
+        # 创建containerd配置
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
+        sed -i "s|registry.k8s.io/pause:3.6|registry.aliyuncs.com/google_containers/pause:3.6|g" /etc/containerd/config.toml
         
         # 配置Docker镜像加速
         mkdir -p /etc/docker
-        cat > /etc/docker/daemon.json << "EOF"
+        cat > /etc/docker/daemon.json << '"'"'EOF'"'"'
 {
   "exec-opts": ["native.cgroupdriver=systemd"],
   "log-driver": "json-file",
@@ -882,63 +1322,35 @@ EOF
 }
 EOF
         
-        # 配置containerd
-        mkdir -p /etc/containerd
-        containerd config default > /etc/containerd/config.toml
-        sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
-        sed -i "s|registry.k8s.io/pause:3.6|registry.aliyuncs.com/google_containers/pause:3.6|g" /etc/containerd/config.toml
-        
-        # 启动Docker服务
+        # 启动服务
         systemctl daemon-reload
         systemctl enable docker containerd
         systemctl restart docker containerd
         
-        # 验证Docker安装
-        if ! docker --version; then
-            echo "Docker启动失败"
-            exit 1
-        fi
-        
-        # 直接从GitHub安装K8S（避免GPG密钥问题）
-        echo "从GitHub安装K8S..."
-        
-        K8S_VERSION="v1.28.2"
-        echo "下载K8S二进制文件 $K8S_VERSION..."
-        
-        # 创建临时目录
-        mkdir -p /tmp/k8s-install
-        cd /tmp/k8s-install
-        
-        K8S_INSTALL_SUCCESS=false
-        
-        # 下载kubectl
-        if download_with_progress "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubectl" "kubectl" "kubectl $K8S_VERSION"; then
-            chmod +x kubectl
-            mv kubectl /usr/local/bin/
-            echo "kubectl下载安装成功"
+        # 验证安装
+        if docker --version && containerd --version; then
+            echo "✅ Docker和containerd安装成功"
         else
-            echo "kubectl下载失败"
+            echo "❌ Docker或containerd启动失败"
             exit 1
         fi
         
-        # 下载kubeadm
-        if download_with_progress "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubeadm" "kubeadm" "kubeadm $K8S_VERSION"; then
-            chmod +x kubeadm
-            mv kubeadm /usr/local/bin/
-            echo "kubeadm下载安装成功"
-        else
-            echo "kubeadm下载失败"
-            exit 1
-        fi
+        # 安装K8S组件
+        echo "开始安装K8S组件..."
+        temp_dir="/tmp/k8s-install"
+        mkdir -p "$temp_dir"
+        cd "$temp_dir"
         
-        # 下载kubelet
-        if download_with_progress "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubelet" "kubelet" "kubelet $K8S_VERSION"; then
-            chmod +x kubelet
-            mv kubelet /usr/local/bin/
-            echo "kubelet下载安装成功"
-            
-            # 创建kubelet服务文件
-            cat > /etc/systemd/system/kubelet.service << 'EOF'
+        # 下载K8S组件
+        download_k8s_binary "kubectl" "$K8S_VERSION" || exit 1
+        download_k8s_binary "kubeadm" "$K8S_VERSION" || exit 1
+        download_k8s_binary "kubelet" "$K8S_VERSION" || exit 1
+        
+        cd /
+        rm -rf "$temp_dir"
+        
+        # 创建kubelet服务文件
+        cat > /etc/systemd/system/kubelet.service << '"'"'EOF'"'"'
 [Unit]
 Description=kubelet: The Kubernetes Node Agent
 Documentation=https://kubernetes.io/docs/home/
@@ -954,10 +1366,9 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
-            
-            # 创建kubelet配置目录
-            mkdir -p /etc/systemd/system/kubelet.service.d
-            cat > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf << 'EOF'
+
+        mkdir -p /etc/systemd/system/kubelet.service.d
+        cat > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf << '"'"'EOF'"'"'
 [Service]
 Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
 Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
@@ -966,27 +1377,11 @@ EnvironmentFile=-/etc/default/kubelet
 ExecStart=
 ExecStart=/usr/local/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
 EOF
-            
-            systemctl daemon-reload
-            systemctl enable kubelet
-            
-            K8S_INSTALL_SUCCESS=true
-            echo "K8S二进制文件安装成功"
-            
-        else
-            echo "kubelet下载失败"
-            exit 1
-        fi
         
-        # 清理临时文件
-        cd /
-        rm -rf /tmp/k8s-install
+        systemctl daemon-reload
+        systemctl enable kubelet
         
-        # 验证安装
-        if [ "$K8S_INSTALL_SUCCESS" = false ]; then
-            echo "K8S安装失败"
-            exit 1
-        fi
+        echo "✅ K8S组件安装成功"
         
         apt-mark hold kubelet kubeadm kubectl
         systemctl enable kubelet
