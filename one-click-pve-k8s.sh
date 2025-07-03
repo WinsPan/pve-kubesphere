@@ -942,11 +942,24 @@ init_k8s_master() {
         fi
         
         echo '下载Calico配置文件...'
-        # 下载并修改Calico配置
+        # 下载并修改Calico配置，使用多个备用方案
         if ! wget -O calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml; then
             if ! curl -o calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml; then
-                echo 'Calico下载失败，使用备用方案'
-                kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml || exit 1
+                echo 'GitHub下载失败，尝试国内镜像源...'
+                # 尝试使用国内镜像源
+                if ! wget -O calico.yaml https://gitee.com/mirrors/calico/raw/v3.26.1/manifests/calico.yaml; then
+                    echo 'Gitee镜像源失败，使用官方备用方案...'
+                    # 使用官方备用地址
+                    if ! kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml; then
+                        echo 'Calico网络插件安装失败，使用Flannel作为备用...'
+                        # 使用Flannel作为最后的备用方案
+                        kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml || \
+                        kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml || \
+                        exit 1
+                    fi
+                else
+                    kubectl apply -f calico.yaml || exit 1
+                fi
             else
                 kubectl apply -f calico.yaml || exit 1
             fi
@@ -1104,9 +1117,26 @@ deploy_kubesphere() {
     log "部署KubeSphere..."
     
     local deploy_script='
-        # 下载配置文件
-        wget -O kubesphere-installer.yaml https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml
-        wget -O cluster-configuration.yaml https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml
+        # 下载配置文件，使用多个备用方案
+        echo "下载KubeSphere配置文件..."
+        
+        # 尝试GitHub官方源
+        if ! wget -O kubesphere-installer.yaml https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml; then
+            echo "GitHub下载失败，尝试国内镜像源..."
+            # 尝试使用国内镜像源
+            if ! wget -O kubesphere-installer.yaml https://gitee.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml; then
+                echo "Gitee下载失败，使用curl重试..."
+                curl -L -o kubesphere-installer.yaml https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/kubesphere-installer.yaml || exit 1
+            fi
+        fi
+        
+        if ! wget -O cluster-configuration.yaml https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml; then
+            echo "GitHub下载失败，尝试国内镜像源..."
+            if ! wget -O cluster-configuration.yaml https://gitee.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml; then
+                echo "Gitee下载失败，使用curl重试..."
+                curl -L -o cluster-configuration.yaml https://github.com/kubesphere/ks-installer/releases/download/v3.4.1/cluster-configuration.yaml || exit 1
+            fi
+        fi
         
         # 部署KubeSphere
         kubectl apply -f kubesphere-installer.yaml
@@ -1234,7 +1264,56 @@ fix_network_connectivity() {
             ping -c 2 baidu.com || echo "外网连接失败"
             
             # 测试镜像源
-            curl -I https://mirrors.ustc.edu.cn/debian/ || echo "镜像源连接失败"
+            # 测试多个镜像源的连通性
+    echo "=== 镜像源连通性测试 ==="
+    
+    # 测试Debian镜像源
+    echo -n "中科大Debian镜像源: "
+    if curl -I --connect-timeout 10 --max-time 30 https://mirrors.ustc.edu.cn/debian/ &>/dev/null; then
+        echo "✅ 可用"
+    else
+        echo "❌ 不可用"
+    fi
+    
+    # 测试Docker镜像源
+    echo -n "阿里云Docker镜像源: "
+    if curl -I --connect-timeout 10 --max-time 30 https://mirrors.aliyun.com/docker-ce/linux/debian/ &>/dev/null; then
+        echo "✅ 可用"
+    else
+        echo "❌ 不可用"
+    fi
+    
+    # 测试K8S镜像源
+    echo -n "阿里云K8S镜像源: "
+    if curl -I --connect-timeout 10 --max-time 30 https://mirrors.aliyun.com/kubernetes/apt/ &>/dev/null; then
+        echo "✅ 可用"
+    else
+        echo "❌ 不可用"
+    fi
+    
+    # 测试容器镜像仓库
+    echo -n "阿里云容器镜像仓库: "
+    if curl -I --connect-timeout 10 --max-time 30 https://registry.aliyuncs.com/v2/ &>/dev/null; then
+        echo "✅ 可用"
+    else
+        echo "❌ 不可用"
+    fi
+    
+    # 测试GitHub
+    echo -n "GitHub连接测试: "
+    if curl -I --connect-timeout 10 --max-time 30 https://github.com/ &>/dev/null; then
+        echo "✅ 可用"
+    else
+        echo "❌ 不可用"
+    fi
+    
+    # 测试Gitee备用源
+    echo -n "Gitee备用源: "
+    if curl -I --connect-timeout 10 --max-time 30 https://gitee.com/ &>/dev/null; then
+        echo "✅ 可用"
+    else
+        echo "❌ 不可用"
+    fi
         '
         
         execute_remote_command "$ip" "$network_fix_script"
@@ -1725,7 +1804,14 @@ install_metrics_server() {
     
     local install_script='
         echo "下载metrics-server配置..."
-        wget -O metrics-server.yaml https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+        # 下载metrics-server配置文件，使用多个备用方案
+        if ! wget -O metrics-server.yaml https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml; then
+            echo "GitHub下载失败，尝试国内镜像源..."
+            if ! wget -O metrics-server.yaml https://gitee.com/mirrors/metrics-server/raw/master/deploy/kubernetes/metrics-server-deployment.yaml; then
+                echo "Gitee下载失败，使用curl重试..."
+                curl -L -o metrics-server.yaml https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml || exit 1
+            fi
+        fi
         
         # 修改配置以支持不安全的TLS
         sed -i "/- --cert-dir=\/tmp/a\        - --kubelet-insecure-tls" metrics-server.yaml
@@ -1909,7 +1995,14 @@ install_helm() {
     
     local install_script='
         echo "下载并安装Helm..."
-        curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        # 下载Helm安装脚本，使用多个备用方案
+        if ! curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3; then
+            echo "GitHub下载失败，尝试国内镜像源..."
+            if ! curl -fsSL -o get_helm.sh https://gitee.com/mirrors/helm/raw/main/scripts/get-helm-3; then
+                echo "Gitee下载失败，使用wget重试..."
+                wget -O get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 || exit 1
+            fi
+        fi
         chmod 700 get_helm.sh
         ./get_helm.sh
         
