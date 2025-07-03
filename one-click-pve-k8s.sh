@@ -3972,7 +3972,16 @@ cleanup_all() {
     
     echo -e "${YELLOW}警告：此操作将删除所有虚拟机和相关配置文件！${NC}"
     echo -e "${YELLOW}这包括：${NC}"
-    echo -e "  - 所有K8S虚拟机 (ID: $(get_all_vm_ids | tr '\n' ' '))"
+    
+    # 安全获取VM ID列表，避免函数调用失败
+    local vm_ids_list=""
+    if vm_ids_list=$(get_all_vm_ids 2>/dev/null); then
+        echo -e "  - 所有K8S虚拟机 (ID: ${vm_ids_list})"
+    else
+        echo -e "  - 所有K8S虚拟机 (ID: 101 102 103)"
+        vm_ids_list="101 102 103"
+    fi
+    
     echo -e "  - 相关的cloud-init配置文件"
     echo -e "  - 所有集群数据和配置"
     echo ""
@@ -3985,15 +3994,30 @@ cleanup_all() {
     
     log "开始清理所有资源..."
     
-    for vm_id in "${!VM_CONFIGS[@]}"; do
-        local vm_name=$(parse_vm_config "$vm_id" "name")
+    # 使用安全的VM ID列表进行清理
+    local vm_ids_array=($vm_ids_list)
+    for vm_id in "${vm_ids_array[@]}"; do
+        local vm_name="k8s-vm-$vm_id"
+        # 尝试获取VM名称，如果失败则使用默认名称
+        if command -v parse_vm_config &>/dev/null; then
+            vm_name=$(parse_vm_config "$vm_id" "name" 2>/dev/null || echo "k8s-vm-$vm_id")
+        fi
+        
         log "删除虚拟机: $vm_name (ID: $vm_id)"
-        qm stop "$vm_id" 2>/dev/null || true
-        sleep 2
-        qm destroy "$vm_id" 2>/dev/null || true
+        if command -v qm &>/dev/null; then
+            qm stop "$vm_id" 2>/dev/null || true
+            sleep 2
+            qm destroy "$vm_id" 2>/dev/null || true
+        else
+            warn "未检测到PVE环境，跳过虚拟机删除操作"
+        fi
     done
     
-    rm -f /var/lib/vz/snippets/user-data-k8s-*.yml
+    # 清理cloud-init配置文件
+    if [[ -d "/var/lib/vz/snippets" ]]; then
+        rm -f /var/lib/vz/snippets/user-data-k8s-*.yml 2>/dev/null || true
+    fi
+    
     success "资源清理完成"
 }
 
@@ -4042,16 +4066,24 @@ show_system_status() {
 
 # 显示集群状态
 show_cluster_status() {
-    local master_ip=$(get_master_ip 2>/dev/null || echo "N/A")
+    local master_ip="N/A"
     local cluster_status="未知"
     local node_count="N/A"
     local pod_count="N/A"
     
-    if [[ "$master_ip" != "N/A" ]] && execute_remote_command "$master_ip" "kubectl get nodes >/dev/null 2>&1"; then
-        cluster_status="运行中"
-        node_count=$(execute_remote_command "$master_ip" "kubectl get nodes --no-headers | wc -l" 2>/dev/null || echo "N/A")
-        pod_count=$(execute_remote_command "$master_ip" "kubectl get pods --all-namespaces --no-headers | wc -l" 2>/dev/null || echo "N/A")
+    # 安全获取master IP
+    if master_ip=$(get_master_ip 2>/dev/null) && [[ -n "$master_ip" ]]; then
+        # 快速检查SSH连接是否可用，减少重试次数
+        if execute_remote_command "$master_ip" "kubectl get nodes >/dev/null 2>&1" 1 2>/dev/null; then
+            cluster_status="运行中"
+            # 获取节点和Pod数量，使用静默模式
+            node_count=$(execute_remote_command "$master_ip" "kubectl get nodes --no-headers 2>/dev/null | wc -l" 1 2>/dev/null || echo "N/A")
+            pod_count=$(execute_remote_command "$master_ip" "kubectl get pods --all-namespaces --no-headers 2>/dev/null | wc -l" 1 2>/dev/null || echo "N/A")
+        else
+            cluster_status="未部署"
+        fi
     else
+        master_ip="N/A"
         cluster_status="未部署"
     fi
     
