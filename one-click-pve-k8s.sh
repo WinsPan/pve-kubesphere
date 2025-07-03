@@ -672,6 +672,9 @@ install_docker_k8s() {
     local install_script='
         set -e
         
+        # 初始化变量
+        skip_docker_repo=false
+        
         # 配置国内镜像源
         echo "配置镜像源..."
         cat > /etc/apt/sources.list << "EOF"
@@ -693,19 +696,53 @@ EOF
         mkdir -p /etc/apt/keyrings
         
         # 下载并安装Docker GPG密钥（新方式）
-        if ! curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/debian/gpg -o /etc/apt/keyrings/docker.gpg; then
-            echo "尝试备用Docker GPG密钥..."
-            curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.gpg
+        echo "下载Docker GPG密钥..."
+        if curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/debian/gpg -o /etc/apt/keyrings/docker.gpg.tmp; then
+            mv /etc/apt/keyrings/docker.gpg.tmp /etc/apt/keyrings/docker.gpg
+        elif curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.gpg.tmp; then
+            echo "使用备用Docker GPG密钥..."
+            mv /etc/apt/keyrings/docker.gpg.tmp /etc/apt/keyrings/docker.gpg
+        else
+            echo "Docker GPG密钥下载失败，跳过Docker仓库"
+            rm -f /etc/apt/keyrings/docker.gpg.tmp
+            # 不添加Docker仓库，使用系统默认docker.io包
+            apt-get update -y
+            if apt-get install -y docker.io containerd; then
+                echo "使用系统默认Docker包安装成功"
+            else
+                echo "Docker安装失败"
+                exit 1
+            fi
+            # 跳过后续Docker仓库配置
+            skip_docker_repo=true
         fi
-        chmod a+r /etc/apt/keyrings/docker.gpg
+        
+        if [ "$skip_docker_repo" != "true" ]; then
+            chmod a+r /etc/apt/keyrings/docker.gpg
+            # 验证GPG密钥文件
+            if [ ! -s /etc/apt/keyrings/docker.gpg ]; then
+                echo "Docker GPG密钥文件为空，使用系统默认包"
+                rm -f /etc/apt/keyrings/docker.gpg
+                apt-get update -y
+                apt-get install -y docker.io containerd
+                skip_docker_repo=true
+            fi
+        fi
         
         # 添加Docker仓库（新格式）
-        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list
-        
-        apt-get update -y
-        if ! apt-get install -y docker-ce docker-ce-cli containerd.io; then
-            echo "Docker安装失败"
-            exit 1
+        if [ "$skip_docker_repo" != "true" ]; then
+            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list
+            
+            apt-get update -y
+            if ! apt-get install -y docker-ce docker-ce-cli containerd.io; then
+                echo "Docker CE安装失败，尝试系统默认包"
+                rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.gpg
+                apt-get update -y
+                if ! apt-get install -y docker.io containerd; then
+                    echo "Docker安装失败"
+                    exit 1
+                fi
+            fi
         fi
         
         # 配置Docker镜像加速
@@ -744,19 +781,47 @@ EOF
         # 安装K8S
         echo "安装K8S..."
         # 下载并安装K8S GPG密钥（新方式）
-        if ! curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg; then
-            echo "尝试备用K8S GPG密钥..."
-            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg
+        echo "下载K8S GPG密钥..."
+        if curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg.tmp; then
+            mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
+        elif curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg.tmp; then
+            echo "使用备用K8S GPG密钥..."
+            mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
+        else
+            echo "K8S GPG密钥下载失败"
+            rm -f /etc/apt/keyrings/kubernetes.gpg.tmp
+            exit 1
         fi
+        
         chmod a+r /etc/apt/keyrings/kubernetes.gpg
+        
+        # 验证GPG密钥文件
+        if [ ! -s /etc/apt/keyrings/kubernetes.gpg ]; then
+            echo "K8S GPG密钥文件为空"
+            exit 1
+        fi
         
         # 添加K8S仓库（新格式）
         echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
         
         apt-get update -y
         if ! apt-get install -y kubelet=1.28.2-00 kubeadm=1.28.2-00 kubectl=1.28.2-00; then
-            echo "K8S安装失败"
-            exit 1
+            echo "K8S安装失败，尝试备用仓库..."
+            rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes.gpg
+            
+            # 尝试使用Google官方仓库
+            if curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes-google.gpg; then
+                chmod a+r /etc/apt/keyrings/kubernetes-google.gpg
+                echo "deb [signed-by=/etc/apt/keyrings/kubernetes-google.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+                apt-get update -y
+                if ! apt-get install -y kubelet=1.28.2-00 kubeadm=1.28.2-00 kubectl=1.28.2-00; then
+                    echo "K8S安装最终失败"
+                    exit 1
+                fi
+            else
+                echo "K8S安装失败"
+                exit 1
+            fi
         fi
         
         apt-mark hold kubelet kubeadm kubectl
@@ -781,7 +846,8 @@ EOF
             apt-get remove --purge -y docker-ce docker-ce-cli containerd.io kubelet kubeadm kubectl 2>/dev/null || true
             apt-get autoremove -y
             rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/kubernetes.list
-            rm -f /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/kubernetes.gpg
+            rm -f /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/kubernetes.gpg /etc/apt/keyrings/kubernetes-google.gpg
+            rm -f /etc/apt/keyrings/docker.gpg.tmp /etc/apt/keyrings/kubernetes.gpg.tmp
             
             echo "重新安装..."
         '
