@@ -795,60 +795,108 @@ EOF
         
         # 安装K8S
         echo "安装K8S..."
-        # 下载并安装K8S GPG密钥（新方式）
+        # 下载并安装K8S GPG密钥（多个备用方案）
         echo "下载K8S GPG密钥..."
+        
+        # 尝试阿里云镜像源
         if curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg.tmp; then
+            echo "使用阿里云镜像源下载K8S GPG密钥..."
             mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
+            K8S_REPO_URL="https://mirrors.aliyun.com/kubernetes/apt/"
         elif wget -O /etc/apt/keyrings/kubernetes.gpg.tmp https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg 2>/dev/null; then
-            echo "使用wget下载K8S GPG密钥..."
+            echo "使用wget下载阿里云K8S GPG密钥..."
             mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
+            K8S_REPO_URL="https://mirrors.aliyun.com/kubernetes/apt/"
+        # 尝试新的K8S官方仓库
+        elif curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key -o /etc/apt/keyrings/kubernetes.gpg.tmp; then
+            echo "使用新的K8S官方仓库下载GPG密钥..."
+            mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
+            K8S_REPO_URL="https://pkgs.k8s.io/core:/stable:/v1.28/deb/"
+        # 尝试旧的官方仓库（可能被墙）
+        elif curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg.tmp; then
+            echo "使用旧的K8S官方仓库下载GPG密钥..."
+            mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
+            K8S_REPO_URL="https://packages.cloud.google.com/apt/"
         else
-            echo "K8S GPG密钥下载失败"
+            echo "所有K8S GPG密钥下载失败，尝试使用系统默认包..."
             rm -f /etc/apt/keyrings/kubernetes.gpg.tmp
-            exit 1
+            # 不使用外部仓库，直接尝试系统默认包
+            K8S_REPO_URL=""
         fi
         
-        chmod a+r /etc/apt/keyrings/kubernetes.gpg
-        
-        # 验证GPG密钥文件
-        if [ ! -s /etc/apt/keyrings/kubernetes.gpg ]; then
-            echo "K8S GPG密钥文件为空"
-            exit 1
+        # 如果成功下载了GPG密钥，配置仓库
+        if [ -n "$K8S_REPO_URL" ] && [ -f /etc/apt/keyrings/kubernetes.gpg ]; then
+            chmod a+r /etc/apt/keyrings/kubernetes.gpg
+            
+            # 验证GPG密钥文件
+            if [ ! -s /etc/apt/keyrings/kubernetes.gpg ]; then
+                echo "K8S GPG密钥文件为空，使用系统默认包..."
+                rm -f /etc/apt/keyrings/kubernetes.gpg
+                K8S_REPO_URL=""
+            else
+                # 添加K8S仓库（根据不同的源使用不同的配置）
+                echo "添加K8S仓库..."
+                if [[ "$K8S_REPO_URL" == *"aliyun"* ]]; then
+                    echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] $K8S_REPO_URL kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+                elif [[ "$K8S_REPO_URL" == *"pkgs.k8s.io"* ]]; then
+                    echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] $K8S_REPO_URL /" > /etc/apt/sources.list.d/kubernetes.list
+                else
+                    echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] $K8S_REPO_URL kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+                fi
+            fi
         fi
-        
-        # 添加K8S仓库（新格式）
-        echo "添加K8S仓库..."
-        echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
         
         echo "更新包列表（包含K8S仓库）..."
-        if ! apt-get update -y; then
-            echo "K8S仓库更新失败"
-            exit 1
+        # 如果配置了外部仓库，更新包列表
+        if [ -n "$K8S_REPO_URL" ]; then
+            if ! apt-get update -y; then
+                echo "K8S仓库更新失败，移除外部仓库..."
+                rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes.gpg
+                K8S_REPO_URL=""
+                # 重新更新包列表
+                apt-get update -y
+            fi
+        else
+            # 没有外部仓库，正常更新
+            apt-get update -y
         fi
         
         echo "安装K8S组件..."
-        if ! apt-get install -y kubelet=1.28.2-00 kubeadm=1.28.2-00 kubectl=1.28.2-00; then
-            echo "K8S安装失败，尝试备用仓库..."
-            rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes.gpg
-            
-            # 尝试使用系统默认包（最稳定的方案）
+        K8S_INSTALL_SUCCESS=false
+        
+        # 尝试安装指定版本的K8S
+        if [ -n "$K8S_REPO_URL" ]; then
+            echo "尝试从外部仓库安装K8S 1.28.2..."
+            if apt-get install -y kubelet=1.28.2-00 kubeadm=1.28.2-00 kubectl=1.28.2-00; then
+                echo "外部仓库K8S安装成功"
+                K8S_INSTALL_SUCCESS=true
+            else
+                echo "外部仓库K8S安装失败，清理并尝试系统默认包..."
+                rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes.gpg
+                apt-get update -y
+            fi
+        fi
+        
+        # 如果外部仓库安装失败，尝试系统默认包
+        if [ "$K8S_INSTALL_SUCCESS" = false ]; then
             echo "尝试安装系统默认K8S包..."
             if apt-get install -y kubeadm kubelet kubectl; then
-                echo "使用系统默认K8S包安装成功"
-                apt-mark hold kubelet kubeadm kubectl
-                systemctl enable kubelet
-                return 0
+                echo "系统默认K8S包安装成功"
+                K8S_INSTALL_SUCCESS=true
             else
-                echo "系统默认K8S包也安装失败"
-                apt-get update -y
-                if ! apt-get install -y kubelet=1.28.2-00 kubeadm=1.28.2-00 kubectl=1.28.2-00; then
-                    echo "K8S安装最终失败"
-                    exit 1
+                echo "系统默认K8S包安装失败，尝试无版本限制安装..."
+                # 最后尝试：不指定版本，安装任何可用版本
+                if apt-get install -y kubelet kubeadm kubectl; then
+                    echo "无版本限制K8S安装成功"
+                    K8S_INSTALL_SUCCESS=true
                 fi
-            else
-                echo "K8S安装失败"
-                exit 1
             fi
+        fi
+        
+        # 检查安装结果
+        if [ "$K8S_INSTALL_SUCCESS" = false ]; then
+            echo "所有K8S安装方案都失败了"
+            exit 1
         fi
         
         apt-mark hold kubelet kubeadm kubectl
@@ -1310,6 +1358,22 @@ fix_network_connectivity() {
     # 测试Gitee备用源
     echo -n "Gitee备用源: "
     if curl -I --connect-timeout 10 --max-time 30 https://gitee.com/ &>/dev/null; then
+        echo "✅ 可用"
+    else
+        echo "❌ 不可用"
+    fi
+    
+    # 测试K8S新官方仓库
+    echo -n "K8S新官方仓库: "
+    if curl -I --connect-timeout 10 --max-time 30 https://pkgs.k8s.io/core:/stable:/v1.28/deb/ &>/dev/null; then
+        echo "✅ 可用"
+    else
+        echo "❌ 不可用"
+    fi
+    
+    # 测试K8S旧官方仓库
+    echo -n "K8S旧官方仓库: "
+    if curl -I --connect-timeout 10 --max-time 30 https://packages.cloud.google.com/apt/ &>/dev/null; then
         echo "✅ 可用"
     else
         echo "❌ 不可用"
@@ -2209,6 +2273,107 @@ cluster_health_check() {
 }
 
 # 自动化运维
+fix_k8s_repository() {
+    log "修复K8S仓库问题..."
+    
+    local all_ips=($(get_all_ips))
+    
+    for ip in "${all_ips[@]}"; do
+        local vm_name=$(get_vm_name_by_ip "$ip")
+        log "修复 $vm_name ($ip) 的K8S仓库..."
+        
+        local fix_script='
+            echo "=== 修复K8S仓库配置 ==="
+            
+            # 清理现有配置
+            echo "清理现有K8S仓库配置..."
+            rm -f /etc/apt/sources.list.d/kubernetes.list
+            rm -f /etc/apt/keyrings/kubernetes.gpg*
+            
+            # 清理旧的apt-key配置
+            apt-key del 7F92E05B31093BEF5A3C2D38FEEA9169307EA071 2>/dev/null || true
+            apt-key del A362B822F6DEDC652817EA46B53DC80D13EDEF05 2>/dev/null || true
+            
+            # 创建keyrings目录
+            mkdir -p /etc/apt/keyrings
+            
+            # 测试多个K8S仓库源
+            echo "测试K8S仓库源..."
+            
+            # 1. 尝试阿里云镜像源
+            echo "尝试阿里云K8S镜像源..."
+            if curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg; then
+                echo "阿里云GPG密钥下载成功"
+                chmod a+r /etc/apt/keyrings/kubernetes.gpg
+                echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+                
+                echo "测试阿里云仓库更新..."
+                if apt-get update -y; then
+                    echo "✅ 阿里云K8S仓库配置成功"
+                    exit 0
+                else
+                    echo "❌ 阿里云K8S仓库更新失败"
+                    rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes.gpg
+                fi
+            fi
+            
+            # 2. 尝试新的K8S官方仓库
+            echo "尝试新的K8S官方仓库..."
+            if curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key -o /etc/apt/keyrings/kubernetes.gpg; then
+                echo "新官方GPG密钥下载成功"
+                chmod a+r /etc/apt/keyrings/kubernetes.gpg
+                echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+                
+                echo "测试新官方仓库更新..."
+                if apt-get update -y; then
+                    echo "✅ 新官方K8S仓库配置成功"
+                    exit 0
+                else
+                    echo "❌ 新官方K8S仓库更新失败"
+                    rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes.gpg
+                fi
+            fi
+            
+            # 3. 尝试旧的K8S官方仓库
+            echo "尝试旧的K8S官方仓库..."
+            if curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg; then
+                echo "旧官方GPG密钥下载成功"
+                chmod a+r /etc/apt/keyrings/kubernetes.gpg
+                echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://packages.cloud.google.com/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+                
+                echo "测试旧官方仓库更新..."
+                if apt-get update -y; then
+                    echo "✅ 旧官方K8S仓库配置成功"
+                    exit 0
+                else
+                    echo "❌ 旧官方K8S仓库更新失败"
+                    rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes.gpg
+                fi
+            fi
+            
+            # 4. 使用系统默认包
+            echo "所有外部仓库都失败，使用系统默认包..."
+            apt-get update -y
+            
+            # 检查系统默认包是否可用
+            if apt-cache search kubelet | grep -q kubelet; then
+                echo "✅ 系统默认K8S包可用"
+            else
+                echo "❌ 系统默认K8S包不可用"
+                exit 1
+            fi
+        '
+        
+        if execute_remote_command "$ip" "$fix_script"; then
+            success "$vm_name K8S仓库修复成功"
+        else
+            error "$vm_name K8S仓库修复失败"
+        fi
+    done
+    
+    success "所有节点K8S仓库修复完成"
+}
+
 automation_ops() {
     log "自动化运维功能..."
     
@@ -2656,6 +2821,7 @@ show_menu() {
     echo -e "  ${CYAN}19.${NC} 备份集群配置"
     echo -e "  ${CYAN}20.${NC} 高级配置选项"
     echo -e "  ${CYAN}22.${NC} 自动化运维"
+    echo -e "  ${CYAN}23.${NC} 修复K8S仓库问题"
     echo ""
     echo -e "${RED}管理功能：${NC}"
     echo -e "  ${CYAN}13.${NC} 强制重建集群"
@@ -2711,6 +2877,7 @@ main() {
             20) advanced_config ;;
             21) cluster_health_check ;;
             22) automation_ops ;;
+        23) fix_k8s_repository ;;
             0) 
                 log "退出脚本"
                 exit 0 
