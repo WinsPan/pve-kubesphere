@@ -125,16 +125,16 @@ readonly CLOUD_IMAGE_PATH="/var/lib/vz/template/qcow/$CLOUD_IMAGE_FILE"
 if [[ "${BASH_VERSION%%.*}" -ge 4 ]]; then
     declare -A VM_CONFIGS=(
         # Master节点
-        ["100"]="k8s-master|10.0.0.10|4|8192|50"
+        ["100"]="k8s-master|10.0.0.10|8|16384|300"
         # Worker节点
-        ["101"]="k8s-worker1|10.0.0.11|4|8192|50"
-        ["102"]="k8s-worker2|10.0.0.12|4|8192|50"
+        ["101"]="k8s-worker1|10.0.0.11|8|16384|300"
+        ["102"]="k8s-worker2|10.0.0.12|8|16384|300"
     )
 else
     # 兼容旧版本bash的虚拟机配置
-    VM_CONFIG_100="k8s-master|10.0.0.10|4|8192|50"
-    VM_CONFIG_101="k8s-worker1|10.0.0.11|4|8192|50"
-    VM_CONFIG_102="k8s-worker2|10.0.0.12|4|8192|50"
+    VM_CONFIG_100="k8s-master|10.0.0.10|8|16384|300"
+    VM_CONFIG_101="k8s-worker1|10.0.0.11|8|16384|300"
+    VM_CONFIG_102="k8s-worker2|10.0.0.12|8|16384|300"
 fi
 
 # 路径配置（自适应权限）
