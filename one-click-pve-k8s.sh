@@ -125,18 +125,16 @@ readonly CLOUD_IMAGE_PATH="/var/lib/vz/template/qcow/$CLOUD_IMAGE_FILE"
 if [[ "${BASH_VERSION%%.*}" -ge 4 ]]; then
     declare -A VM_CONFIGS=(
         # Master节点
-        ["101"]="k8s-master|10.0.0.101|4|8192|50"
+        ["100"]="k8s-master|10.0.0.10|4|8192|50"
         # Worker节点
-        ["102"]="k8s-worker1|10.0.0.102|4|8192|50"
-        ["103"]="k8s-worker2|10.0.0.103|4|8192|50"
-        ["104"]="k8s-worker3|10.0.0.104|4|8192|50"
+        ["101"]="k8s-worker1|10.0.0.11|4|8192|50"
+        ["102"]="k8s-worker2|10.0.0.12|4|8192|50"
     )
 else
     # 兼容旧版本bash的虚拟机配置
-    VM_CONFIG_101="k8s-master|10.0.0.101|4|8192|50"
-    VM_CONFIG_102="k8s-worker1|10.0.0.102|4|8192|50"
-    VM_CONFIG_103="k8s-worker2|10.0.0.103|4|8192|50"
-    VM_CONFIG_104="k8s-worker3|10.0.0.104|4|8192|50"
+    VM_CONFIG_100="k8s-master|10.0.0.10|4|8192|50"
+    VM_CONFIG_101="k8s-worker1|10.0.0.11|4|8192|50"
+    VM_CONFIG_102="k8s-worker2|10.0.0.12|4|8192|50"
 fi
 
 # 路径配置（自适应权限）
@@ -1164,7 +1162,7 @@ get_all_vm_ids() {
         vm_ids=("${!VM_CONFIGS[@]}")
     else
         # bash 3.x 使用固定的VM ID列表
-        local all_vm_ids=(101 102 103 104)
+        local all_vm_ids=(100 101 102)
         for vm_id in "${all_vm_ids[@]}"; do
             local var_name="VM_CONFIG_$vm_id"
             if [[ -n "${!var_name}" ]]; then
@@ -1190,7 +1188,7 @@ get_all_ips() {
 
 # 获取master IP
 get_master_ip() {
-    parse_vm_config "101" "ip"
+    parse_vm_config "100" "ip"
 }
 
 # 根据IP获取VM名称
@@ -2246,7 +2244,7 @@ join_workers() {
     
     # 加入worker节点
     for vm_id in "${!VM_CONFIGS[@]}"; do
-        if [[ "$vm_id" != "101" ]]; then  # 跳过master节点
+        if [[ "$vm_id" != "100" ]]; then  # 跳过master节点
             local worker_ip=$(parse_vm_config "$vm_id" "ip")
             local worker_name=$(parse_vm_config "$vm_id" "name")
             
@@ -2451,7 +2449,7 @@ fix_k8s_cluster() {
     # 检查worker节点
     log "检查worker节点状态..."
     for vm_id in "${!VM_CONFIGS[@]}"; do
-        if [[ "$vm_id" != "101" ]]; then
+        if [[ "$vm_id" != "100" ]]; then
             local worker_ip=$(parse_vm_config "$vm_id" "ip")
             local worker_name=$(parse_vm_config "$vm_id" "name")
             
