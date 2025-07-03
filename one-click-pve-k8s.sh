@@ -1450,8 +1450,13 @@ fix_all_ssh_configs() {
     log "批量修复SSH配置..."
     local all_ips=($(get_all_ips))
     
+    if [[ ${#all_ips[@]} -eq 0 ]]; then
+        warn "未获取到任何IP地址，无法执行SSH配置修复"
+        return 1
+    fi
+    
     for ip in "${all_ips[@]}"; do
-        fix_ssh_config "$ip"
+        fix_ssh_config "$ip" || warn "$ip SSH配置修复失败，但继续执行"
     done
     
     success "所有SSH配置修复完成"
@@ -2404,9 +2409,20 @@ fix_docker_k8s() {
     log "修复Docker和K8S安装..."
     
     local all_ips=($(get_all_ips))
+    if [[ ${#all_ips[@]} -eq 0 ]]; then
+        warn "未获取到任何IP地址，无法执行修复操作"
+        return 1
+    fi
+    
     for ip in "${all_ips[@]}"; do
         local vm_name=$(get_vm_name_by_ip "$ip")
         log "修复 $vm_name ($ip) 的Docker和K8S..."
+        
+        # 检查SSH连接
+        if ! test_ssh_connection "$ip"; then
+            warn "$vm_name ($ip) SSH连接失败，跳过修复"
+            continue
+        fi
         
         # 检查当前状态
         local status_script='
@@ -2417,12 +2433,12 @@ fix_docker_k8s() {
             echo "kubectl版本: $(kubectl version --client 2>/dev/null || echo "未安装")"
         '
         
-        execute_remote_command "$ip" "$status_script"
+        execute_remote_command "$ip" "$status_script" || warn "$vm_name 状态检查失败，但继续执行"
         
         # 强制重新安装
         if ! verify_docker_k8s_installation "$ip"; then
             warn "$vm_name Docker/K8S验证失败，重新安装..."
-            install_docker_k8s "$ip"
+            install_docker_k8s "$ip" || warn "$vm_name Docker/K8S安装失败，但继续执行"
         else
             success "$vm_name Docker/K8S验证成功"
         fi
@@ -2434,13 +2450,19 @@ fix_k8s_cluster() {
     
     local master_ip=$(get_master_ip)
     
+    # 检查master节点SSH连接
+    if ! test_ssh_connection "$master_ip"; then
+        error "Master节点 ($master_ip) SSH连接失败，无法修复集群"
+        return 1
+    fi
+    
     # 检查master节点状态
     log "检查master节点状态..."
     local master_status=$(execute_remote_command "$master_ip" "kubectl get nodes 2>/dev/null || echo 'CLUSTER_NOT_READY'" 1)
     
     if [[ "$master_status" == "CLUSTER_NOT_READY" ]]; then
         warn "K8S集群未就绪，重新初始化master节点..."
-        init_k8s_master
+        init_k8s_master || warn "Master节点初始化失败，但继续执行"
     else
         log "Master节点状态正常"
         echo "$master_status"
@@ -2448,10 +2470,17 @@ fix_k8s_cluster() {
     
     # 检查worker节点
     log "检查worker节点状态..."
-    for vm_id in "${!VM_CONFIGS[@]}"; do
+    local vm_ids=($(get_all_vm_ids))
+    for vm_id in "${vm_ids[@]}"; do
         if [[ "$vm_id" != "101" ]]; then
             local worker_ip=$(parse_vm_config "$vm_id" "ip")
             local worker_name=$(parse_vm_config "$vm_id" "name")
+            
+            # 检查SSH连接
+            if ! test_ssh_connection "$worker_ip"; then
+                warn "Worker节点 $worker_name ($worker_ip) SSH连接失败，跳过检查"
+                continue
+            fi
             
             # 检查节点是否在集群中
             local node_in_cluster=$(execute_remote_command "$master_ip" "kubectl get nodes | grep $worker_name || echo 'NOT_FOUND'" 1)
@@ -2489,9 +2518,20 @@ fix_network_connectivity() {
     log "修复网络连接问题..."
     
     local all_ips=($(get_all_ips))
+    if [[ ${#all_ips[@]} -eq 0 ]]; then
+        warn "未获取到任何IP地址，无法执行网络修复操作"
+        return 1
+    fi
+    
     for ip in "${all_ips[@]}"; do
         local vm_name=$(get_vm_name_by_ip "$ip")
         log "修复 $vm_name ($ip) 的网络连接..."
+        
+        # 检查SSH连接
+        if ! test_ssh_connection "$ip"; then
+            warn "$vm_name ($ip) SSH连接失败，跳过网络修复"
+            continue
+        fi
         
         local network_fix_script='
             echo "修复网络连接..."
@@ -2578,7 +2618,7 @@ fix_network_connectivity() {
     fi
         '
         
-        execute_remote_command "$ip" "$network_fix_script"
+        execute_remote_command "$ip" "$network_fix_script" || warn "$vm_name 网络修复失败，但继续执行"
     done
 }
 
@@ -2589,19 +2629,24 @@ diagnose_system() {
     local issues_found=0
     local all_ips=($(get_all_ips))
     
-    # 检查虚拟机状态
-    log "检查虚拟机状态..."
-    for vm_id in "${!VM_CONFIGS[@]}"; do
-        local vm_name=$(parse_vm_config "$vm_id" "name")
-        local vm_status=$(qm status "$vm_id" 2>/dev/null | grep -o "status: [^,]*" | cut -d' ' -f2)
-        
-        if [[ "$vm_status" != "running" ]]; then
-            warn "虚拟机 $vm_name (ID: $vm_id) 状态异常: $vm_status"
-            ((issues_found++))
-        else
-            log "虚拟机 $vm_name (ID: $vm_id) 状态正常"
-        fi
-    done
+    # 检查虚拟机状态（仅在PVE环境下）
+    if command -v qm &>/dev/null; then
+        log "检查虚拟机状态..."
+        local vm_ids=($(get_all_vm_ids))
+        for vm_id in "${vm_ids[@]}"; do
+            local vm_name=$(parse_vm_config "$vm_id" "name")
+            local vm_status=$(qm status "$vm_id" 2>/dev/null | grep -o "status: [^,]*" | cut -d' ' -f2)
+            
+            if [[ "$vm_status" != "running" ]]; then
+                warn "虚拟机 $vm_name (ID: $vm_id) 状态异常: $vm_status"
+                ((issues_found++))
+            else
+                log "虚拟机 $vm_name (ID: $vm_id) 状态正常"
+            fi
+        done
+    else
+        log "非PVE环境，跳过虚拟机状态检查"
+    fi
     
     # 检查SSH连接
     log "检查SSH连接..."
