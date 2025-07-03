@@ -1134,6 +1134,374 @@ fix_network_connectivity() {
     done
 }
 
+# 自动诊断系统问题
+diagnose_system() {
+    log "开始系统诊断..."
+    
+    local issues_found=0
+    local all_ips=($(get_all_ips))
+    
+    # 检查虚拟机状态
+    log "检查虚拟机状态..."
+    for vm_id in "${!VM_CONFIGS[@]}"; do
+        local vm_name=$(parse_vm_config "$vm_id" "name")
+        local vm_status=$(qm status "$vm_id" 2>/dev/null | grep -o "status: [^,]*" | cut -d' ' -f2)
+        
+        if [[ "$vm_status" != "running" ]]; then
+            warn "虚拟机 $vm_name (ID: $vm_id) 状态异常: $vm_status"
+            ((issues_found++))
+        else
+            log "虚拟机 $vm_name (ID: $vm_id) 状态正常"
+        fi
+    done
+    
+    # 检查SSH连接
+    log "检查SSH连接..."
+    for ip in "${all_ips[@]}"; do
+        local vm_name=$(get_vm_name_by_ip "$ip")
+        if ! test_ssh_connection "$ip"; then
+            warn "SSH连接失败: $vm_name ($ip)"
+            ((issues_found++))
+        else
+            log "SSH连接正常: $vm_name ($ip)"
+        fi
+    done
+    
+    # 检查Docker和K8S安装
+    log "检查Docker和K8S安装..."
+    for ip in "${all_ips[@]}"; do
+        local vm_name=$(get_vm_name_by_ip "$ip")
+        if ! verify_docker_k8s_installation "$ip"; then
+            warn "Docker/K8S安装异常: $vm_name ($ip)"
+            ((issues_found++))
+        else
+            log "Docker/K8S安装正常: $vm_name ($ip)"
+        fi
+    done
+    
+    # 检查K8S集群状态
+    log "检查K8S集群状态..."
+    local master_ip=$(get_master_ip)
+    local cluster_status=$(execute_remote_command "$master_ip" "kubectl get nodes 2>/dev/null || echo 'CLUSTER_NOT_READY'" 1)
+    
+    if [[ "$cluster_status" == "CLUSTER_NOT_READY" ]]; then
+        warn "K8S集群未就绪"
+        ((issues_found++))
+    else
+        log "K8S集群状态:"
+        echo "$cluster_status"
+        
+        # 检查节点状态
+        local not_ready_nodes=$(echo "$cluster_status" | grep -c "NotReady" || echo "0")
+        if [[ "$not_ready_nodes" -gt 0 ]]; then
+            warn "发现 $not_ready_nodes 个NotReady节点"
+            ((issues_found++))
+        fi
+    fi
+    
+    # 诊断结果
+    if [[ $issues_found -eq 0 ]]; then
+        success "系统诊断完成，未发现问题"
+    else
+        warn "系统诊断完成，发现 $issues_found 个问题"
+        echo ""
+        echo -e "${YELLOW}建议的修复步骤：${NC}"
+        echo -e "  ${CYAN}1.${NC} 运行菜单选项 6 - 修复Docker和K8S安装"
+        echo -e "  ${CYAN}2.${NC} 运行菜单选项 7 - 修复K8S集群"
+        echo -e "  ${CYAN}3.${NC} 运行菜单选项 8 - 修复网络连接"
+        echo -e "  ${CYAN}4.${NC} 运行菜单选项 9 - 修复SSH配置"
+        echo -e "  ${CYAN}5.${NC} 或者运行菜单选项 12 - 一键修复所有问题"
+    fi
+    
+    return $issues_found
+}
+
+# 一键修复所有问题
+fix_all_issues() {
+    log "开始一键修复所有问题..."
+    
+    # 先诊断问题
+    if ! diagnose_system; then
+        log "发现问题，开始修复..."
+        
+        # 修复网络连接
+        log "第1步：修复网络连接..."
+        fix_network_connectivity
+        
+        # 修复SSH配置
+        log "第2步：修复SSH配置..."
+        fix_all_ssh_configs
+        
+        # 修复Docker和K8S安装
+        log "第3步：修复Docker和K8S安装..."
+        fix_docker_k8s
+        
+        # 修复K8S集群
+        log "第4步：修复K8S集群..."
+        fix_k8s_cluster
+        
+        # 再次诊断
+        log "修复完成，重新诊断..."
+        if ! diagnose_system; then
+            warn "部分问题可能仍然存在，请检查诊断结果"
+        else
+            success "所有问题已修复！"
+        fi
+    else
+        success "系统状态正常，无需修复"
+    fi
+}
+
+# 强制重建整个集群
+rebuild_cluster() {
+    log "开始强制重建K8S集群..."
+    
+    read -p "警告：这将删除现有集群并重新创建。确认继续？(y/N): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        log "操作已取消"
+        return 0
+    fi
+    
+    local all_ips=($(get_all_ips))
+    
+    # 清理所有节点
+    log "清理所有节点..."
+    for ip in "${all_ips[@]}"; do
+        local vm_name=$(get_vm_name_by_ip "$ip")
+        log "清理节点 $vm_name ($ip)..."
+        
+        local cleanup_script='
+            # 停止K8S服务
+            systemctl stop kubelet 2>/dev/null || true
+            
+            # 重置kubeadm
+            kubeadm reset -f 2>/dev/null || true
+            
+            # 清理配置文件
+            rm -rf /etc/kubernetes/
+            rm -rf /var/lib/etcd/
+            rm -rf /var/lib/kubelet/
+            rm -rf /etc/cni/
+            rm -rf /opt/cni/
+            rm -rf /var/lib/cni/
+            rm -rf /run/flannel/
+            
+            # 清理iptables规则
+            iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+            
+            # 重启Docker和containerd
+            systemctl restart docker containerd
+            
+            echo "节点清理完成"
+        '
+        
+        execute_remote_command "$ip" "$cleanup_script"
+    done
+    
+    # 重新部署集群
+    log "重新部署K8S集群..."
+    deploy_k8s
+    
+    success "集群重建完成"
+}
+
+# 查看系统日志
+view_logs() {
+    log "查看系统日志..."
+    
+    echo -e "${YELLOW}请选择要查看的日志类型：${NC}"
+    echo -e "  ${CYAN}1.${NC} 查看所有节点的系统日志"
+    echo -e "  ${CYAN}2.${NC} 查看Docker日志"
+    echo -e "  ${CYAN}3.${NC} 查看Kubelet日志"
+    echo -e "  ${CYAN}4.${NC} 查看K8S Pod日志"
+    echo -e "  ${CYAN}5.${NC} 查看Cloud-init日志"
+    echo -e "  ${CYAN}0.${NC} 返回主菜单"
+    
+    read -p "请选择 [0-5]: " log_choice
+    
+    case $log_choice in
+        1)
+            local all_ips=($(get_all_ips))
+            for ip in "${all_ips[@]}"; do
+                local vm_name=$(get_vm_name_by_ip "$ip")
+                echo -e "${CYAN}=== $vm_name ($ip) 系统日志 ===${NC}"
+                execute_remote_command "$ip" "journalctl -n 50 --no-pager" || true
+                echo ""
+            done
+            ;;
+        2)
+            local all_ips=($(get_all_ips))
+            for ip in "${all_ips[@]}"; do
+                local vm_name=$(get_vm_name_by_ip "$ip")
+                echo -e "${CYAN}=== $vm_name ($ip) Docker日志 ===${NC}"
+                execute_remote_command "$ip" "journalctl -u docker -n 20 --no-pager" || true
+                echo ""
+            done
+            ;;
+        3)
+            local all_ips=($(get_all_ips))
+            for ip in "${all_ips[@]}"; do
+                local vm_name=$(get_vm_name_by_ip "$ip")
+                echo -e "${CYAN}=== $vm_name ($ip) Kubelet日志 ===${NC}"
+                execute_remote_command "$ip" "journalctl -u kubelet -n 20 --no-pager" || true
+                echo ""
+            done
+            ;;
+        4)
+            local master_ip=$(get_master_ip)
+            echo -e "${CYAN}=== K8S Pod日志 ===${NC}"
+            execute_remote_command "$master_ip" "kubectl get pods --all-namespaces -o wide" || true
+            echo ""
+            echo -e "${CYAN}=== 问题Pod详情 ===${NC}"
+            execute_remote_command "$master_ip" "kubectl get pods --all-namespaces | grep -E '(Error|CrashLoopBackOff|ImagePullBackOff|Pending)'" || true
+            ;;
+        5)
+            local all_ips=($(get_all_ips))
+            for ip in "${all_ips[@]}"; do
+                local vm_name=$(get_vm_name_by_ip "$ip")
+                echo -e "${CYAN}=== $vm_name ($ip) Cloud-init日志 ===${NC}"
+                execute_remote_command "$ip" "tail -50 /var/log/cloud-init-output.log" || true
+                echo ""
+            done
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            warn "无效选择"
+            ;;
+    esac
+}
+
+# 生成故障报告
+generate_troubleshooting_report() {
+    log "生成故障排查报告..."
+    
+    local report_file="/tmp/k8s-troubleshooting-report-$(date +%Y%m%d-%H%M%S).txt"
+    
+    {
+        echo "K8S集群故障排查报告"
+        echo "生成时间: $(date)"
+        echo "脚本版本: $SCRIPT_VERSION"
+        echo "========================================"
+        echo ""
+        
+        echo "虚拟机配置："
+        for vm_id in "${!VM_CONFIGS[@]}"; do
+            echo "  VM $vm_id: ${VM_CONFIGS[$vm_id]}"
+        done
+        echo ""
+        
+        echo "虚拟机状态："
+        for vm_id in "${!VM_CONFIGS[@]}"; do
+            local vm_name=$(parse_vm_config "$vm_id" "name")
+            local vm_status=$(qm status "$vm_id" 2>/dev/null || echo "ERROR")
+            echo "  $vm_name (ID: $vm_id): $vm_status"
+        done
+        echo ""
+        
+        echo "SSH连接测试："
+        local all_ips=($(get_all_ips))
+        for ip in "${all_ips[@]}"; do
+            local vm_name=$(get_vm_name_by_ip "$ip")
+            if test_ssh_connection "$ip"; then
+                echo "  $vm_name ($ip): SSH连接正常"
+            else
+                echo "  $vm_name ($ip): SSH连接失败"
+            fi
+        done
+        echo ""
+        
+        echo "Docker和K8S安装状态："
+        for ip in "${all_ips[@]}"; do
+            local vm_name=$(get_vm_name_by_ip "$ip")
+            echo "  $vm_name ($ip):"
+            
+            local status_output=$(execute_remote_command "$ip" "
+                echo '    Docker: '$(systemctl is-active docker 2>/dev/null || echo '未安装')
+                echo '    containerd: '$(systemctl is-active containerd 2>/dev/null || echo '未安装')
+                echo '    kubelet: '$(systemctl is-active kubelet 2>/dev/null || echo '未安装')
+                echo '    kubectl: '$(kubectl version --client 2>/dev/null | head -1 || echo '未安装')
+            " 1 2>/dev/null || echo "    无法获取状态信息")
+            
+            echo "$status_output"
+        done
+        echo ""
+        
+        echo "K8S集群状态："
+        local master_ip=$(get_master_ip)
+        local cluster_info=$(execute_remote_command "$master_ip" "kubectl get nodes -o wide 2>/dev/null || echo 'K8S集群未就绪'" 1)
+        echo "$cluster_info"
+        echo ""
+        
+        echo "Pod状态："
+        local pod_info=$(execute_remote_command "$master_ip" "kubectl get pods --all-namespaces 2>/dev/null || echo 'K8S集群未就绪'" 1)
+        echo "$pod_info"
+        echo ""
+        
+        echo "========================================"
+        echo "报告生成完成"
+        
+    } > "$report_file"
+    
+    success "故障排查报告已生成: $report_file"
+    
+    # 显示报告内容
+    echo -e "${YELLOW}报告内容预览：${NC}"
+    head -50 "$report_file"
+    echo ""
+    echo -e "${CYAN}完整报告路径: $report_file${NC}"
+}
+
+# 显示快速修复手册
+show_quick_fix_guide() {
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║                     快速修复手册                             ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${YELLOW}常见问题及解决方法：${NC}"
+    echo ""
+    echo -e "${GREEN}1. 虚拟机无法SSH连接${NC}"
+    echo -e "   - 检查虚拟机是否正在运行"
+    echo -e "   - 运行菜单选项 9 修复SSH配置"
+    echo -e "   - 检查网络配置是否正确"
+    echo ""
+    echo -e "${GREEN}2. Docker/K8S安装失败${NC}"
+    echo -e "   - 运行菜单选项 8 修复网络连接"
+    echo -e "   - 运行菜单选项 6 修复Docker和K8S安装"
+    echo -e "   - 检查镜像源是否可访问"
+    echo ""
+    echo -e "${GREEN}3. K8S集群初始化失败${NC}"
+    echo -e "   - 运行菜单选项 7 修复K8S集群"
+    echo -e "   - 检查master节点的Docker服务状态"
+    echo -e "   - 确认所有节点时间同步"
+    echo ""
+    echo -e "${GREEN}4. Worker节点无法加入集群${NC}"
+    echo -e "   - 检查worker节点的containerd服务状态"
+    echo -e "   - 运行菜单选项 7 修复K8S集群"
+    echo -e "   - 确认网络连通性"
+    echo ""
+    echo -e "${GREEN}5. Pod状态异常${NC}"
+    echo -e "   - 运行菜单选项 15 查看系统日志"
+    echo -e "   - 检查镜像拉取是否正常"
+    echo -e "   - 检查节点资源是否充足"
+    echo ""
+    echo -e "${GREEN}6. 一键解决所有问题${NC}"
+    echo -e "   - 运行菜单选项 10 系统诊断"
+    echo -e "   - 运行菜单选项 12 一键修复所有问题"
+    echo -e "   - 如果问题严重，运行菜单选项 13 强制重建集群"
+    echo ""
+    echo -e "${YELLOW}调试技巧：${NC}"
+    echo -e "   - 使用菜单选项 16 生成详细的故障报告"
+    echo -e "   - 使用菜单选项 15 查看具体的系统日志"
+    echo -e "   - 检查 /var/log/cloud-init-output.log 了解初始化过程"
+    echo ""
+    echo -e "${RED}紧急情况：${NC}"
+    echo -e "   - 如果系统完全无响应，使用菜单选项 14 清理所有资源"
+    echo -e "   - 然后重新运行菜单选项 1 一键全自动部署"
+    echo ""
+}
+
 # ==========================================
 # 状态检查
 # ==========================================
@@ -1202,12 +1570,18 @@ show_menu() {
     echo -e "  ${CYAN}7.${NC} 修复K8S集群"
     echo -e "  ${CYAN}8.${NC} 修复网络连接"
     echo -e "  ${CYAN}9.${NC} 修复SSH配置"
+    echo -e "  ${CYAN}12.${NC} 一键修复所有问题"
     echo ""
-    echo -e "${BLUE}状态检查：${NC}"
-    echo -e "  ${CYAN}10.${NC} 检查集群状态"
+    echo -e "${BLUE}诊断功能：${NC}"
+    echo -e "  ${CYAN}10.${NC} 系统诊断"
+    echo -e "  ${CYAN}11.${NC} 检查集群状态"
+    echo -e "  ${CYAN}15.${NC} 查看系统日志"
+    echo -e "  ${CYAN}16.${NC} 生成故障报告"
+    echo -e "  ${CYAN}17.${NC} 快速修复手册"
     echo ""
     echo -e "${RED}管理功能：${NC}"
-    echo -e "  ${CYAN}11.${NC} 清理所有资源"
+    echo -e "  ${CYAN}13.${NC} 强制重建集群"
+    echo -e "  ${CYAN}14.${NC} 清理所有资源"
     echo -e "  ${CYAN}0.${NC} 退出"
     echo -e "${YELLOW}══════════════════════════════════════${NC}"
 }
@@ -1226,7 +1600,7 @@ main() {
         show_banner
         show_menu
         
-        read -p "请选择操作 [0-11]: " choice
+        read -p "请选择操作 [0-17]: " choice
         
         case $choice in
             1)
@@ -1246,8 +1620,14 @@ main() {
             7) fix_k8s_cluster ;;
             8) fix_network_connectivity ;;
             9) fix_all_ssh_configs ;;
-            10) check_status ;;
-            11) cleanup_all ;;
+            10) diagnose_system ;;
+            11) check_status ;;
+            12) fix_all_issues ;;
+            13) rebuild_cluster ;;
+            14) cleanup_all ;;
+            15) view_logs ;;
+            16) generate_troubleshooting_report ;;
+            17) show_quick_fix_guide ;;
             0) 
                 log "退出脚本"
                 exit 0 
