@@ -6,7 +6,7 @@
 # 重构版本 - 模块化设计，高可靠性
 # ==========================================
 
-set -euo pipefail
+set -uo pipefail
 
 # ==========================================
 # 全局配置
@@ -2320,13 +2320,14 @@ EOF
     
     # 创建监控脚本
     local monitor_script="/usr/local/bin/k8s-monitor.sh"
-    cat > "$monitor_script" << 'EOF'
+    cat > "$monitor_script" << EOF
 #!/bin/bash
 # K8S集群监控脚本
 
 source /etc/k8s-alert-config
 
 LOGFILE="/var/log/k8s-monitor.log"
+CLOUDINIT_PASS="$CLOUDINIT_PASS"
 
 # 日志函数
 log() {
@@ -2348,30 +2349,30 @@ send_alert() {
 
 # 检查资源使用率
 check_resources() {
-    local all_ips=(10.0.0.10 10.0.0.11 10.0.0.12)
+    local all_ips=(\$(get_all_ips))
     
     for ip in "${all_ips[@]}"; do
         # 检查CPU使用率
-        local cpu_usage=$(sshpass -p "123456" ssh -o StrictHostKeyChecking=no root@$ip \
+        local cpu_usage=$(sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no root@$ip \
             "top -bn1 | grep 'Cpu(s)' | sed 's/.*, *\([0-9.]*\)%* id.*/\1/' | awk '{print 100 - \$1}'" 2>/dev/null | cut -d. -f1)
         
-        if [[ "$cpu_usage" -gt "$CPU_THRESHOLD" ]]; then
+        if [[ -n "$cpu_usage" && "$cpu_usage" -gt "$CPU_THRESHOLD" ]]; then
             send_alert "节点 $ip CPU使用率过高: ${cpu_usage}%"
         fi
         
         # 检查内存使用率
-        local mem_usage=$(sshpass -p "123456" ssh -o StrictHostKeyChecking=no root@$ip \
+        local mem_usage=$(sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no root@$ip \
             "free | grep Mem | awk '{printf \"%.0f\", \$3/\$2 * 100}'" 2>/dev/null)
         
-        if [[ "$mem_usage" -gt "$MEM_THRESHOLD" ]]; then
+        if [[ -n "$mem_usage" && "$mem_usage" -gt "$MEM_THRESHOLD" ]]; then
             send_alert "节点 $ip 内存使用率过高: ${mem_usage}%"
         fi
         
         # 检查磁盘使用率
-        local disk_usage=$(sshpass -p "123456" ssh -o StrictHostKeyChecking=no root@$ip \
+        local disk_usage=$(sshpass -p "$CLOUDINIT_PASS" ssh -o StrictHostKeyChecking=no root@$ip \
             "df / | tail -1 | awk '{print \$5}' | sed 's/%//'" 2>/dev/null)
         
-        if [[ "$disk_usage" -gt "$DISK_THRESHOLD" ]]; then
+        if [[ -n "$disk_usage" && "$disk_usage" -gt "$DISK_THRESHOLD" ]]; then
             send_alert "节点 $ip 磁盘使用率过高: ${disk_usage}%"
         fi
     done
