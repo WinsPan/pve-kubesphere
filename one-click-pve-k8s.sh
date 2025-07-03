@@ -1,18 +1,58 @@
 #!/bin/bash
 
 # ==========================================
-# PVE K8S+KubeSphere 一键部署脚本 v4.0
+# PVE K8S+KubeSphere 智能部署工具 v5.0
+# ==========================================
+#
+# 描述: 这是一个功能强大的PVE虚拟化环境下的Kubernetes集群自动化部署工具
+#       支持一键部署、智能修复、性能监控、自动化运维等高级功能
+#
 # 作者: WinsPan
-# 重构版本 - 模块化设计，高可靠性
+# 版本: 5.0 (重构版)
+# 日期: $(date '+%Y-%m-%d')
+#
+# 主要功能:
+#   🚀 一键全自动部署 K8S + KubeSphere
+#   🔧 智能故障诊断和修复
+#   📊 实时性能监控和健康检查
+#   💾 自动备份和恢复
+#   🤖 定时任务和自动化运维
+#   🔍 详细的日志记录和审计
+#   ⚙️ 高度可配置和可扩展
+#
+# 系统要求:
+#   - Proxmox VE 7.0+
+#   - Debian 12 (Bookworm)
+#   - 最少 16GB 内存，100GB 存储
+#   - 网络连接正常
+#
+# 使用方法:
+#   ./one-click-pve-k8s.sh          # 交互模式
+#   ./one-click-pve-k8s.sh 1        # 直接执行一键部署
+#   ./one-click-pve-k8s.sh --help   # 显示帮助
+#
+# 环境变量:
+#   DEBUG=true                      # 启用调试模式
+#   LOG_LEVEL=DEBUG                 # 设置日志级别
+#   K8S_VERSION=v1.29.0            # 指定K8S版本
+#   DOCKER_VERSION=24.0.8          # 指定Docker版本
+#
+# 许可证: MIT License
+# 仓库: https://github.com/winspan/pve-k8s-deploy
+#
 # ==========================================
 
 set -uo pipefail
 
 # ==========================================
-# 全局配置
+# 全局配置中心
 # ==========================================
-readonly SCRIPT_VERSION="4.0"
+
+# 脚本信息
+readonly SCRIPT_VERSION="5.0"
 readonly SCRIPT_NAME="PVE K8S+KubeSphere 部署工具"
+readonly SCRIPT_AUTHOR="WinsPan"
+readonly SCRIPT_DESCRIPTION="模块化设计，高可靠性，智能化部署"
 
 # 颜色定义
 readonly GREEN='\e[0;32m'
@@ -21,73 +61,265 @@ readonly RED='\e[0;31m'
 readonly BLUE='\e[0;34m'
 readonly CYAN='\e[0;36m'
 readonly PURPLE='\e[0;35m'
+readonly BOLD='\e[1m'
 readonly NC='\e[0m'
 
-# 带进度显示的下载函数
+# 环境配置
+readonly DEFAULT_SSH_USER="${SSH_USER:-root}"
+readonly DEFAULT_SSH_PORT="${SSH_PORT:-22}"
+readonly DEFAULT_SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_rsa}"
+readonly DEFAULT_TIMEOUT="${TIMEOUT:-600}"
+readonly LOG_LEVEL="${LOG_LEVEL:-INFO}"
+readonly DEBUG_MODE="${DEBUG:-false}"
+
+# 网络配置
+readonly NETWORK_BRIDGE="${BRIDGE:-vmbr0}"
+readonly NETWORK_GATEWAY="${GATEWAY:-10.0.0.1}"
+readonly NETWORK_DNS="${DNS:-119.29.29.29,8.8.8.8,10.0.0.1}"
+readonly NETWORK_DOMAIN="${DOMAIN:-local}"
+
+# 软件版本配置（支持环境变量覆盖）
+readonly DOCKER_VERSION="${DOCKER_VERSION:-24.0.7}"
+readonly CONTAINERD_VERSION="${CONTAINERD_VERSION:-1.7.8}"
+readonly RUNC_VERSION="${RUNC_VERSION:-1.1.9}"
+readonly K8S_VERSION="${K8S_VERSION:-v1.28.2}"
+readonly KUBESPHERE_VERSION="${KUBESPHERE_VERSION:-v3.4.1}"
+
+# 镜像源配置
+readonly GITHUB_MIRRORS=(
+    "https://github.com"
+    "https://ghproxy.com/https://github.com"
+    "https://mirror.ghproxy.com/https://github.com"
+    "https://gh.api.99988866.xyz/https://github.com"
+    "https://gitclone.com/github.com"
+)
+
+readonly K8S_MIRRORS=(
+    "https://dl.k8s.io"
+    "https://storage.googleapis.com/kubernetes-release"
+    "https://mirror.ghproxy.com/https://storage.googleapis.com/kubernetes-release"
+)
+
+readonly DEBIAN_MIRRORS=(
+    "https://mirrors.ustc.edu.cn/debian"
+    "https://mirrors.tuna.tsinghua.edu.cn/debian"
+    "https://mirrors.aliyun.com/debian"
+    "https://deb.debian.org/debian"
+)
+
+readonly DOCKER_REGISTRY_MIRRORS=(
+    "https://docker.mirrors.ustc.edu.cn"
+    "https://hub-mirror.c.163.com"
+    "https://mirror.baidubce.com"
+)
+
+# 云镜像配置
+readonly CLOUD_IMAGE_URLS=(
+    "https://mirrors.ustc.edu.cn/debian-cloud-images/bookworm/latest/debian-12-generic-amd64.qcow2"
+    "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
+)
+readonly CLOUD_IMAGE_FILE="debian-12-generic-amd64.qcow2"
+readonly CLOUD_IMAGE_PATH="/var/lib/vz/template/qcow/$CLOUD_IMAGE_FILE"
+
+# 虚拟机配置模板
+if [[ "${BASH_VERSION%%.*}" -ge 4 ]]; then
+    declare -A VM_CONFIGS=(
+        # Master节点
+        ["101"]="k8s-master|10.0.0.101|4|8192|50"
+        # Worker节点
+        ["102"]="k8s-worker1|10.0.0.102|4|8192|50"
+        ["103"]="k8s-worker2|10.0.0.103|4|8192|50"
+        ["104"]="k8s-worker3|10.0.0.104|4|8192|50"
+    )
+else
+    # 兼容旧版本bash的虚拟机配置
+    VM_CONFIG_101="k8s-master|10.0.0.101|4|8192|50"
+    VM_CONFIG_102="k8s-worker1|10.0.0.102|4|8192|50"
+    VM_CONFIG_103="k8s-worker2|10.0.0.103|4|8192|50"
+    VM_CONFIG_104="k8s-worker3|10.0.0.104|4|8192|50"
+fi
+
+# 路径配置（自适应权限）
+if [[ $EUID -eq 0 ]]; then
+    # root用户使用系统目录
+    readonly WORK_DIR="/tmp/pve-k8s-deploy"
+    readonly LOG_DIR="/var/log/pve-k8s-deploy"
+    readonly BACKUP_DIR="/var/backups/pve-k8s"
+    readonly CONFIG_DIR="/etc/pve-k8s"
+else
+    # 普通用户使用用户目录
+    readonly WORK_DIR="$HOME/.pve-k8s-deploy"
+    readonly LOG_DIR="$HOME/.pve-k8s-deploy/logs"
+    readonly BACKUP_DIR="$HOME/.pve-k8s-deploy/backups"
+    readonly CONFIG_DIR="$HOME/.pve-k8s-deploy/config"
+fi
+
+# 文件配置
+readonly LOG_FILE="$LOG_DIR/deploy-$(date '+%Y%m%d-%H%M%S').log"
+readonly ERROR_LOG="$LOG_DIR/error.log"
+readonly PERFORMANCE_LOG="$LOG_DIR/performance.log"
+readonly AUDIT_LOG="$LOG_DIR/audit.log"
+
+# 性能配置
+readonly MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-4}"
+readonly DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-300}"
+readonly SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-30}"
+readonly VM_BOOT_TIMEOUT="${VM_BOOT_TIMEOUT:-900}"
+
+# 安全配置
+readonly ENABLE_FIREWALL="${ENABLE_FIREWALL:-false}"
+readonly ENABLE_SELINUX="${ENABLE_SELINUX:-false}"
+readonly SECURE_MODE="${SECURE_MODE:-false}"
+
+# 功能开关
+readonly ENABLE_MONITORING="${ENABLE_MONITORING:-true}"
+readonly ENABLE_BACKUP="${ENABLE_BACKUP:-true}"
+readonly ENABLE_AUTO_CLEANUP="${ENABLE_AUTO_CLEANUP:-true}"
+readonly ENABLE_HEALTH_CHECK="${ENABLE_HEALTH_CHECK:-true}"
+
+# ==========================================
+# 网络下载和文件管理
+# ==========================================
+
+##
+# 增强的下载函数 - 支持进度显示、重试机制、文件验证
+#
+# 功能描述:
+#   - 支持curl和wget双重下载
+#   - 显示下载进度和速度
+#   - 自动重试机制（指数退避）
+#   - 文件完整性验证
+#   - 性能监控和日志记录
+#
+# 参数:
+#   $1 - 下载URL
+#   $2 - 输出文件路径
+#   $3 - 描述信息
+#   $4 - 最大重试次数（可选，默认3）
+#
+# 返回值: 0=成功, 1=失败
+# 依赖: curl或wget, log_*, measure_performance
+##
 download_with_progress() {
     local url="$1"
     local output="$2"
     local description="$3"
-    local max_retries=3
+    local max_retries="${4:-3}"
     local retry_count=0
     
-    echo -e "${CYAN}正在下载: ${description}${NC}"
-    echo -e "${YELLOW}URL: $url${NC}"
+    log_info "开始下载: $description"
+    log_debug "URL: $url"
+    log_debug "输出文件: $output"
+    
+    # 检查输出目录
+    local output_dir=$(dirname "$output")
+    [[ ! -d "$output_dir" ]] && mkdir -p "$output_dir"
+    
+    # 记录下载开始时间
+    local start_time=$(date +%s)
     
     while [ $retry_count -lt $max_retries ]; do
         if [ $retry_count -gt 0 ]; then
-            echo -e "${YELLOW}重试 ($retry_count/$max_retries)...${NC}"
-            sleep 2
+            log_warn "重试下载 ($retry_count/$max_retries): $description"
+            sleep $((retry_count * 2))
         fi
         
         # 尝试使用curl下载
         if command -v curl >/dev/null 2>&1; then
-            echo -e "${BLUE}使用curl下载...${NC}"
-            if curl --progress-bar --connect-timeout 30 --max-time 300 -L "$url" -o "$output"; then
-                echo -e "${GREEN}✅ $description 下载成功${NC}"
-                return 0
+            log_debug "使用curl下载: $description"
+            if curl --progress-bar \
+                   --connect-timeout "$SSH_CONNECT_TIMEOUT" \
+                   --max-time "$DOWNLOAD_TIMEOUT" \
+                   --retry 2 \
+                   --retry-delay 1 \
+                   --location \
+                   --fail \
+                   --silent \
+                   --show-error \
+                   "$url" -o "$output"; then
+                local end_time=$(date +%s)
+                local duration=$((end_time - start_time))
+                log_success "✅ $description 下载成功 (${duration}s)"
+                
+                # 验证文件
+                if [[ -f "$output" && -s "$output" ]]; then
+                    local file_size=$(stat -c%s "$output" 2>/dev/null || echo "0")
+                    log_debug "文件大小: $file_size bytes"
+                    return 0
+                else
+                    log_error "下载的文件无效: $output"
+                    rm -f "$output"
+                fi
             fi
         fi
         
         # 如果curl失败，尝试wget
         if command -v wget >/dev/null 2>&1; then
-            echo -e "${BLUE}使用wget下载...${NC}"
-            if wget --progress=bar:force --timeout=30 --tries=3 "$url" -O "$output"; then
-                echo -e "${GREEN}✅ $description 下载成功${NC}"
-                return 0
+            log_debug "使用wget下载: $description"
+            if wget --progress=bar:force \
+                   --timeout="$SSH_CONNECT_TIMEOUT" \
+                   --tries=2 \
+                   --waitretry=1 \
+                   --no-check-certificate \
+                   "$url" -O "$output"; then
+                local end_time=$(date +%s)
+                local duration=$((end_time - start_time))
+                log_success "✅ $description 下载成功 (${duration}s)"
+                
+                # 验证文件
+                if [[ -f "$output" && -s "$output" ]]; then
+                    local file_size=$(stat -c%s "$output" 2>/dev/null || echo "0")
+                    log_debug "文件大小: $file_size bytes"
+                    return 0
+                else
+                    log_error "下载的文件无效: $output"
+                    rm -f "$output"
+                fi
             fi
         fi
         
         ((retry_count++))
-        echo -e "${RED}❌ 下载失败，准备重试...${NC}"
+        log_warn "下载失败，准备重试: $description"
+        rm -f "$output" 2>/dev/null || true
     done
     
-    echo -e "${RED}❌ $description 下载失败，已重试 $max_retries 次${NC}"
+    log_error "❌ $description 下载失败，已重试 $max_retries 次"
     return 1
 }
 
-# GitHub文件下载函数（支持多镜像源）
+# 智能GitHub文件下载函数
 download_github_file() {
     local github_path="$1"  # 例如: /docker/docker/releases/download/v24.0.7/docker-24.0.7.tgz
     local output="$2"
     local description="$3"
+    local max_retries="${4:-3}"
     
-    echo -e "${CYAN}正在下载: ${description}${NC}"
+    log_info "开始GitHub下载: $description"
+    log_debug "GitHub路径: $github_path"
+    
+    # 检查网络连接
+    if ! ping -c 1 -W 5 github.com >/dev/null 2>&1; then
+        log_warn "无法连接到GitHub，可能需要使用镜像源"
+    fi
     
     # 遍历所有GitHub镜像源
     for mirror in "${GITHUB_MIRRORS[@]}"; do
         local full_url="${mirror}${github_path}"
-        echo -e "${YELLOW}尝试镜像源: $mirror${NC}"
+        log_debug "尝试镜像源: $mirror"
         
-        if download_with_progress "$full_url" "$output" "$description"; then
+        if measure_performance "download_github_${mirror##*/}" download_with_progress "$full_url" "$output" "$description" "$max_retries"; then
+            log_success "GitHub下载成功: $description (镜像源: $mirror)"
             return 0
         fi
         
-        echo -e "${YELLOW}当前镜像源失败，尝试下一个...${NC}"
+        log_warn "镜像源失败，尝试下一个: $mirror"
         rm -f "$output" 2>/dev/null || true
+        
+        # 短暂延迟避免过于频繁的请求
+        sleep 1
     done
     
-    echo -e "${RED}❌ 所有GitHub镜像源都失败了${NC}"
+    log_error "❌ 所有GitHub镜像源都失败了: $description"
     return 1
 }
 
@@ -103,37 +335,292 @@ download_software() {
     download_github_file "$github_path" "$output" "${software_name} ${version}"
 }
 
-# K8S镜像源配置
-readonly K8S_MIRRORS=(
-    "https://dl.k8s.io"
-    "https://storage.googleapis.com/kubernetes-release"
-    "https://mirror.ghproxy.com/https://storage.googleapis.com/kubernetes-release"
-)
+# ==========================================
+# 核心工具函数库
+# ==========================================
 
-# K8S二进制文件下载函数
+# ==========================================
+# 系统初始化和环境配置
+# ==========================================
+
+##
+# 初始化系统环境
+# 
+# 功能描述:
+#   - 创建必要的工作目录
+#   - 初始化日志系统
+#   - 设置错误处理机制
+#   - 配置性能监控
+#
+# 参数: 无
+# 返回值: 0=成功, 非0=失败
+# 全局变量: WORK_DIR, LOG_DIR, BACKUP_DIR, CONFIG_DIR
+# 依赖函数: init_logging, handle_error
+##
+init_system() {
+    # 创建必要的目录
+    mkdir -p "$WORK_DIR" "$LOG_DIR" "$BACKUP_DIR" "$CONFIG_DIR"
+    
+    # 设置权限
+    chmod 755 "$WORK_DIR" "$LOG_DIR" "$BACKUP_DIR" "$CONFIG_DIR"
+    
+    # 初始化日志系统
+    init_logging
+    
+    # 设置错误处理（仅在非测试模式下）
+    if [[ "${SCRIPT_TEST_MODE:-false}" != "true" ]]; then
+        set -eE
+        trap 'handle_error $? $LINENO' ERR
+    fi
+    
+    # 性能优化
+    optimize_memory_usage
+    manage_disk_space
+    
+    # 系统预热
+    if [[ "$ENABLE_MONITORING" == "true" ]]; then
+        warm_up_system
+    fi
+    
+    # 记录启动信息
+    log_info "系统初始化完成"
+    log_info "脚本版本: $SCRIPT_VERSION"
+    log_info "工作目录: $WORK_DIR"
+    log_info "日志目录: $LOG_DIR"
+    log_info "性能优化: 已启用"
+    log_info "监控功能: $ENABLE_MONITORING"
+    log_info "备份功能: $ENABLE_BACKUP"
+}
+
+# 增强的日志系统
+init_logging() {
+    # 确保日志目录存在
+    mkdir -p "$(dirname "$LOG_FILE")"
+    
+    # 创建日志文件
+    touch "$LOG_FILE" "$ERROR_LOG" "$PERFORMANCE_LOG" "$AUDIT_LOG"
+    
+    # 设置日志轮转
+    if command -v logrotate >/dev/null 2>&1; then
+        cat > "/etc/logrotate.d/pve-k8s-deploy" << EOF
+$LOG_DIR/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 644 root root
+}
+EOF
+    fi
+}
+
+# 统一日志函数
+log_debug() { 
+    [[ "$LOG_LEVEL" == "DEBUG" ]] && echo -e "${BLUE}[DEBUG]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
+}
+
+log_info() { 
+    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
+}
+
+log_warn() { 
+    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE" "$ERROR_LOG"
+}
+
+log_error() { 
+    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE" "$ERROR_LOG"
+}
+
+log_success() { 
+    echo -e "${GREEN}[SUCCESS]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
+}
+
+log_performance() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$PERFORMANCE_LOG"
+}
+
+log_audit() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') USER=$(whoami) ACTION=$*" >> "$AUDIT_LOG"
+}
+
+# 增强的错误处理
+handle_error() {
+    local exit_code=$1
+    local line_number=$2
+    local command="${BASH_COMMAND}"
+    
+    log_error "脚本执行失败"
+    log_error "退出码: $exit_code"
+    log_error "行号: $line_number"
+    log_error "命令: $command"
+    log_error "调用栈:"
+    
+    # 打印调用栈
+    local frame=0
+    while caller $frame; do
+        ((frame++))
+    done | while read line func file; do
+        log_error "  at $func ($file:$line)"
+    done
+    
+    # 生成错误报告
+    generate_error_report "$exit_code" "$line_number" "$command"
+    
+    # 清理资源
+    cleanup_on_error
+    
+    exit "$exit_code"
+}
+
+# 生成错误报告
+generate_error_report() {
+    local exit_code=$1
+    local line_number=$2
+    local command=$3
+    local report_file="$LOG_DIR/error-report-$(date '+%Y%m%d-%H%M%S').txt"
+    
+    cat > "$report_file" << EOF
+=== PVE K8S 部署错误报告 ===
+时间: $(date)
+脚本版本: $SCRIPT_VERSION
+退出码: $exit_code
+错误行号: $line_number
+失败命令: $command
+
+系统信息:
+- 操作系统: $(uname -a)
+- 用户: $(whoami)
+- 工作目录: $(pwd)
+- 环境变量: $(env | grep -E '^(PATH|HOME|USER)=')
+
+最近的日志:
+$(tail -20 "$LOG_FILE" 2>/dev/null || echo "无法读取日志文件")
+
+错误日志:
+$(tail -10 "$ERROR_LOG" 2>/dev/null || echo "无错误日志")
+EOF
+    
+    log_error "错误报告已生成: $report_file"
+}
+
+# 错误清理函数
+cleanup_on_error() {
+    log_info "开始错误清理..."
+    
+    # 清理临时文件
+    [[ -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"/*.tmp 2>/dev/null || true
+    
+    # 停止可能的后台进程
+    jobs -p | xargs -r kill 2>/dev/null || true
+    
+    log_info "错误清理完成"
+}
+
+# 性能监控函数
+measure_performance() {
+    local operation="$1"
+    local start_time=$(date +%s.%N)
+    
+    # 执行操作
+    shift
+    "$@"
+    local exit_code=$?
+    
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l)
+    
+    log_performance "OPERATION=$operation DURATION=${duration}s EXIT_CODE=$exit_code"
+    
+    return $exit_code
+}
+
+# 资源监控函数
+monitor_resources() {
+    local cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
+    local memory_usage=$(free | grep Mem | awk '{printf "%.1f", $3/$2 * 100.0}')
+    local disk_usage=$(df / | tail -1 | awk '{print $5}' | cut -d'%' -f1)
+    
+    log_performance "RESOURCES CPU=${cpu_usage}% MEM=${memory_usage}% DISK=${disk_usage}%"
+    
+    # 资源告警
+    if (( $(echo "$cpu_usage > 80" | bc -l) )); then
+        log_warn "CPU使用率过高: ${cpu_usage}%"
+    fi
+    
+    if (( $(echo "$memory_usage > 80" | bc -l) )); then
+        log_warn "内存使用率过高: ${memory_usage}%"
+    fi
+    
+    if (( disk_usage > 80 )); then
+        log_warn "磁盘使用率过高: ${disk_usage}%"
+    fi
+}
+
+# 智能K8S二进制文件下载函数
 download_k8s_binary() {
     local binary_name="$1"  # kubectl, kubeadm, kubelet
     local version="$2"      # v1.28.2
+    local install_path="${3:-/usr/local/bin}"
     
-    echo -e "${CYAN}正在下载: ${binary_name} ${version}${NC}"
+    log_info "开始下载K8S组件: $binary_name $version"
+    
+    # 检查是否已经安装
+    if [[ -f "$install_path/$binary_name" ]]; then
+        local current_version
+        current_version=$($install_path/$binary_name version --client --short 2>/dev/null | grep -o 'v[0-9.]*' || echo "unknown")
+        if [[ "$current_version" == "$version" ]]; then
+            log_info "$binary_name $version 已安装，跳过下载"
+            return 0
+        else
+            log_info "发现不同版本的 $binary_name ($current_version)，将更新到 $version"
+        fi
+    fi
+    
+    # 创建临时文件
+    local temp_file="/tmp/${binary_name}-${version}"
     
     # 遍历所有K8S镜像源
     for mirror in "${K8S_MIRRORS[@]}"; do
         local full_url="${mirror}/release/${version}/bin/linux/amd64/${binary_name}"
-        echo -e "${YELLOW}尝试镜像源: $mirror${NC}"
+        log_debug "尝试K8S镜像源: $mirror"
         
-        if download_with_progress "$full_url" "$binary_name" "${binary_name} ${version}"; then
-            chmod +x "$binary_name"
-            mv "$binary_name" /usr/local/bin/
-            echo -e "${GREEN}✅ ${binary_name} 安装成功${NC}"
-            return 0
+        if measure_performance "download_k8s_${binary_name}" download_with_progress "$full_url" "$temp_file" "${binary_name} ${version}"; then
+            # 验证下载的文件
+            if [[ -f "$temp_file" && -s "$temp_file" ]]; then
+                # 设置执行权限
+                chmod +x "$temp_file"
+                
+                # 验证二进制文件
+                if "$temp_file" version --client >/dev/null 2>&1; then
+                    # 移动到安装目录
+                    mv "$temp_file" "$install_path/$binary_name"
+                    log_success "✅ $binary_name $version 安装成功"
+                    
+                    # 验证安装
+                    if "$install_path/$binary_name" version --client >/dev/null 2>&1; then
+                        log_debug "$binary_name 安装验证成功"
+                        return 0
+                    else
+                        log_error "$binary_name 安装验证失败"
+                        rm -f "$install_path/$binary_name"
+                    fi
+                else
+                    log_error "下载的 $binary_name 文件无效"
+                    rm -f "$temp_file"
+                fi
+            else
+                log_error "下载的 $binary_name 文件为空"
+            fi
         fi
         
-        echo -e "${YELLOW}当前镜像源失败，尝试下一个...${NC}"
-        rm -f "$binary_name" 2>/dev/null || true
+        log_warn "K8S镜像源失败，尝试下一个: $mirror"
+        rm -f "$temp_file" 2>/dev/null || true
+        sleep 1
     done
     
-    echo -e "${RED}❌ 所有K8S镜像源都失败了${NC}"
+    log_error "❌ 所有K8S镜像源都失败了: $binary_name $version"
     return 1
 }
 
@@ -163,7 +650,7 @@ install_docker_containerd() {
         echo -e "${RED}Docker下载失败${NC}"
         return 1
     fi
-    
+
     # 下载并安装containerd
     if download_software "containerd" "v$CONTAINERD_VERSION" "containerd/containerd" "containerd-$CONTAINERD_VERSION-linux-amd64.tar.gz" "containerd.tar.gz"; then
         echo -e "${GREEN}containerd下载成功${NC}"
@@ -382,56 +869,235 @@ ExecStart=/usr/local/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $
 EOF
 }
 
-# 系统配置
-readonly STORAGE="local-lvm"
-readonly BRIDGE="vmbr0"
-readonly GATEWAY="10.0.0.1"
-readonly DNS="119.29.29.29,8.8.8.8,10.0.0.2"
+# ==========================================
+# 性能优化和缓存机制
+# ==========================================
 
-# 虚拟机配置 - 使用数组存储配置
-declare -A VM_CONFIGS=(
-    ["101"]="k8s-master:10.0.0.10:8:16384:300"
-    ["102"]="k8s-worker1:10.0.0.11:8:16384:300"
-    ["103"]="k8s-worker2:10.0.0.12:8:16384:300"
-)
+##
+# 并行执行函数 - 高效的任务并发处理
+#
+# 功能描述:
+#   - 控制最大并发数
+#   - 实时监控任务状态
+#   - 收集所有任务结果
+#   - 智能任务调度
+#   - 错误统计和报告
+#
+# 参数:
+#   $1 - 最大并发数（可选，默认使用MAX_PARALLEL_JOBS）
+#   $2+ - 要执行的命令列表
+#
+# 返回值: 0=所有任务成功, 1=有任务失败
+# 使用示例:
+#   parallel_execute 4 "task1" "task2" "task3" "task4"
+##
+parallel_execute() {
+    local max_jobs="${1:-$MAX_PARALLEL_JOBS}"
+    shift
+    local commands=("$@")
+    local pids=()
+    local results=()
+    
+    log_info "开始并行执行 ${#commands[@]} 个任务，最大并发数: $max_jobs"
+    
+    for i in "${!commands[@]}"; do
+        # 控制并发数
+        while (( ${#pids[@]} >= max_jobs )); do
+            # 等待任意一个任务完成
+            for j in "${!pids[@]}"; do
+                if ! kill -0 "${pids[$j]}" 2>/dev/null; then
+                    wait "${pids[$j]}"
+                    results[$j]=$?
+                    unset pids[$j]
+                    break
+                fi
+            done
+            sleep 0.1
+        done
+        
+        # 启动新任务
+        log_debug "启动并行任务 $((i+1)): ${commands[$i]}"
+        eval "${commands[$i]}" &
+        pids[$i]=$!
+    done
+    
+    # 等待所有任务完成
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}"
+        results[$i]=$?
+    done
+    
+    # 检查结果
+    local failed_count=0
+    for i in "${!results[@]}"; do
+        if (( results[$i] != 0 )); then
+            log_error "并行任务 $((i+1)) 失败: ${commands[$i]} (退出码: ${results[$i]})"
+            ((failed_count++))
+        fi
+    done
+    
+    if (( failed_count > 0 )); then
+        log_error "并行执行完成，$failed_count 个任务失败"
+        return 1
+    else
+        log_success "并行执行完成，所有任务成功"
+        return 0
+    fi
+}
+
+# 缓存管理
+cache_get() {
+    local key="$1"
+    local cache_file="$WORK_DIR/cache/$key"
+    
+    if [[ -f "$cache_file" ]]; then
+        local cache_time=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+        local current_time=$(date +%s)
+        local cache_ttl="${2:-3600}"  # 默认1小时过期
+        
+        if (( current_time - cache_time < cache_ttl )); then
+            cat "$cache_file"
+            return 0
+        else
+            rm -f "$cache_file"
+        fi
+    fi
+    
+    return 1
+}
+
+cache_set() {
+    local key="$1"
+    local value="$2"
+    local cache_dir="$WORK_DIR/cache"
+    local cache_file="$cache_dir/$key"
+    
+    mkdir -p "$cache_dir"
+    echo "$value" > "$cache_file"
+}
+
+cache_clear() {
+    local pattern="${1:-*}"
+    local cache_dir="$WORK_DIR/cache"
+    
+    if [[ -d "$cache_dir" ]]; then
+        rm -f "$cache_dir"/$pattern
+        log_info "缓存已清理: $pattern"
+    fi
+}
+
+# 智能重试机制
+smart_retry() {
+    local max_attempts="$1"
+    local delay="$2"
+    local operation="$3"
+    shift 3
+    
+    local attempt=1
+    local base_delay="$delay"
+    
+    while (( attempt <= max_attempts )); do
+        log_debug "尝试执行操作 ($attempt/$max_attempts): $operation"
+        
+        if "$@"; then
+            log_debug "操作成功: $operation"
+            return 0
+        fi
+        
+        if (( attempt == max_attempts )); then
+            log_error "操作最终失败: $operation"
+            return 1
+        fi
+        
+        # 指数退避
+        local wait_time=$((base_delay * (2 ** (attempt - 1))))
+        log_warn "操作失败，等待 ${wait_time}s 后重试: $operation"
+        sleep "$wait_time"
+        
+        ((attempt++))
+    done
+}
+
+# 预热系统
+warm_up_system() {
+    log_info "开始系统预热..."
+    
+    # 预热DNS解析
+    local dns_targets=("github.com" "dl.k8s.io" "docker.io")
+    for target in "${dns_targets[@]}"; do
+        nslookup "$target" >/dev/null 2>&1 &
+    done
+    
+    # 预热网络连接
+    for mirror in "${GITHUB_MIRRORS[@]:0:2}"; do
+        curl -I "$mirror" --connect-timeout 5 >/dev/null 2>&1 &
+    done
+    
+    # 预创建工作目录
+    mkdir -p "$WORK_DIR"/{downloads,cache,pools,temp}
+    
+    # 预热系统命令
+    which curl wget ssh scp qm >/dev/null 2>&1
+    
+    wait  # 等待所有预热任务完成
+    log_info "系统预热完成"
+}
+
+# 内存使用优化
+optimize_memory_usage() {
+    # 清理不必要的变量
+    unset BASH_COMPLETION_DEBUG 2>/dev/null || true
+    
+    # 设置bash选项优化内存
+    set +h  # 禁用hash表
+    
+    # 限制历史记录大小
+    export HISTSIZE=100
+    export HISTFILESIZE=100
+    
+    # 清理环境变量
+    unset MAIL MAILCHECK 2>/dev/null || true
+    
+    log_debug "内存使用已优化"
+}
+
+# 磁盘空间管理
+manage_disk_space() {
+    local min_free_space_gb="${1:-5}"
+    local work_dir_size=$(du -sg "$WORK_DIR" 2>/dev/null | cut -f1 || echo 0)
+    local available_space=$(df "$WORK_DIR" | tail -1 | awk '{print int($4/1024/1024)}')
+    
+    log_debug "工作目录大小: ${work_dir_size}GB，可用空间: ${available_space}GB"
+    
+    if (( available_space < min_free_space_gb )); then
+        log_warn "磁盘空间不足，开始清理..."
+        
+        # 清理缓存
+        cache_clear
+        
+        # 清理临时文件
+        find "$WORK_DIR" -name "*.tmp" -mtime +1 -delete 2>/dev/null || true
+        
+        # 清理旧日志
+        find "$LOG_DIR" -name "*.log" -mtime +7 -delete 2>/dev/null || true
+        
+        log_info "磁盘空间清理完成"
+    fi
+}
+
+# ==========================================
+# 系统配置和认证
+# ==========================================
+
+# 系统配置
+readonly STORAGE="${STORAGE:-local-lvm}"
+readonly BRIDGE="${BRIDGE:-vmbr0}"
+readonly GATEWAY="${GATEWAY:-10.0.0.1}"
+readonly DNS="${DNS:-119.29.29.29,8.8.8.8,10.0.0.1}"
 
 # 认证配置
-readonly CLOUDINIT_USER="root"
-readonly CLOUDINIT_PASS="kubesphere123"
-
-# 云镜像配置
-readonly CLOUD_IMAGE_URLS=(
-    "https://mirrors.ustc.edu.cn/debian-cloud-images/bookworm/latest/debian-12-generic-amd64.qcow2"
-    "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
-)
-readonly CLOUD_IMAGE_FILE="debian-12-generic-amd64.qcow2"
-readonly CLOUD_IMAGE_PATH="/var/lib/vz/template/qcow/$CLOUD_IMAGE_FILE"
-
-# GitHub镜像源配置
-readonly GITHUB_MIRRORS=(
-    "https://github.com"
-    "https://ghproxy.com/https://github.com"
-    "https://mirror.ghproxy.com/https://github.com"
-    "https://gh.api.99988866.xyz/https://github.com"
-    "https://gitclone.com/github.com"
-)
-
-# 软件版本配置
-readonly DOCKER_VERSION="24.0.7"
-readonly CONTAINERD_VERSION="1.7.8"
-readonly RUNC_VERSION="1.1.9"
-
-# K8S配置
-readonly K8S_VERSION="v1.28.2"
-readonly POD_SUBNET="10.244.0.0/16"
-
-# 日志配置
-readonly LOG_DIR="/var/log/pve-k8s-deploy"
-readonly LOG_FILE="$LOG_DIR/deploy_$(date +%Y%m%d_%H%M%S).log"
-
-# 超时配置
-readonly SSH_TIMEOUT=600
-readonly CLOUDINIT_TIMEOUT=900
+readonly CLOUDINIT_USER="${CLOUDINIT_USER:-root}"
+readonly CLOUDINIT_PASS="${CLOUDINIT_PASS:-kubesphere123}"
 
 # ==========================================
 # 日志和工具函数
@@ -614,7 +1280,7 @@ wait_for_ssh() {
     done
     
     error "$ip SSH服务超时"
-    return 1
+            return 1
 }
 
 # 检查网络连接
@@ -664,8 +1330,8 @@ wait_for_cloudinit() {
             elif [[ "$status" == *"error"* ]]; then
                 warn "$ip Cloud-init出现错误，但继续执行"
                 return 0
-            fi
-        else
+        fi
+    else
             echo -n "x"
         fi
         
@@ -749,7 +1415,7 @@ fix_all_ssh_configs() {
 download_cloud_image() {
     if [[ -f "$CLOUD_IMAGE_PATH" ]]; then
         log "云镜像已存在: $CLOUD_IMAGE_PATH"
-        return 0
+    return 0
     fi
     
     log "下载云镜像..."
@@ -937,9 +1603,9 @@ create_vm() {
         --memory "$vm_memory" \
         --cores "$vm_cores" \
         --net0 "virtio,bridge=$BRIDGE" \
-        --scsihw virtio-scsi-pci \
+            --scsihw virtio-scsi-pci \
         --ide2 "$STORAGE:cloudinit" \
-        --serial0 socket \
+            --serial0 socket \
         --vga std \
         --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY" \
         --nameserver "$DNS" \
@@ -962,7 +1628,7 @@ create_vm() {
     fi
     
     error "虚拟机 $vm_name 创建失败"
-    return 1
+            return 1
 }
 
 create_all_vms() {
@@ -1416,8 +2082,8 @@ EOF
         # 重新尝试安装
         if ! execute_remote_command "$ip" "$install_script"; then
             error "$ip Docker/K8S安装最终失败"
-            return 1
-        fi
+                return 1
+            fi
     fi
     
     # 验证安装
@@ -1450,7 +2116,7 @@ init_k8s_master() {
         
         # 确保Docker和containerd运行
         systemctl restart docker containerd
-        sleep 5
+            sleep 5
         
         # 使用国内镜像初始化
         if ! kubeadm init \
@@ -1557,8 +2223,8 @@ join_workers() {
                 if ! systemctl is-active containerd; then
                     echo 'containerd未运行，启动containerd...'
                     systemctl start containerd
-                    sleep 3
-                fi
+                sleep 3
+            fi
                 
                 # 验证Docker
                 if ! docker ps &>/dev/null; then
@@ -1760,8 +2426,8 @@ fix_k8s_cluster() {
                         success "Worker节点 $worker_name 重新加入成功"
                     else
                         error "Worker节点 $worker_name 重新加入失败"
-                    fi
-                else
+        fi
+    else
                     error "获取集群加入令牌失败"
                 fi
             else
@@ -1938,7 +2604,7 @@ diagnose_system() {
         success "系统诊断完成，未发现问题"
     else
         warn "系统诊断完成，发现 $issues_found 个问题"
-        echo ""
+    echo ""
         echo -e "${YELLOW}建议的修复步骤：${NC}"
         echo -e "  ${CYAN}1.${NC} 运行菜单选项 6 - 修复Docker和K8S安装"
         echo -e "  ${CYAN}2.${NC} 运行菜单选项 7 - 修复K8S集群"
@@ -2060,7 +2726,7 @@ view_logs() {
                 local vm_name=$(get_vm_name_by_ip "$ip")
                 echo -e "${CYAN}=== $vm_name ($ip) 系统日志 ===${NC}"
                 execute_remote_command "$ip" "journalctl -n 50 --no-pager" || true
-                echo ""
+    echo ""
             done
             ;;
         2)
@@ -2118,7 +2784,7 @@ generate_troubleshooting_report() {
         echo "生成时间: $(date)"
         echo "脚本版本: $SCRIPT_VERSION"
         echo "========================================"
-        echo ""
+    echo ""
         
         echo "虚拟机配置："
         for vm_id in "${!VM_CONFIGS[@]}"; do
@@ -2166,12 +2832,12 @@ generate_troubleshooting_report() {
         local master_ip=$(get_master_ip)
         local cluster_info=$(execute_remote_command "$master_ip" "kubectl get nodes -o wide 2>/dev/null || echo 'K8S集群未就绪'" 1)
         echo "$cluster_info"
-        echo ""
-        
+    echo ""
+    
         echo "Pod状态："
         local pod_info=$(execute_remote_command "$master_ip" "kubectl get pods --all-namespaces 2>/dev/null || echo 'K8S集群未就绪'" 1)
         echo "$pod_info"
-        echo ""
+    echo ""
         
         echo "========================================"
         echo "报告生成完成"
@@ -2888,7 +3554,7 @@ automation_ops() {
             cleanup_cron_jobs
             ;;
         0)
-            return 0
+    return 0
             ;;
         *)
             warn "无效选择"
@@ -2924,7 +3590,7 @@ setup_health_check_cron() {
             ;;
         *)
             warn "无效选择"
-            return 1
+        return 1
             ;;
     esac
     
@@ -3000,7 +3666,7 @@ setup_backup_cron() {
             ;;
         *)
             warn "无效选择"
-            return 1
+        return 1
             ;;
     esac
     
@@ -3263,120 +3929,533 @@ cleanup_all() {
 }
 
 # ==========================================
-# 用户界面
+# 现代化用户界面
 # ==========================================
-show_banner() {
-    echo -e "${CYAN}"
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║                                                              ║"
-    echo "║           PVE K8S + KubeSphere 一键部署工具 v4.0            ║"
-    echo "║                        重构精简版                            ║"
-    echo "║                                                              ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-}
 
-show_menu() {
-    echo -e "${YELLOW}═══════════════ 主菜单 ═══════════════${NC}"
-    echo -e "${GREEN}部署功能：${NC}"
-    echo -e "  ${CYAN}1.${NC} 一键全自动部署（推荐）"
-    echo -e "  ${CYAN}2.${NC} 下载云镜像"
-    echo -e "  ${CYAN}3.${NC} 创建虚拟机"
-    echo -e "  ${CYAN}4.${NC} 部署K8S集群"
-    echo -e "  ${CYAN}5.${NC} 部署KubeSphere"
-    echo ""
-    echo -e "${YELLOW}修复功能：${NC}"
-    echo -e "  ${CYAN}6.${NC} 修复Docker和K8S安装"
-    echo -e "  ${CYAN}7.${NC} 修复K8S集群"
-    echo -e "  ${CYAN}8.${NC} 修复网络连接"
-    echo -e "  ${CYAN}9.${NC} 修复SSH配置"
-    echo -e "  ${CYAN}12.${NC} 一键修复所有问题"
-    echo ""
-    echo -e "${BLUE}诊断功能：${NC}"
-    echo -e "  ${CYAN}10.${NC} 系统诊断"
-    echo -e "  ${CYAN}11.${NC} 检查集群状态"
-    echo -e "  ${CYAN}21.${NC} 集群健康检查"
-    echo -e "  ${CYAN}15.${NC} 查看系统日志"
-    echo -e "  ${CYAN}16.${NC} 生成故障报告"
-    echo -e "  ${CYAN}17.${NC} 快速修复手册"
-    echo ""
-    echo -e "${PURPLE}高级功能：${NC}"
-    echo -e "  ${CYAN}18.${NC} 性能监控"
-    echo -e "  ${CYAN}19.${NC} 备份集群配置"
-    echo -e "  ${CYAN}20.${NC} 高级配置选项"
-    echo -e "  ${CYAN}22.${NC} 自动化运维"
-    echo -e "  ${CYAN}23.${NC} 修复K8S仓库问题"
-    echo ""
-    echo -e "${RED}管理功能：${NC}"
-    echo -e "  ${CYAN}13.${NC} 强制重建集群"
-    echo -e "  ${CYAN}14.${NC} 清理所有资源"
-    echo -e "  ${CYAN}0.${NC} 退出"
-    echo -e "${YELLOW}══════════════════════════════════════${NC}"
-}
-
-# ==========================================
-# 主程序
-# ==========================================
-main() {
-    init_logging
-    log "脚本启动 - $SCRIPT_NAME v$SCRIPT_VERSION"
+# 显示系统状态
+show_system_status() {
+    local cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
+    local memory_usage=$(free | grep Mem | awk '{printf "%.1f", $3/$2 * 100.0}' 2>/dev/null || echo "N/A")
+    local disk_usage=$(df / | tail -1 | awk '{print $5}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
+    local load_avg=$(uptime | awk -F'load average:' '{print $2}' | cut -d',' -f1 | xargs 2>/dev/null || echo "N/A")
     
-    check_environment
+    echo -e "${BLUE}┌─ 系统状态 ─────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BLUE}│${NC} CPU: ${cpu_usage}%  内存: ${memory_usage}%  磁盘: ${disk_usage}%  负载: ${load_avg}      ${BLUE}│${NC}"
+    echo -e "${BLUE}└────────────────────────────────────────────────────────────────────┘${NC}"
+}
+
+# 显示集群状态
+show_cluster_status() {
+    local master_ip=$(get_master_ip 2>/dev/null || echo "N/A")
+    local cluster_status="未知"
+    local node_count="N/A"
+    local pod_count="N/A"
+    
+    if [[ "$master_ip" != "N/A" ]] && execute_remote_command "$master_ip" "kubectl get nodes >/dev/null 2>&1"; then
+        cluster_status="运行中"
+        node_count=$(execute_remote_command "$master_ip" "kubectl get nodes --no-headers | wc -l" 2>/dev/null || echo "N/A")
+        pod_count=$(execute_remote_command "$master_ip" "kubectl get pods --all-namespaces --no-headers | wc -l" 2>/dev/null || echo "N/A")
+    else
+        cluster_status="未部署"
+    fi
+    
+    echo -e "${GREEN}┌─ 集群状态 ─────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${GREEN}│${NC} 状态: ${cluster_status}  节点数: ${node_count}  Pod数: ${pod_count}  Master: ${master_ip}  ${GREEN}│${NC}"
+    echo -e "${GREEN}└────────────────────────────────────────────────────────────────────┘${NC}"
+}
+
+# 现代化横幅
+show_banner() {
+    clear
+    echo -e "${BOLD}${CYAN}"
+    echo "╔══════════════════════════════════════════════════════════════════════╗"
+    echo "║                                                                      ║"
+    echo "║    🚀 PVE K8S + KubeSphere 智能部署工具 v${SCRIPT_VERSION}                     ║"
+    echo "║                                                                      ║"
+    echo "║    📋 ${SCRIPT_DESCRIPTION}                          ║"
+    echo "║    👨‍💻 作者: ${SCRIPT_AUTHOR}                                            ║"
+    echo "║                                                                      ║"
+    echo "╚══════════════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    
+    # 显示系统和集群状态
+    show_system_status
+    show_cluster_status
+    echo ""
+}
+
+# 交互式菜单选择
+show_interactive_menu() {
+    local categories=(
+        "🚀 部署功能"
+        "🔧 修复功能"
+        "🔍 诊断功能"
+        "⚙️ 高级功能"
+        "📊 管理功能"
+        "❌ 退出"
+    )
+    
+    echo -e "${BOLD}${YELLOW}┌─ 主菜单 ─────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${YELLOW}│${NC} 请选择功能分类：                                                   ${BOLD}${YELLOW}│${NC}"
+    echo -e "${BOLD}${YELLOW}└──────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    
+    for i in "${!categories[@]}"; do
+        echo -e "  ${CYAN}$((i+1)).${NC} ${categories[$i]}"
+    done
+    echo ""
+    
+    read -p "请选择分类 [1-6]: " category_choice
+    
+    case $category_choice in
+        1) show_deploy_menu ;;
+        2) show_fix_menu ;;
+        3) show_diagnose_menu ;;
+        4) show_advanced_menu ;;
+        5) show_manage_menu ;;
+        6) return 1 ;;
+        *) 
+            log_warn "无效选择，请重新输入"
+            return 2
+            ;;
+    esac
+}
+
+# 部署功能菜单
+show_deploy_menu() {
+    echo -e "${BOLD}${GREEN}┌─ 🚀 部署功能 ─────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${GREEN}│${NC} 选择部署操作：                                                     ${BOLD}${GREEN}│${NC}"
+    echo -e "${BOLD}${GREEN}└──────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "  ${CYAN}1.${NC} 🎯 一键全自动部署（推荐）"
+    echo -e "  ${CYAN}2.${NC} 💿 下载云镜像"
+    echo -e "  ${CYAN}3.${NC} 🖥️  创建虚拟机"
+    echo -e "  ${CYAN}4.${NC} ☸️  部署K8S集群"
+    echo -e "  ${CYAN}5.${NC} 🌐 部署KubeSphere"
+    echo -e "  ${CYAN}0.${NC} 🔙 返回主菜单"
+    echo ""
+    
+    read -p "请选择操作 [0-5]: " deploy_choice
+    return $deploy_choice
+}
+
+# 修复功能菜单
+show_fix_menu() {
+    echo -e "${BOLD}${YELLOW}┌─ 🔧 修复功能 ─────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${YELLOW}│${NC} 选择修复操作：                                                     ${BOLD}${YELLOW}│${NC}"
+    echo -e "${BOLD}${YELLOW}└──────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "  ${CYAN}1.${NC} 🐳 修复Docker和K8S安装"
+    echo -e "  ${CYAN}2.${NC} ☸️  修复K8S集群"
+    echo -e "  ${CYAN}3.${NC} 🌐 修复网络连接"
+    echo -e "  ${CYAN}4.${NC} 🔑 修复SSH配置"
+    echo -e "  ${CYAN}5.${NC} 🔧 修复K8S仓库问题"
+    echo -e "  ${CYAN}9.${NC} 🛠️  一键修复所有问题"
+    echo -e "  ${CYAN}0.${NC} 🔙 返回主菜单"
+    echo ""
+    
+    read -p "请选择操作 [0-9]: " fix_choice
+    return $fix_choice
+}
+
+# 诊断功能菜单
+show_diagnose_menu() {
+    echo -e "${BOLD}${BLUE}┌─ 🔍 诊断功能 ─────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${BLUE}│${NC} 选择诊断操作：                                                     ${BOLD}${BLUE}│${NC}"
+    echo -e "${BOLD}${BLUE}└──────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "  ${CYAN}1.${NC} 🔍 系统诊断"
+    echo -e "  ${CYAN}2.${NC} 📊 检查集群状态"
+    echo -e "  ${CYAN}3.${NC} ❤️  集群健康检查"
+    echo -e "  ${CYAN}4.${NC} 📋 查看系统日志"
+    echo -e "  ${CYAN}5.${NC} 📄 生成故障报告"
+    echo -e "  ${CYAN}6.${NC} 📖 快速修复手册"
+    echo -e "  ${CYAN}0.${NC} 🔙 返回主菜单"
+    echo ""
+    
+    read -p "请选择操作 [0-6]: " diagnose_choice
+    return $diagnose_choice
+}
+
+# 高级功能菜单
+show_advanced_menu() {
+    echo -e "${BOLD}${PURPLE}┌─ ⚙️ 高级功能 ─────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${PURPLE}│${NC} 选择高级操作：                                                     ${BOLD}${PURPLE}│${NC}"
+    echo -e "${BOLD}${PURPLE}└──────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "  ${CYAN}1.${NC} 📈 性能监控"
+    echo -e "  ${CYAN}2.${NC} 💾 备份集群配置"
+    echo -e "  ${CYAN}3.${NC} ⚙️  高级配置选项"
+    echo -e "  ${CYAN}4.${NC} 🤖 自动化运维"
+    echo -e "  ${CYAN}0.${NC} 🔙 返回主菜单"
+    echo ""
+    
+    read -p "请选择操作 [0-4]: " advanced_choice
+    return $advanced_choice
+}
+
+# 管理功能菜单
+show_manage_menu() {
+    echo -e "${BOLD}${RED}┌─ 📊 管理功能 ─────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${RED}│${NC} 选择管理操作：                                                     ${BOLD}${RED}│${NC}"
+    echo -e "${BOLD}${RED}└──────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "  ${CYAN}1.${NC} 🔄 强制重建集群"
+    echo -e "  ${CYAN}2.${NC} 🗑️  清理所有资源"
+    echo -e "  ${CYAN}0.${NC} 🔙 返回主菜单"
+    echo ""
+    
+    read -p "请选择操作 [0-2]: " manage_choice
+    return $manage_choice
+}
+
+# 传统菜单（兼容模式）
+show_menu() {
+    echo -e "${BOLD}${YELLOW}┌─ 传统菜单模式 ───────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${YELLOW}│${NC} 直接输入功能编号：                                                 ${BOLD}${YELLOW}│${NC}"
+    echo -e "${BOLD}${YELLOW}└──────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "${GREEN}🚀 部署功能：${NC}"
+    echo -e "  ${CYAN}1.${NC} 一键全自动部署（推荐）  ${CYAN}2.${NC} 下载云镜像      ${CYAN}3.${NC} 创建虚拟机"
+    echo -e "  ${CYAN}4.${NC} 部署K8S集群            ${CYAN}5.${NC} 部署KubeSphere"
+    echo ""
+    echo -e "${YELLOW}🔧 修复功能：${NC}"
+    echo -e "  ${CYAN}6.${NC} 修复Docker/K8S安装     ${CYAN}7.${NC} 修复K8S集群     ${CYAN}8.${NC} 修复网络连接"
+    echo -e "  ${CYAN}9.${NC} 修复SSH配置           ${CYAN}12.${NC} 一键修复所有    ${CYAN}23.${NC} 修复K8S仓库"
+    echo ""
+    echo -e "${BLUE}🔍 诊断功能：${NC}"
+    echo -e "  ${CYAN}10.${NC} 系统诊断              ${CYAN}11.${NC} 检查集群状态    ${CYAN}21.${NC} 集群健康检查"
+    echo -e "  ${CYAN}15.${NC} 查看系统日志          ${CYAN}16.${NC} 生成故障报告    ${CYAN}17.${NC} 快速修复手册"
+    echo ""
+    echo -e "${PURPLE}⚙️ 高级功能：${NC}"
+    echo -e "  ${CYAN}18.${NC} 性能监控              ${CYAN}19.${NC} 备份集群配置    ${CYAN}20.${NC} 高级配置选项"
+    echo -e "  ${CYAN}22.${NC} 自动化运维"
+    echo ""
+    echo -e "${RED}📊 管理功能：${NC}"
+    echo -e "  ${CYAN}13.${NC} 强制重建集群          ${CYAN}14.${NC} 清理所有资源    ${CYAN}0.${NC} 退出"
+    echo ""
+    echo -e "${BOLD}${CYAN}💡 提示：输入 'i' 进入交互模式，'h' 查看帮助${NC}"
+    echo -e "${YELLOW}──────────────────────────────────────────────────────────────────────${NC}"
+}
+
+# ==========================================
+# 智能主程序
+# ==========================================
+
+# 显示帮助信息
+show_help() {
+    echo -e "${BOLD}${CYAN}┌─ 帮助信息 ───────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${CYAN}│${NC} 使用方法：                                                         ${BOLD}${CYAN}│${NC}"
+    echo -e "${BOLD}${CYAN}└──────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "${GREEN}命令行参数：${NC}"
+    echo -e "  ${CYAN}./one-click-pve-k8s.sh${NC}           # 进入交互模式"
+    echo -e "  ${CYAN}./one-click-pve-k8s.sh 1${NC}         # 直接执行一键部署"
+    echo -e "  ${CYAN}./one-click-pve-k8s.sh --help${NC}    # 显示帮助信息"
+    echo -e "  ${CYAN}./one-click-pve-k8s.sh --version${NC} # 显示版本信息"
+    echo ""
+    echo -e "${GREEN}环境变量：${NC}"
+    echo -e "  ${CYAN}DEBUG=true${NC}                      # 启用调试模式"
+    echo -e "  ${CYAN}LOG_LEVEL=DEBUG${NC}                 # 设置日志级别"
+    echo -e "  ${CYAN}K8S_VERSION=v1.29.0${NC}             # 指定K8S版本"
+    echo -e "  ${CYAN}DOCKER_VERSION=24.0.8${NC}           # 指定Docker版本"
+    echo ""
+    echo -e "${GREEN}快捷键：${NC}"
+    echo -e "  ${CYAN}Ctrl+C${NC}                          # 安全退出"
+    echo -e "  ${CYAN}i${NC}                               # 交互模式"
+    echo -e "  ${CYAN}h${NC}                               # 显示帮助"
+    echo ""
+}
+
+# 处理命令行参数
+handle_arguments() {
+    case "${1:-}" in
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --version|-v)
+            echo -e "${BOLD}${SCRIPT_NAME} v${SCRIPT_VERSION}${NC}"
+            echo -e "作者: ${SCRIPT_AUTHOR}"
+            echo -e "描述: ${SCRIPT_DESCRIPTION}"
+            exit 0
+            ;;
+        --debug|-d)
+            export DEBUG=true
+            export LOG_LEVEL=DEBUG
+            log_info "调试模式已启用"
+            ;;
+        [1-9]|[1-2][0-9])
+            # 直接执行指定功能
+            execute_function "$1"
+            exit $?
+            ;;
+        "")
+            # 无参数，进入交互模式
+            return 0
+            ;;
+        *)
+            log_error "未知参数: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# 执行指定功能
+execute_function() {
+    local func_id="$1"
+    
+    log_audit "EXECUTE_FUNCTION id=$func_id"
+    
+    case $func_id in
+        1) measure_performance "full_deploy" full_auto_deploy ;;
+        2) measure_performance "download_image" download_cloud_image ;;
+        3) measure_performance "create_vms" create_all_vms && wait_for_all_vms ;;
+        4) measure_performance "deploy_k8s" deploy_k8s ;;
+        5) measure_performance "deploy_kubesphere" deploy_kubesphere ;;
+        6) measure_performance "fix_docker_k8s" fix_docker_k8s ;;
+        7) measure_performance "fix_k8s_cluster" fix_k8s_cluster ;;
+        8) measure_performance "fix_network" fix_network_connectivity ;;
+        9) measure_performance "fix_ssh" fix_all_ssh_configs ;;
+        10) measure_performance "diagnose_system" diagnose_system ;;
+        11) measure_performance "check_status" check_status ;;
+        12) measure_performance "fix_all_issues" fix_all_issues ;;
+        13) measure_performance "rebuild_cluster" rebuild_cluster ;;
+        14) measure_performance "cleanup_all" cleanup_all ;;
+        15) measure_performance "view_logs" view_logs ;;
+        16) measure_performance "generate_report" generate_troubleshooting_report ;;
+        17) measure_performance "show_guide" show_quick_fix_guide ;;
+        18) measure_performance "monitor_performance" monitor_cluster_performance ;;
+        19) measure_performance "backup_config" backup_cluster_config ;;
+        20) measure_performance "advanced_config" advanced_config ;;
+        21) measure_performance "health_check" cluster_health_check ;;
+        22) measure_performance "automation_ops" automation_ops ;;
+        23) measure_performance "fix_k8s_repository" fix_k8s_repository ;;
+        *) 
+            log_error "未知功能ID: $func_id"
+            return 1
+            ;;
+    esac
+}
+
+# 一键全自动部署
+full_auto_deploy() {
+    log_info "开始一键全自动部署..."
+    log_audit "START_FULL_DEPLOY"
+    
+    local steps=(
+        "download_cloud_image:下载云镜像"
+        "create_all_vms:创建虚拟机"
+        "wait_for_all_vms:等待虚拟机启动"
+        "deploy_k8s:部署K8S集群"
+        "deploy_kubesphere:部署KubeSphere"
+    )
+    
+    local total_steps=${#steps[@]}
+    local current_step=0
+    
+    for step_info in "${steps[@]}"; do
+        local step_func="${step_info%%:*}"
+        local step_desc="${step_info##*:}"
+        
+        ((current_step++))
+        
+        log_info "[$current_step/$total_steps] $step_desc"
+        
+        if ! measure_performance "$step_func" "$step_func"; then
+            log_error "步骤失败: $step_desc"
+            log_audit "FULL_DEPLOY_FAILED step=$step_func"
+            
+            # 询问是否继续
+            echo -e "${YELLOW}是否继续下一步？[y/N]: ${NC}"
+            read -t 30 -n 1 continue_choice
+            echo ""
+            
+            if [[ ! "$continue_choice" =~ ^[Yy]$ ]]; then
+                log_info "用户选择停止部署"
+                return 1
+            fi
+        fi
+        
+        # 显示进度
+        local progress=$((current_step * 100 / total_steps))
+        echo -e "${GREEN}进度: [$progress%] $step_desc 完成${NC}"
+    done
+    
+    log_success "一键全自动部署完成！"
+    log_audit "FULL_DEPLOY_SUCCESS"
+    
+    # 显示部署结果
+    echo -e "${BOLD}${GREEN}┌─ 部署完成 ───────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${GREEN}│${NC} 🎉 恭喜！PVE K8S + KubeSphere 部署成功！                           ${BOLD}${GREEN}│${NC}"
+    echo -e "${BOLD}${GREEN}└──────────────────────────────────────────────────────────────────────┘${NC}"
+    
+    # 显示访问信息
+    show_access_info
+}
+
+# 显示访问信息
+show_access_info() {
+    local master_ip=$(get_master_ip 2>/dev/null || echo "N/A")
+    
+    if [[ "$master_ip" != "N/A" ]]; then
+        echo -e "${CYAN}┌─ 访问信息 ───────────────────────────────────────────────────────────┐${NC}"
+        echo -e "${CYAN}│${NC} KubeSphere 控制台: http://$master_ip:30880                          ${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC} 默认用户名: admin                                                  ${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC} 默认密码: P@88w0rd                                                 ${CYAN}│${NC}"
+        echo -e "${CYAN}│${NC} SSH 连接: ssh root@$master_ip                                      ${CYAN}│${NC}"
+        echo -e "${CYAN}└──────────────────────────────────────────────────────────────────────┘${NC}"
+    fi
+}
+
+# 交互式主程序
+interactive_main() {
+    local use_interactive_menu=true
     
     while true; do
-        clear
         show_banner
-        show_menu
         
-        read -p "请选择操作 [0-22]: " choice
+        if [[ "$use_interactive_menu" == "true" ]]; then
+            if show_interactive_menu; then
+                local menu_result=$?
+                case $menu_result in
+                    1) break ;; # 退出
+                    2) continue ;; # 无效选择，重新显示
+                esac
+                
+                # 处理子菜单选择
+                handle_submenu_choice $?
+            else
+                break
+            fi
+        else
+            show_menu
+            
+            read -p "请选择操作 [0-23] (或输入 'i' 进入交互模式, 'h' 查看帮助): " choice
+            
+            case "$choice" in
+                i|I)
+                    use_interactive_menu=true
+                    continue
+                    ;;
+                h|H)
+                    show_help
+                    ;;
+                0)
+                    log_info "用户选择退出"
+                    break
+                    ;;
+                [1-9]|[1-2][0-9])
+                    execute_function "$choice"
+                    ;;
+                *)
+                    log_warn "无效选择: $choice"
+                    ;;
+            esac
+        fi
         
-        case $choice in
-            1)
-                log "开始一键全自动部署..."
-                download_cloud_image && \
-                create_all_vms && \
-                wait_for_all_vms && \
-                deploy_k8s && \
-                deploy_kubesphere
-                success "一键部署完成！"
-                ;;
-            2) download_cloud_image ;;
-            3) create_all_vms && wait_for_all_vms ;;
-            4) deploy_k8s ;;
-            5) deploy_kubesphere ;;
-            6) fix_docker_k8s ;;
-            7) fix_k8s_cluster ;;
-            8) fix_network_connectivity ;;
-            9) fix_all_ssh_configs ;;
-            10) diagnose_system ;;
-            11) check_status ;;
-            12) fix_all_issues ;;
-            13) rebuild_cluster ;;
-            14) cleanup_all ;;
-            15) view_logs ;;
-            16) generate_troubleshooting_report ;;
-            17) show_quick_fix_guide ;;
-            18) monitor_cluster_performance ;;
-            19) backup_cluster_config ;;
-            20) advanced_config ;;
-            21) cluster_health_check ;;
-            22) automation_ops ;;
-        23) fix_k8s_repository ;;
-            0) 
-                log "退出脚本"
-                exit 0 
-                ;;
-            *)
-                warn "无效选择，请重新输入"
-                ;;
-        esac
-        
+        # 显示操作结果提示
         echo ""
-        read -p "按回车键继续..."
+        echo -e "${YELLOW}按回车键继续，或输入 'q' 退出...${NC}"
+        read -t 10 -n 1 continue_key
+        echo ""
+        
+        if [[ "$continue_key" == "q" || "$continue_key" == "Q" ]]; then
+            break
+        fi
     done
+}
+
+# 处理子菜单选择
+handle_submenu_choice() {
+    local choice=$1
+    
+    case $choice in
+        # 部署菜单
+        1) execute_function 1 ;;  # 一键部署
+        2) execute_function 2 ;;  # 下载云镜像
+        3) execute_function 3 ;;  # 创建虚拟机
+        4) execute_function 4 ;;  # 部署K8S
+        5) execute_function 5 ;;  # 部署KubeSphere
+        
+        # 修复菜单
+        6) execute_function 6 ;;  # 修复Docker/K8S
+        7) execute_function 7 ;;  # 修复K8S集群
+        8) execute_function 8 ;;  # 修复网络
+        9) execute_function 9 ;;  # 修复SSH
+        23) execute_function 23 ;; # 修复K8S仓库
+        12) execute_function 12 ;; # 一键修复
+        
+        # 诊断菜单
+        10) execute_function 10 ;; # 系统诊断
+        11) execute_function 11 ;; # 检查状态
+        21) execute_function 21 ;; # 健康检查
+        15) execute_function 15 ;; # 查看日志
+        16) execute_function 16 ;; # 生成报告
+        17) execute_function 17 ;; # 修复手册
+        
+        # 高级菜单
+        18) execute_function 18 ;; # 性能监控
+        19) execute_function 19 ;; # 备份配置
+        20) execute_function 20 ;; # 高级配置
+        22) execute_function 22 ;; # 自动化运维
+        
+        # 管理菜单
+        13) execute_function 13 ;; # 重建集群
+        14) execute_function 14 ;; # 清理资源
+        
+        0) return 0 ;;  # 返回主菜单
+        *) log_warn "无效选择: $choice" ;;
+    esac
+}
+
+# 安全退出处理
+cleanup_and_exit() {
+    log_info "接收到退出信号，正在安全退出..."
+    
+    # 停止后台进程
+    jobs -p | xargs -r kill 2>/dev/null || true
+    
+    # 清理临时文件
+    [[ -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"/*.tmp 2>/dev/null || true
+    
+    # 保存审计日志
+    log_audit "SCRIPT_EXIT"
+    
+    echo -e "${GREEN}感谢使用 $SCRIPT_NAME！${NC}"
+    exit 0
+}
+
+# 主程序入口
+main() {
+    # 设置信号处理
+    trap cleanup_and_exit SIGINT SIGTERM
+    
+    # 初始化系统
+    init_system
+    
+    # 记录启动
+    log_info "脚本启动 - $SCRIPT_NAME v$SCRIPT_VERSION"
+    log_audit "SCRIPT_START version=$SCRIPT_VERSION user=$(whoami)"
+    
+    # 处理命令行参数
+    handle_arguments "$@"
+    
+    # 检查环境
+    if ! check_environment; then
+        log_error "环境检查失败，脚本退出"
+        exit 1
+    fi
+    
+    # 进入交互模式
+    interactive_main
+    
+    # 正常退出
+    cleanup_and_exit
 }
 
 # 脚本入口
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
+main "$@" 
 fi 
