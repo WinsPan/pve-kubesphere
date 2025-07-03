@@ -2669,8 +2669,11 @@ fix_all_issues() {
     log "开始一键修复所有问题..."
     
     # 先诊断问题
-    if ! diagnose_system; then
-        log "发现问题，开始修复..."
+    diagnose_system
+    local issues_count=$?
+    
+    if [[ $issues_count -gt 0 ]]; then
+        log "发现 $issues_count 个问题，开始修复..."
         
         # 修复网络连接
         log "第1步：修复网络连接..."
@@ -2690,8 +2693,11 @@ fix_all_issues() {
         
         # 再次诊断
         log "修复完成，重新诊断..."
-        if ! diagnose_system; then
-            warn "部分问题可能仍然存在，请检查诊断结果"
+        diagnose_system
+        local remaining_issues=$?
+        
+        if [[ $remaining_issues -gt 0 ]]; then
+            warn "还有 $remaining_issues 个问题可能仍然存在，请检查诊断结果"
         else
             success "所有问题已修复！"
         fi
