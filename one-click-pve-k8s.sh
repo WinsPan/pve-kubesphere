@@ -626,17 +626,35 @@ create_vm() {
     log "镜像路径: $image_path"
     log "存储: $STORAGE, 格式: $disk_format"
     
-    local temp_disk
+    # 执行导入命令
     local import_output
     import_output=$(qm importdisk "$vm_id" "$image_path" "$STORAGE" --format "$disk_format" 2>&1)
+    local import_result=$?
     
-    if [[ $? -eq 0 ]]; then
-        temp_disk=$(echo "$import_output" | grep "unused0" | awk '{print $3}')
-        if [[ -n "$temp_disk" ]]; then
-            success "磁盘导入成功: $temp_disk"
+    log "导入命令输出: $import_output"
+    
+    if [[ $import_result -eq 0 ]]; then
+        # 导入成功后，检查VM配置获取unused磁盘
+        sleep 2  # 等待配置更新
+        local unused_disk=$(qm config "$vm_id" | grep "unused0:" | cut -d: -f2 | tr -d ' ')
+        
+        if [[ -n "$unused_disk" ]]; then
+            success "磁盘导入成功: $unused_disk"
+            log "将磁盘移动到scsi0..."
+            
+            # 直接移动unused0到scsi0
+            if qm set "$vm_id" --scsi0 "$unused_disk" --delete unused0; then
+                success "磁盘设置完成"
+            else
+                error "移动磁盘到scsi0失败"
+                log "清理失败的VM..."
+                qm destroy "$vm_id" >/dev/null 2>&1 || true
+                return 1
+            fi
         else
-            error "导入磁盘失败：无法解析磁盘路径"
-            log "导入输出: $import_output"
+            error "导入磁盘失败：未找到unused磁盘"
+            log "VM配置信息:"
+            qm config "$vm_id" || true
             log "清理失败的VM..."
             qm destroy "$vm_id" >/dev/null 2>&1 || true
             return 1
@@ -649,13 +667,7 @@ create_vm() {
         return 1
     fi
     
-    # 设置主磁盘
-    if ! qm set "$vm_id" --scsi0 "$temp_disk"; then
-        error "设置主磁盘失败"
-        log "清理失败的VM..."
-        qm destroy "$vm_id" >/dev/null 2>&1 || true
-        return 1
-    fi
+
     
     # 调整磁盘大小
     log "调整磁盘大小到 ${vm_disk}G..."
