@@ -702,8 +702,8 @@ EOF
         echo "下载Docker GPG密钥..."
         if curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/debian/gpg -o /etc/apt/keyrings/docker.gpg.tmp; then
             mv /etc/apt/keyrings/docker.gpg.tmp /etc/apt/keyrings/docker.gpg
-        elif curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.gpg.tmp; then
-            echo "使用备用Docker GPG密钥..."
+        elif curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian/gpg -o /etc/apt/keyrings/docker.gpg.tmp; then
+            echo "使用清华大学Docker GPG密钥..."
             mv /etc/apt/keyrings/docker.gpg.tmp /etc/apt/keyrings/docker.gpg
         else
             echo "Docker GPG密钥下载失败，跳过Docker仓库"
@@ -799,8 +799,8 @@ EOF
         echo "下载K8S GPG密钥..."
         if curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg.tmp; then
             mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
-        elif curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg.tmp; then
-            echo "使用备用K8S GPG密钥..."
+        elif wget -O /etc/apt/keyrings/kubernetes.gpg.tmp https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg 2>/dev/null; then
+            echo "使用wget下载K8S GPG密钥..."
             mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
         else
             echo "K8S GPG密钥下载失败"
@@ -831,10 +831,15 @@ EOF
             echo "K8S安装失败，尝试备用仓库..."
             rm -f /etc/apt/sources.list.d/kubernetes.list /etc/apt/keyrings/kubernetes.gpg
             
-            # 尝试使用Google官方仓库
-            if curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes-google.gpg; then
-                chmod a+r /etc/apt/keyrings/kubernetes-google.gpg
-                echo "deb [signed-by=/etc/apt/keyrings/kubernetes-google.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+            # 尝试使用系统默认包（最稳定的方案）
+            echo "尝试安装系统默认K8S包..."
+            if apt-get install -y kubeadm kubelet kubectl; then
+                echo "使用系统默认K8S包安装成功"
+                apt-mark hold kubelet kubeadm kubectl
+                systemctl enable kubelet
+                return 0
+            else
+                echo "系统默认K8S包也安装失败"
                 apt-get update -y
                 if ! apt-get install -y kubelet=1.28.2-00 kubeadm=1.28.2-00 kubectl=1.28.2-00; then
                     echo "K8S安装最终失败"
@@ -868,7 +873,7 @@ EOF
             apt-get remove --purge -y docker-ce docker-ce-cli containerd.io kubelet kubeadm kubectl 2>/dev/null || true
             apt-get autoremove -y
             rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/kubernetes.list
-            rm -f /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/kubernetes.gpg /etc/apt/keyrings/kubernetes-google.gpg
+            rm -f /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/kubernetes.gpg
             rm -f /etc/apt/keyrings/docker.gpg.tmp /etc/apt/keyrings/kubernetes.gpg.tmp
             
             echo "重新安装..."
