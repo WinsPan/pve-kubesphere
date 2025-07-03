@@ -31,6 +31,10 @@ readonly SCRIPT_NAME="PVE K8S + KubeSphere 部署工具"
 readonly WORK_DIR="/tmp/pve-k8s-deploy"
 readonly LOG_FILE="$WORK_DIR/deploy.log"
 
+# 全局变量
+STORAGE=""
+DETECTED_BRIDGE=""
+
 # VM配置数组
 readonly VM_IDS=(101 102 103)
 readonly VM_NAMES=("k8s-master" "k8s-worker1" "k8s-worker2")
@@ -43,7 +47,7 @@ readonly VM_DISK=(300 300 300)
 readonly GATEWAY="10.0.0.1"
 readonly DNS="119.29.29.29,8.8.8.8"
 readonly BRIDGE="vmbr0"
-readonly STORAGE="local-lvm"
+# STORAGE将在环境检查时自动检测
 
 # 认证配置
 readonly VM_USER="root"
@@ -180,6 +184,94 @@ download_with_retry() {
 }
 
 #===============================================================================
+# 环境检查和自动检测
+#===============================================================================
+
+# 检测可用存储
+detect_storage() {
+    # 如果已经手动指定存储，验证其可用性
+    if [[ -n "$STORAGE" ]]; then
+        log "验证指定存储: $STORAGE"
+        if ! pvesm status "$STORAGE" >/dev/null 2>&1; then
+            error "指定的存储 $STORAGE 不可用"
+            log "可用存储列表："
+            pvesm status | grep -E "(dir|lvm|zfs)" | grep -v "^Storage"
+            exit 1
+        fi
+        success "使用指定存储: $STORAGE"
+        return 0
+    fi
+    
+    log "自动检测可用存储..."
+    
+    # 获取所有可用存储
+    local storages=($(pvesm status | grep -E "(dir|lvm|zfs)" | grep -v "^Storage" | awk '{print $1}'))
+    
+    if [[ ${#storages[@]} -eq 0 ]]; then
+        error "未找到可用存储"
+        log "请检查PVE存储配置"
+        exit 1
+    fi
+    
+    log "发现可用存储: ${storages[*]}"
+    
+    # 优先选择顺序：local-lvm > local-zfs > local > 其他
+    local preferred_storages=("local-lvm" "local-zfs" "local")
+    
+    for preferred in "${preferred_storages[@]}"; do
+        for storage in "${storages[@]}"; do
+            if [[ "$storage" == "$preferred" ]]; then
+                STORAGE="$storage"
+                success "自动选择存储: $STORAGE"
+                return 0
+            fi
+        done
+    done
+    
+    # 如果没有找到首选存储，使用第一个可用的
+    STORAGE="${storages[0]}"
+    success "使用存储: $STORAGE"
+    
+    # 验证存储可用性
+    if ! pvesm status "$STORAGE" >/dev/null 2>&1; then
+        error "存储 $STORAGE 不可用"
+        exit 1
+    fi
+}
+
+# 检测网络桥接
+detect_bridge() {
+    log "检测网络桥接..."
+    
+    # 获取所有网络桥接
+    local bridges=($(ip link show | grep -E "^[0-9]+: vmbr" | awk -F': ' '{print $2}'))
+    
+    if [[ ${#bridges[@]} -eq 0 ]]; then
+        warn "未检测到vmbr桥接，尝试检测其他网络接口..."
+        bridges=($(ip link show | grep -E "^[0-9]+: (br|bridge)" | awk -F': ' '{print $2}'))
+    fi
+    
+    if [[ ${#bridges[@]} -eq 0 ]]; then
+        warn "未检测到网络桥接，使用默认值: vmbr0"
+        DETECTED_BRIDGE="vmbr0"
+    else
+        # 优先使用vmbr0，否则使用第一个找到的
+        for bridge in "${bridges[@]}"; do
+            if [[ "$bridge" == "vmbr0" ]]; then
+                DETECTED_BRIDGE="vmbr0"
+                break
+            fi
+        done
+        
+        if [[ -z "$DETECTED_BRIDGE" ]]; then
+            DETECTED_BRIDGE="${bridges[0]}"
+        fi
+    fi
+    
+    success "检测到网络桥接: $DETECTED_BRIDGE"
+}
+
+#===============================================================================
 # 环境检查
 #===============================================================================
 
@@ -210,11 +302,18 @@ check_environment() {
     # 创建工作目录
     mkdir -p "$WORK_DIR"
     
-    # 检查存储
-    if ! pvesm status "$STORAGE" >/dev/null 2>&1; then
-        error "存储 $STORAGE 不可用"
-        exit 1
-    fi
+    # 自动检测可用存储
+    detect_storage
+    
+    # 自动检测网络桥接
+    detect_bridge
+    
+    # 显示检测结果
+    log "环境配置信息："
+    log "  存储: $STORAGE"
+    log "  网络桥接: ${DETECTED_BRIDGE:-$BRIDGE}"
+    log "  网关: $GATEWAY"
+    log "  DNS: $DNS"
     
     success "环境检查完成"
 }
@@ -364,7 +463,7 @@ create_vm() {
         --name "$vm_name" \
         --cores "$vm_cores" \
         --memory "$vm_memory" \
-        --net0 "virtio,bridge=$BRIDGE" \
+        --net0 "virtio,bridge=${DETECTED_BRIDGE:-$BRIDGE}" \
         --scsihw virtio-scsi-pci \
         --scsi0 "$STORAGE:$vm_disk,format=qcow2" \
         --ide2 "$STORAGE:cloudinit" \
@@ -1265,20 +1364,49 @@ main_menu() {
 #===============================================================================
 
 main() {
-    # 处理命令行参数（帮助和版本信息不需要环境检查）
+    # 解析命令行参数
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --storage)
+                STORAGE="$2"
+                shift 2
+                ;;
+            --bridge)
+                DETECTED_BRIDGE="$2"
+                shift 2
+                ;;
+            --help|-h|--version|-v|--auto)
+                break
+                ;;
+            *)
+                echo "错误：未知参数: $1"
+                echo "使用 --help 查看帮助信息"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # 处理主要命令（帮助和版本信息不需要环境检查）
     case "${1:-}" in
         --help|-h)
             echo "用法: $0 [选项]"
             echo ""
             echo "选项:"
-            echo "  -h, --help     显示帮助信息"
-            echo "  -v, --version  显示版本信息"
-            echo "  --auto         自动部署模式"
+            echo "  -h, --help              显示帮助信息"
+            echo "  -v, --version           显示版本信息"
+            echo "  --auto                  自动部署模式"
+            echo "  --storage <name>        指定存储名称（默认自动检测）"
+            echo "  --bridge <name>         指定网络桥接（默认自动检测）"
             echo ""
             echo "VM配置:"
             for i in "${!VM_IDS[@]}"; do
                 echo "  ${VM_NAMES[$i]} (${VM_IDS[$i]}): ${VM_IPS[$i]} - ${VM_CORES[$i]}核${VM_MEMORY[$i]}MB内存${VM_DISK[$i]}GB硬盘"
             done
+            echo ""
+            echo "示例:"
+            echo "  $0 --storage local"
+            echo "  $0 --bridge vmbr1"
+            echo "  $0 --storage local-zfs --auto"
             echo ""
             exit 0
             ;;
