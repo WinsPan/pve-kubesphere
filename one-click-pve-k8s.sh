@@ -9,7 +9,7 @@
 #
 # 作者: WinsPan
 # 版本: 5.0 (重构版)
-# 日期: $(date '+%Y-%m-%d')
+# 日期: 2025-01-03
 #
 # 主要功能:
 #   🚀 一键全自动部署 K8S + KubeSphere
@@ -42,7 +42,7 @@
 #
 # ==========================================
 
-set -uo pipefail
+set -u
 
 # ==========================================
 # 全局配置中心
@@ -1111,14 +1111,20 @@ warn()    { echo -e "${YELLOW}[WARN]${NC} $(date '+%H:%M:%S') $1" | tee -a "$LOG
 error()   { echo -e "${RED}[ERROR]${NC} $(date '+%H:%M:%S') $1" | tee -a "$LOG_FILE"; }
 success() { echo -e "${GREEN}[SUCCESS]${NC} $(date '+%H:%M:%S') $1" | tee -a "$LOG_FILE"; }
 
-# 错误处理
+# 错误处理（仅在严重错误时退出）
 handle_error() {
     local line_no=$1
-    error "脚本在第 $line_no 行执行失败"
-    error "详细日志: $LOG_FILE"
-    exit 1
+    local exit_code=$?
+    
+    # 只有在严重错误时才退出（退出码大于1）
+    if [[ $exit_code -gt 1 ]]; then
+        error "脚本在第 $line_no 行遇到严重错误（退出码: $exit_code）"
+        error "详细日志: $LOG_FILE"
+        exit $exit_code
+    fi
 }
 
+# 仅在严重错误时触发trap
 trap 'handle_error ${LINENO}' ERR
 
 # 解析虚拟机配置
@@ -4432,6 +4438,20 @@ main() {
     # 设置信号处理
     trap cleanup_and_exit SIGINT SIGTERM
     
+    # 先处理命令行参数（帮助和版本信息不需要初始化系统）
+    case "${1:-}" in
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --version|-v)
+            echo -e "${BOLD}${SCRIPT_NAME} v${SCRIPT_VERSION}${NC}"
+            echo -e "作者: ${SCRIPT_AUTHOR}"
+            echo -e "描述: ${SCRIPT_DESCRIPTION}"
+            exit 0
+            ;;
+    esac
+    
     # 初始化系统
     init_system
     
@@ -4439,7 +4459,7 @@ main() {
     log_info "脚本启动 - $SCRIPT_NAME v$SCRIPT_VERSION"
     log_audit "SCRIPT_START version=$SCRIPT_VERSION user=$(whoami)"
     
-    # 处理命令行参数
+    # 处理其他命令行参数
     handle_arguments "$@"
     
     # 检查环境
@@ -4457,5 +4477,5 @@ main() {
 
 # 脚本入口
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-main "$@" 
-fi 
+    main "$@"
+fi
