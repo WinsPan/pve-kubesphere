@@ -698,42 +698,47 @@ EOF
         # 创建keyrings目录
         mkdir -p /etc/apt/keyrings
         
-        # 下载并安装Docker GPG密钥（新方式）
+        # 下载并安装Docker GPG密钥（修复版本）
         echo "下载Docker GPG密钥..."
-        if curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/debian/gpg -o /etc/apt/keyrings/docker.gpg.tmp; then
-            mv /etc/apt/keyrings/docker.gpg.tmp /etc/apt/keyrings/docker.gpg
-        elif curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian/gpg -o /etc/apt/keyrings/docker.gpg.tmp; then
-            echo "使用清华大学Docker GPG密钥..."
-            mv /etc/apt/keyrings/docker.gpg.tmp /etc/apt/keyrings/docker.gpg
+        skip_docker_repo=false
+        
+        # 创建keyrings目录
+        mkdir -p /etc/apt/keyrings
+        
+        # 尝试多个Docker GPG密钥源
+        if curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; then
+            echo "阿里云Docker GPG密钥安装成功"
+        elif curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; then
+            echo "清华大学Docker GPG密钥安装成功"
+        elif curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; then
+            echo "Docker官方GPG密钥安装成功"
         else
-            echo "Docker GPG密钥下载失败，跳过Docker仓库"
-            rm -f /etc/apt/keyrings/docker.gpg.tmp
-            # 不添加Docker仓库，使用系统默认docker.io包
+            echo "所有Docker GPG密钥下载失败，使用系统默认包"
+            skip_docker_repo=true
+            # 直接安装系统默认包
             apt-get update -y
             if apt-get install -y docker.io containerd; then
-                echo "使用系统默认Docker包安装成功"
+                echo "系统默认Docker包安装成功"
             else
                 echo "Docker安装失败"
                 exit 1
             fi
-            # 跳过后续Docker仓库配置
-            skip_docker_repo=true
         fi
         
-        if [ "$skip_docker_repo" != "true" ]; then
+        if [ "$skip_docker_repo" = false ]; then
             chmod a+r /etc/apt/keyrings/docker.gpg
             # 验证GPG密钥文件
             if [ ! -s /etc/apt/keyrings/docker.gpg ]; then
                 echo "Docker GPG密钥文件为空，使用系统默认包"
                 rm -f /etc/apt/keyrings/docker.gpg
+                skip_docker_repo=true
                 apt-get update -y
                 apt-get install -y docker.io containerd
-                skip_docker_repo=true
             fi
         fi
         
         # 添加Docker仓库（新格式）
-        if [ "$skip_docker_repo" != "true" ]; then
+        if [ "$skip_docker_repo" = false ]; then
             echo "添加Docker CE仓库..."
             echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list
             
@@ -795,32 +800,30 @@ EOF
         
         # 安装K8S
         echo "安装K8S..."
-        # 下载并安装K8S GPG密钥（多个备用方案）
+        # 下载并安装K8S GPG密钥（修复版本）
         echo "下载K8S GPG密钥..."
         
-        # 尝试阿里云镜像源
-        if curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg.tmp; then
-            echo "使用阿里云镜像源下载K8S GPG密钥..."
-            mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
+        # 创建keyrings目录
+        mkdir -p /etc/apt/keyrings
+        
+        # 尝试多个K8S GPG密钥源
+        K8S_REPO_URL=""
+        
+        # 1. 尝试阿里云镜像源
+        if curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg; then
+            echo "阿里云K8S GPG密钥安装成功"
             K8S_REPO_URL="https://mirrors.aliyun.com/kubernetes/apt/"
-        elif wget -O /etc/apt/keyrings/kubernetes.gpg.tmp https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg 2>/dev/null; then
-            echo "使用wget下载阿里云K8S GPG密钥..."
-            mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
-            K8S_REPO_URL="https://mirrors.aliyun.com/kubernetes/apt/"
-        # 尝试新的K8S官方仓库
-        elif curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key -o /etc/apt/keyrings/kubernetes.gpg.tmp; then
-            echo "使用新的K8S官方仓库下载GPG密钥..."
-            mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
+        # 2. 尝试新的K8S官方仓库
+        elif curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg; then
+            echo "新K8S官方仓库GPG密钥安装成功"
             K8S_REPO_URL="https://pkgs.k8s.io/core:/stable:/v1.28/deb/"
-        # 尝试旧的官方仓库（可能被墙）
-        elif curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg.tmp; then
-            echo "使用旧的K8S官方仓库下载GPG密钥..."
-            mv /etc/apt/keyrings/kubernetes.gpg.tmp /etc/apt/keyrings/kubernetes.gpg
+        # 3. 尝试旧的官方仓库
+        elif curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg; then
+            echo "旧K8S官方仓库GPG密钥安装成功"
             K8S_REPO_URL="https://packages.cloud.google.com/apt/"
         else
-            echo "所有K8S GPG密钥下载失败，尝试使用系统默认包..."
-            rm -f /etc/apt/keyrings/kubernetes.gpg.tmp
-            # 不使用外部仓库，直接尝试系统默认包
+            echo "所有K8S GPG密钥下载失败，将使用系统默认包..."
+            rm -f /etc/apt/keyrings/kubernetes.gpg
             K8S_REPO_URL=""
         fi
         
@@ -884,16 +887,108 @@ EOF
                 echo "系统默认K8S包安装成功"
                 K8S_INSTALL_SUCCESS=true
             else
-                echo "系统默认K8S包安装失败，尝试无版本限制安装..."
-                # 最后尝试：不指定版本，安装任何可用版本
-                if apt-get install -y kubelet kubeadm kubectl; then
-                    echo "无版本限制K8S安装成功"
-                    K8S_INSTALL_SUCCESS=true
+                echo "系统默认K8S包安装失败，尝试snap安装..."
+                # 尝试使用snap安装
+                if command -v snap >/dev/null 2>&1; then
+                    if snap install kubectl --classic && snap install kubeadm --classic; then
+                        echo "Snap K8S安装成功"
+                        K8S_INSTALL_SUCCESS=true
+                        # 创建符号链接到标准路径
+                        ln -sf /snap/bin/kubectl /usr/local/bin/kubectl
+                        ln -sf /snap/bin/kubeadm /usr/local/bin/kubeadm
+                        # 手动安装kubelet（snap版本可能不包含）
+                        if ! command -v kubelet >/dev/null 2>&1; then
+                            echo "手动安装kubelet..."
+                            # 从GitHub下载kubelet二进制文件
+                            curl -L "https://dl.k8s.io/release/v1.28.2/bin/linux/amd64/kubelet" -o /usr/local/bin/kubelet
+                            chmod +x /usr/local/bin/kubelet
+                        fi
+                    fi
+                else
+                    echo "snap不可用，安装snap..."
+                    apt-get update && apt-get install -y snapd
+                    systemctl enable snapd && systemctl start snapd
+                    # 重试snap安装
+                    if snap install kubectl --classic && snap install kubeadm --classic; then
+                        echo "Snap K8S安装成功"
+                        K8S_INSTALL_SUCCESS=true
+                        ln -sf /snap/bin/kubectl /usr/local/bin/kubectl
+                        ln -sf /snap/bin/kubeadm /usr/local/bin/kubeadm
+                    fi
                 fi
             fi
         fi
         
-        # 检查安装结果
+        # 最后的备用方案：直接下载二进制文件
+        if [ "$K8S_INSTALL_SUCCESS" = false ]; then
+            echo "尝试直接下载K8S二进制文件..."
+            K8S_VERSION="v1.28.2"
+            
+            # 下载kubectl
+            if curl -L "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl; then
+                chmod +x /usr/local/bin/kubectl
+                echo "kubectl下载成功"
+            else
+                echo "kubectl下载失败"
+                exit 1
+            fi
+            
+            # 下载kubeadm
+            if curl -L "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubeadm" -o /usr/local/bin/kubeadm; then
+                chmod +x /usr/local/bin/kubeadm
+                echo "kubeadm下载成功"
+            else
+                echo "kubeadm下载失败"
+                exit 1
+            fi
+            
+            # 下载kubelet
+            if curl -L "https://dl.k8s.io/release/$K8S_VERSION/bin/linux/amd64/kubelet" -o /usr/local/bin/kubelet; then
+                chmod +x /usr/local/bin/kubelet
+                echo "kubelet下载成功"
+                
+                # 创建kubelet服务文件
+                cat > /etc/systemd/system/kubelet.service << "EOF"
+[Unit]
+Description=kubelet: The Kubernetes Node Agent
+Documentation=https://kubernetes.io/docs/home/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/kubelet
+Restart=always
+StartLimitInterval=0
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                
+                # 创建kubelet配置目录
+                mkdir -p /etc/systemd/system/kubelet.service.d
+                cat > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf << "EOF"
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+EnvironmentFile=-/etc/default/kubelet
+ExecStart=
+ExecStart=/usr/local/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+EOF
+                
+                systemctl daemon-reload
+                systemctl enable kubelet
+                
+                K8S_INSTALL_SUCCESS=true
+                echo "K8S二进制文件安装成功"
+            else
+                echo "kubelet下载失败"
+                exit 1
+            fi
+        fi
+        
+        # 最终检查安装结果
         if [ "$K8S_INSTALL_SUCCESS" = false ]; then
             echo "所有K8S安装方案都失败了"
             exit 1
@@ -2302,8 +2397,8 @@ fix_k8s_repository() {
             
             # 1. 尝试阿里云镜像源
             echo "尝试阿里云K8S镜像源..."
-            if curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg; then
-                echo "阿里云GPG密钥下载成功"
+            if curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg; then
+                echo "阿里云GPG密钥安装成功"
                 chmod a+r /etc/apt/keyrings/kubernetes.gpg
                 echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
                 
@@ -2319,8 +2414,8 @@ fix_k8s_repository() {
             
             # 2. 尝试新的K8S官方仓库
             echo "尝试新的K8S官方仓库..."
-            if curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key -o /etc/apt/keyrings/kubernetes.gpg; then
-                echo "新官方GPG密钥下载成功"
+            if curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg; then
+                echo "新官方GPG密钥安装成功"
                 chmod a+r /etc/apt/keyrings/kubernetes.gpg
                 echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
                 
@@ -2336,8 +2431,8 @@ fix_k8s_repository() {
             
             # 3. 尝试旧的K8S官方仓库
             echo "尝试旧的K8S官方仓库..."
-            if curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /etc/apt/keyrings/kubernetes.gpg; then
-                echo "旧官方GPG密钥下载成功"
+            if curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg; then
+                echo "旧官方GPG密钥安装成功"
                 chmod a+r /etc/apt/keyrings/kubernetes.gpg
                 echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://packages.cloud.google.com/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
                 
