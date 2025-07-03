@@ -113,6 +113,19 @@ get_master_ip() {
     parse_vm_config "101" "ip"
 }
 
+# 根据IP获取VM名称
+get_vm_name_by_ip() {
+    local target_ip="$1"
+    for vm_id in "${!VM_CONFIGS[@]}"; do
+        local ip=$(parse_vm_config "$vm_id" "ip")
+        if [[ "$ip" == "$target_ip" ]]; then
+            echo $(parse_vm_config "$vm_id" "name")
+            return
+        fi
+    done
+    echo "unknown"
+}
+
 # 重试执行函数
 retry_command() {
     local max_attempts="$1"
@@ -623,11 +636,41 @@ wait_for_all_vms() {
 # ==========================================
 # K8S部署
 # ==========================================
+# 验证Docker和K8S安装
+verify_docker_k8s_installation() {
+    local ip="$1"
+    local verify_script='
+        # 检查Docker
+        if ! command -v docker &>/dev/null || ! systemctl is-active docker &>/dev/null; then
+            echo "Docker验证失败"
+            exit 1
+        fi
+        
+        # 检查containerd
+        if ! command -v containerd &>/dev/null || ! systemctl is-active containerd &>/dev/null; then
+            echo "containerd验证失败"
+            exit 1
+        fi
+        
+        # 检查K8S组件
+        if ! command -v kubectl &>/dev/null || ! command -v kubeadm &>/dev/null || ! command -v kubelet &>/dev/null; then
+            echo "K8S组件验证失败"
+            exit 1
+        fi
+        
+        echo "Docker和K8S验证成功"
+    '
+    
+    execute_remote_command "$ip" "$verify_script" 1
+}
+
 install_docker_k8s() {
     local ip="$1"
     log "在 $ip 安装Docker和K8S..."
     
     local install_script='
+        set -e
+        
         # 配置国内镜像源
         echo "配置镜像源..."
         cat > /etc/apt/sources.list << "EOF"
@@ -637,15 +680,23 @@ deb https://mirrors.ustc.edu.cn/debian/ bookworm-backports main contrib non-free
 deb https://mirrors.ustc.edu.cn/debian-security/ bookworm-security main contrib non-free non-free-firmware
 EOF
         
+        # 更新包列表
+        apt-get update -y || { echo "APT更新失败"; exit 1; }
+        
         # 安装Docker
         echo "安装Docker..."
-        curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/debian/gpg | apt-key add - || \
-        curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
+        if ! curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/debian/gpg | apt-key add -; then
+            echo "尝试备用Docker GPG密钥..."
+            curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
+        fi
         
         echo "deb [arch=amd64] https://mirrors.aliyun.com/docker-ce/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list
         
         apt-get update -y
-        apt-get install -y docker-ce docker-ce-cli containerd.io
+        if ! apt-get install -y docker-ce docker-ce-cli containerd.io; then
+            echo "Docker安装失败"
+            exit 1
+        fi
         
         # 配置Docker镜像加速
         mkdir -p /etc/docker
@@ -669,34 +720,88 @@ EOF
         sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
         sed -i "s|registry.k8s.io/pause:3.6|registry.aliyuncs.com/google_containers/pause:3.6|g" /etc/containerd/config.toml
         
+        # 启动Docker服务
         systemctl daemon-reload
         systemctl enable docker containerd
         systemctl restart docker containerd
         
+        # 验证Docker安装
+        if ! docker --version; then
+            echo "Docker启动失败"
+            exit 1
+        fi
+        
         # 安装K8S
         echo "安装K8S..."
-        curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | apt-key add - || \
-        curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+        if ! curl -fsSL https://mirrors.aliyun.com/kubernetes/apt/doc/apt-key.gpg | apt-key add -; then
+            echo "尝试备用K8S GPG密钥..."
+            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+        fi
         
         echo "deb https://mirrors.aliyun.com/kubernetes/apt/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
         
         apt-get update -y
-        apt-get install -y kubelet=1.28.2-00 kubeadm=1.28.2-00 kubectl=1.28.2-00
-        apt-mark hold kubelet kubeadm kubectl
+        if ! apt-get install -y kubelet=1.28.2-00 kubeadm=1.28.2-00 kubectl=1.28.2-00; then
+            echo "K8S安装失败"
+            exit 1
+        fi
         
+        apt-mark hold kubelet kubeadm kubectl
         systemctl enable kubelet
+        
+        # 验证K8S安装
+        if ! kubectl version --client && ! kubeadm version; then
+            echo "K8S组件验证失败"
+            exit 1
+        fi
         
         echo "Docker和K8S安装完成"
     '
     
-    execute_remote_command "$ip" "$install_script"
+    # 尝试安装，如果失败则重试
+    if ! execute_remote_command "$ip" "$install_script"; then
+        warn "$ip Docker/K8S安装失败，尝试修复..."
+        
+        # 修复安装
+        local fix_script='
+            echo "清理失败的安装..."
+            apt-get remove --purge -y docker-ce docker-ce-cli containerd.io kubelet kubeadm kubectl 2>/dev/null || true
+            apt-get autoremove -y
+            rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/kubernetes.list
+            
+            echo "重新安装..."
+        '
+        
+        execute_remote_command "$ip" "$fix_script"
+        
+        # 重新尝试安装
+        if ! execute_remote_command "$ip" "$install_script"; then
+            error "$ip Docker/K8S安装最终失败"
+            return 1
+        fi
+    fi
+    
+    # 验证安装
+    if verify_docker_k8s_installation "$ip"; then
+        success "$ip Docker和K8S安装验证成功"
+    else
+        error "$ip Docker和K8S安装验证失败"
+        return 1
+    fi
 }
 
 init_k8s_master() {
     local master_ip=$(get_master_ip)
     log "初始化K8S主节点..."
     
+    # 首先验证master节点的Docker和K8S安装
+    if ! verify_docker_k8s_installation "$master_ip"; then
+        error "Master节点Docker/K8S验证失败，重新安装..."
+        install_docker_k8s "$master_ip"
+    fi
+    
     local init_script="
+        set -e
         echo '开始初始化K8S主节点...'
         
         # 清理之前的配置
@@ -704,30 +809,60 @@ init_k8s_master() {
         rm -rf /etc/kubernetes/manifests/* 2>/dev/null || true
         rm -rf /var/lib/etcd/* 2>/dev/null || true
         
+        # 确保Docker和containerd运行
+        systemctl restart docker containerd
+        sleep 5
+        
         # 使用国内镜像初始化
-        kubeadm init \
+        if ! kubeadm init \
             --apiserver-advertise-address=$master_ip \
             --pod-network-cidr=$POD_SUBNET \
             --kubernetes-version=$K8S_VERSION \
             --image-repository=registry.aliyuncs.com/google_containers \
-            --ignore-preflight-errors=all
+            --ignore-preflight-errors=all; then
+            echo 'K8S初始化失败'
+            exit 1
+        fi
         
+        # 配置kubectl
         mkdir -p /root/.kube
         cp /etc/kubernetes/admin.conf /root/.kube/config
         
+        # 验证kubectl工作
+        if ! kubectl get nodes; then
+            echo 'kubectl配置失败'
+            exit 1
+        fi
+        
         echo '下载Calico配置文件...'
         # 下载并修改Calico配置
-        wget -O calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml || \
-        curl -o calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
-        
-        # 应用Calico网络
-        kubectl apply -f calico.yaml
+        if ! wget -O calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml; then
+            if ! curl -o calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml; then
+                echo 'Calico下载失败，使用备用方案'
+                kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml || exit 1
+            else
+                kubectl apply -f calico.yaml || exit 1
+            fi
+        else
+            kubectl apply -f calico.yaml || exit 1
+        fi
         
         echo 'K8S主节点初始化完成'
     "
     
-    execute_remote_command "$master_ip" "$init_script"
-    success "K8S主节点初始化完成"
+    if execute_remote_command "$master_ip" "$init_script"; then
+        success "K8S主节点初始化完成"
+        
+        # 验证主节点状态
+        local verify_script="
+            kubectl get nodes
+            kubectl get pods --all-namespaces
+        "
+        execute_remote_command "$master_ip" "$verify_script" || warn "主节点状态检查有警告"
+    else
+        error "K8S主节点初始化失败"
+        return 1
+    fi
 }
 
 join_workers() {
@@ -736,6 +871,11 @@ join_workers() {
     # 获取加入命令
     local join_cmd=$(execute_remote_command "$master_ip" "kubeadm token create --print-join-command")
     
+    if [[ -z "$join_cmd" ]]; then
+        error "获取集群加入令牌失败"
+        return 1
+    fi
+    
     # 加入worker节点
     for vm_id in "${!VM_CONFIGS[@]}"; do
         if [[ "$vm_id" != "101" ]]; then  # 跳过master节点
@@ -743,9 +883,86 @@ join_workers() {
             local worker_name=$(parse_vm_config "$vm_id" "name")
             
             log "将 $worker_name 加入集群..."
-            execute_remote_command "$worker_ip" "kubeadm reset -f; $join_cmd --ignore-preflight-errors=all"
+            
+            # 首先验证worker节点的Docker和K8S安装
+            if ! verify_docker_k8s_installation "$worker_ip"; then
+                error "Worker节点 $worker_name Docker/K8S验证失败，重新安装..."
+                install_docker_k8s "$worker_ip"
+            fi
+            
+            local join_script="
+                set -e
+                echo '开始加入worker节点...'
+                
+                # 重置节点
+                kubeadm reset -f 2>/dev/null || true
+                
+                # 确保Docker和containerd运行
+                systemctl restart docker containerd
+                sleep 5
+                
+                # 验证containerd socket
+                if ! systemctl is-active containerd; then
+                    echo 'containerd未运行，启动containerd...'
+                    systemctl start containerd
+                    sleep 3
+                fi
+                
+                # 验证Docker
+                if ! docker ps &>/dev/null; then
+                    echo 'Docker未正常工作'
+                    exit 1
+                fi
+                
+                # 加入集群
+                if ! $join_cmd --ignore-preflight-errors=all; then
+                    echo 'Worker节点加入失败'
+                    exit 1
+                fi
+                
+                echo 'Worker节点加入完成'
+            "
+            
+            if execute_remote_command "$worker_ip" "$join_script"; then
+                success "Worker节点 $worker_name 加入完成"
+                
+                # 验证节点状态
+                local verify_script="
+                    kubectl get nodes | grep $worker_name || kubectl get nodes
+                "
+                execute_remote_command "$master_ip" "$verify_script" || warn "Worker节点 $worker_name 状态检查有警告"
+            else
+                error "Worker节点 $worker_name 加入失败"
+                
+                # 尝试修复
+                warn "尝试修复Worker节点 $worker_name..."
+                local fix_script="
+                    echo '修复Worker节点...'
+                    
+                    # 清理失败的状态
+                    kubeadm reset -f
+                    
+                    # 重启服务
+                    systemctl restart docker containerd kubelet
+                    sleep 10
+                    
+                    # 重新加入
+                    $join_cmd --ignore-preflight-errors=all
+                "
+                
+                if execute_remote_command "$worker_ip" "$fix_script"; then
+                    success "Worker节点 $worker_name 修复成功"
+                else
+                    error "Worker节点 $worker_name 修复失败，请手动检查"
+                fi
+            fi
         fi
     done
+    
+    # 最终验证集群状态
+    log "验证集群状态..."
+    local cluster_status=$(execute_remote_command "$master_ip" "kubectl get nodes -o wide" 1)
+    echo "$cluster_status"
     
     success "所有worker节点加入完成"
 }
@@ -798,6 +1015,126 @@ deploy_kubesphere() {
 }
 
 # ==========================================
+# 修复功能
+# ==========================================
+fix_docker_k8s() {
+    log "修复Docker和K8S安装..."
+    
+    local all_ips=($(get_all_ips))
+    for ip in "${all_ips[@]}"; do
+        local vm_name=$(get_vm_name_by_ip "$ip")
+        log "修复 $vm_name ($ip) 的Docker和K8S..."
+        
+        # 检查当前状态
+        local status_script='
+            echo "=== 检查当前状态 ==="
+            echo "Docker状态: $(systemctl is-active docker 2>/dev/null || echo "未安装")"
+            echo "containerd状态: $(systemctl is-active containerd 2>/dev/null || echo "未安装")"
+            echo "kubelet状态: $(systemctl is-active kubelet 2>/dev/null || echo "未安装")"
+            echo "kubectl版本: $(kubectl version --client 2>/dev/null || echo "未安装")"
+        '
+        
+        execute_remote_command "$ip" "$status_script"
+        
+        # 强制重新安装
+        if ! verify_docker_k8s_installation "$ip"; then
+            warn "$vm_name Docker/K8S验证失败，重新安装..."
+            install_docker_k8s "$ip"
+        else
+            success "$vm_name Docker/K8S验证成功"
+        fi
+    done
+}
+
+fix_k8s_cluster() {
+    log "修复K8S集群..."
+    
+    local master_ip=$(get_master_ip)
+    
+    # 检查master节点状态
+    log "检查master节点状态..."
+    local master_status=$(execute_remote_command "$master_ip" "kubectl get nodes 2>/dev/null || echo 'CLUSTER_NOT_READY'" 1)
+    
+    if [[ "$master_status" == "CLUSTER_NOT_READY" ]]; then
+        warn "K8S集群未就绪，重新初始化master节点..."
+        init_k8s_master
+    else
+        log "Master节点状态正常"
+        echo "$master_status"
+    fi
+    
+    # 检查worker节点
+    log "检查worker节点状态..."
+    for vm_id in "${!VM_CONFIGS[@]}"; do
+        if [[ "$vm_id" != "101" ]]; then
+            local worker_ip=$(parse_vm_config "$vm_id" "ip")
+            local worker_name=$(parse_vm_config "$vm_id" "name")
+            
+            # 检查节点是否在集群中
+            local node_in_cluster=$(execute_remote_command "$master_ip" "kubectl get nodes | grep $worker_name || echo 'NOT_FOUND'" 1)
+            
+            if [[ "$node_in_cluster" == "NOT_FOUND" ]]; then
+                warn "Worker节点 $worker_name 不在集群中，重新加入..."
+                
+                # 获取加入命令
+                local join_cmd=$(execute_remote_command "$master_ip" "kubeadm token create --print-join-command")
+                
+                if [[ -n "$join_cmd" ]]; then
+                    local rejoin_script="
+                        kubeadm reset -f
+                        systemctl restart docker containerd kubelet
+                        sleep 5
+                        $join_cmd --ignore-preflight-errors=all
+                    "
+                    
+                    if execute_remote_command "$worker_ip" "$rejoin_script"; then
+                        success "Worker节点 $worker_name 重新加入成功"
+                    else
+                        error "Worker节点 $worker_name 重新加入失败"
+                    fi
+                else
+                    error "获取集群加入令牌失败"
+                fi
+            else
+                log "Worker节点 $worker_name 状态: $node_in_cluster"
+            fi
+        fi
+    done
+}
+
+fix_network_connectivity() {
+    log "修复网络连接问题..."
+    
+    local all_ips=($(get_all_ips))
+    for ip in "${all_ips[@]}"; do
+        local vm_name=$(get_vm_name_by_ip "$ip")
+        log "修复 $vm_name ($ip) 的网络连接..."
+        
+        local network_fix_script='
+            echo "修复网络连接..."
+            
+            # 配置DNS
+            echo "nameserver 119.29.29.29" > /etc/resolv.conf
+            echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+            echo "nameserver 10.0.0.1" >> /etc/resolv.conf
+            
+            # 重启网络服务
+            systemctl restart networking
+            
+            # 测试网络连接
+            echo "测试网络连接..."
+            ping -c 2 119.29.29.29 || echo "DNS连接失败"
+            ping -c 2 baidu.com || echo "外网连接失败"
+            
+            # 测试镜像源
+            curl -I https://mirrors.ustc.edu.cn/debian/ || echo "镜像源连接失败"
+        '
+        
+        execute_remote_command "$ip" "$network_fix_script"
+    done
+}
+
+# ==========================================
 # 状态检查
 # ==========================================
 check_status() {
@@ -813,6 +1150,9 @@ check_status() {
         
         echo "=== KubeSphere状态 ==="
         kubectl get pods -n kubesphere-system
+        
+        echo "=== 集群信息 ==="
+        kubectl cluster-info
     '
 }
 
@@ -858,11 +1198,16 @@ show_menu() {
     echo -e "  ${CYAN}5.${NC} 部署KubeSphere"
     echo ""
     echo -e "${YELLOW}修复功能：${NC}"
-    echo -e "  ${CYAN}6.${NC} 修复SSH配置"
-    echo -e "  ${CYAN}7.${NC} 检查集群状态"
+    echo -e "  ${CYAN}6.${NC} 修复Docker和K8S安装"
+    echo -e "  ${CYAN}7.${NC} 修复K8S集群"
+    echo -e "  ${CYAN}8.${NC} 修复网络连接"
+    echo -e "  ${CYAN}9.${NC} 修复SSH配置"
+    echo ""
+    echo -e "${BLUE}状态检查：${NC}"
+    echo -e "  ${CYAN}10.${NC} 检查集群状态"
     echo ""
     echo -e "${RED}管理功能：${NC}"
-    echo -e "  ${CYAN}8.${NC} 清理所有资源"
+    echo -e "  ${CYAN}11.${NC} 清理所有资源"
     echo -e "  ${CYAN}0.${NC} 退出"
     echo -e "${YELLOW}══════════════════════════════════════${NC}"
 }
@@ -881,7 +1226,7 @@ main() {
         show_banner
         show_menu
         
-        read -p "请选择操作 [0-8]: " choice
+        read -p "请选择操作 [0-11]: " choice
         
         case $choice in
             1)
@@ -897,9 +1242,12 @@ main() {
             3) create_all_vms && wait_for_all_vms ;;
             4) deploy_k8s ;;
             5) deploy_kubesphere ;;
-            6) fix_all_ssh_configs ;;
-            7) check_status ;;
-            8) cleanup_all ;;
+            6) fix_docker_k8s ;;
+            7) fix_k8s_cluster ;;
+            8) fix_network_connectivity ;;
+            9) fix_all_ssh_configs ;;
+            10) check_status ;;
+            11) cleanup_all ;;
             0) 
                 log "退出脚本"
                 exit 0 
