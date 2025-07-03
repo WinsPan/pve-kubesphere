@@ -20,6 +20,7 @@ readonly YELLOW='\e[1;33m'
 readonly RED='\e[0;31m'
 readonly BLUE='\e[0;34m'
 readonly CYAN='\e[0;36m'
+readonly PURPLE='\e[0;35m'
 readonly NC='\e[0m'
 
 # 系统配置
