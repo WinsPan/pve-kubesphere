@@ -4182,9 +4182,8 @@ show_banner() {
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     
-    # 显示系统和集群状态
+    # 显示系统状态（不检测集群状态）
     show_system_status
-    show_cluster_status
     echo ""
 }
 
@@ -4269,7 +4268,7 @@ show_diagnose_menu() {
     echo -e "${BOLD}${BLUE}└──────────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     echo -e "  ${CYAN}1.${NC} 🔍 系统诊断"
-    echo -e "  ${CYAN}2.${NC} 📊 检查集群状态"
+    echo -e "  ${CYAN}2.${NC} 📊 查看集群状态"
     echo -e "  ${CYAN}3.${NC} ❤️  集群健康检查"
     echo -e "  ${CYAN}4.${NC} 📋 查看系统日志"
     echo -e "  ${CYAN}5.${NC} 📄 生成故障报告"
@@ -4328,7 +4327,7 @@ show_menu() {
     echo -e "  ${CYAN}9.${NC} 修复SSH配置           ${CYAN}12.${NC} 一键修复所有    ${CYAN}23.${NC} 修复K8S仓库"
     echo ""
     echo -e "${BLUE}🔍 诊断功能：${NC}"
-    echo -e "  ${CYAN}10.${NC} 系统诊断              ${CYAN}11.${NC} 检查集群状态    ${CYAN}21.${NC} 集群健康检查"
+    echo -e "  ${CYAN}10.${NC} 系统诊断              ${CYAN}11.${NC} 查看集群状态    ${CYAN}21.${NC} 集群健康检查"
     echo -e "  ${CYAN}15.${NC} 查看系统日志          ${CYAN}16.${NC} 生成故障报告    ${CYAN}17.${NC} 快速修复手册"
     echo ""
     echo -e "${PURPLE}⚙️ 高级功能：${NC}"
