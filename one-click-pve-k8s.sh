@@ -436,20 +436,49 @@ create_vms() {
             --cipassword "$CLOUDINIT_PASS" \
             --agent enabled=1
         
-        # 导入云镜像
+        # 导入云镜像并设置磁盘
         log "导入云镜像到存储..."
-        local imported_disk
-        imported_disk=$(qm importdisk "$vm_id" "$CLOUD_IMAGE_PATH" "$STORAGE" --format qcow2 2>&1 | grep "Successfully imported disk" | awk '{print $NF}' | tr -d "'")
         
-        if [[ -z "$imported_disk" ]]; then
-            err "云镜像导入失败"
-            continue
+        # 方法1：尝试直接导入
+        if qm importdisk "$vm_id" "$CLOUD_IMAGE_PATH" "$STORAGE" --format qcow2 >/dev/null 2>&1; then
+            log "使用导入方式设置磁盘"
+            qm set "$vm_id" --scsi0 "$STORAGE:vm-$vm_id-disk-0"
+        else
+            # 方法2：使用传统方式创建磁盘并复制镜像
+            log "导入失败，使用传统方式创建磁盘"
+            
+            # 创建空磁盘
+            qm set "$vm_id" --scsi0 "$STORAGE:$VM_DISK,format=qcow2"
+            
+            # 等待磁盘创建完成
+            sleep 2
+            
+            # 获取磁盘路径
+            local disk_path
+            if [[ "$STORAGE" == "local-lvm" ]]; then
+                disk_path="/dev/pve/vm-$vm_id-disk-0"
+            else
+                disk_path="/var/lib/vz/images/$vm_id/vm-$vm_id-disk-0.qcow2"
+            fi
+            
+            # 复制镜像内容
+            log "复制云镜像内容到VM磁盘..."
+            if [[ "$STORAGE" == "local-lvm" ]]; then
+                # LVM存储：转换并复制
+                qemu-img convert -f qcow2 -O raw "$CLOUD_IMAGE_PATH" "$disk_path" || {
+                    warn "直接复制失败，尝试使用dd"
+                    dd if="$CLOUD_IMAGE_PATH" of="$disk_path" bs=1M status=progress 2>/dev/null || true
+                }
+            else
+                # 文件存储：直接复制
+                cp "$CLOUD_IMAGE_PATH" "$disk_path" || {
+                    warn "直接复制失败，尝试使用qemu-img"
+                    qemu-img convert -f qcow2 -O qcow2 "$CLOUD_IMAGE_PATH" "$disk_path" || true
+                }
+            fi
         fi
         
-        log "导入的磁盘: $imported_disk"
-        
-        # 设置启动磁盘
-        qm set "$vm_id" --scsi0 "$imported_disk"
+        # 设置启动配置
         qm set "$vm_id" --boot c --bootdisk scsi0
         
         # 验证VM配置
