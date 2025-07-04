@@ -683,7 +683,13 @@ create_vms() {
         
         # 首先创建指定大小的磁盘
         log "创建 ${VM_DISK}GB 磁盘..."
-        qm set "$vm_id" --scsi0 "$STORAGE:${VM_DISK}G,format=qcow2"
+        if [[ "$STORAGE" == "local-lvm" ]]; then
+            # LVM存储：大小以GB为单位，不需要G后缀
+            qm set "$vm_id" --scsi0 "$STORAGE:$VM_DISK"
+        else
+            # 文件存储：需要G后缀和格式说明
+            qm set "$vm_id" --scsi0 "$STORAGE:${VM_DISK}G,format=qcow2"
+        fi
         
         # 等待磁盘创建完成
         sleep 5
@@ -1142,7 +1148,13 @@ create_simple_vms() {
             qm set "$vm_id" --scsi0 "$STORAGE:vm-$vm_id-disk-0"
         else
             # 传统方式
-            qm set "$vm_id" --scsi0 "$STORAGE:${VM_DISK}G,format=qcow2"
+            if [[ "$STORAGE" == "local-lvm" ]]; then
+                # LVM存储：大小以GB为单位
+                qm set "$vm_id" --scsi0 "$STORAGE:$VM_DISK"
+            else
+                # 文件存储：需要G后缀和格式说明
+                qm set "$vm_id" --scsi0 "$STORAGE:${VM_DISK}G,format=qcow2"
+            fi
             sleep 2
             
             local disk_path
