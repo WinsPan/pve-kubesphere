@@ -854,10 +854,40 @@ EOFSVC
             echo "=== 安装K8S组件（从GitHub源码） ==="
             cd /tmp
             
+            # 清理旧文件
+            rm -rf kubernetes* kube*
+            
             # 下载K8S二进制文件
             echo "下载 Kubernetes '"$K8S_VERSION"'..."
-            wget -q https://github.com/kubernetes/kubernetes/releases/download/'"$K8S_VERSION"'/kubernetes-server-linux-amd64.tar.gz
-            tar -xzf kubernetes-server-linux-amd64.tar.gz
+            if ! wget -q --timeout=30 --tries=3 https://github.com/kubernetes/kubernetes/releases/download/'"$K8S_VERSION"'/kubernetes-server-linux-amd64.tar.gz; then
+                echo "GitHub下载失败，尝试备用源..."
+                # 尝试备用下载源
+                wget -q --timeout=30 --tries=3 https://dl.k8s.io/'"$K8S_VERSION"'/kubernetes-server-linux-amd64.tar.gz || {
+                    echo "所有下载源失败，使用APT安装..."
+                    # 使用APT安装作为备用方案
+                    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+                    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | tee /etc/apt/sources.list.d/kubernetes.list
+                    apt-get update
+                    apt-get install -y kubelet=1.29.0-00 kubeadm=1.29.0-00 kubectl=1.29.0-00
+                    apt-mark hold kubelet kubeadm kubectl
+                    echo "K8S组件APT安装完成"
+                    return 0
+                }
+            fi
+            
+            # 解压并安装
+            if [[ -f kubernetes-server-linux-amd64.tar.gz ]]; then
+                tar -xzf kubernetes-server-linux-amd64.tar.gz
+            else
+                echo "下载文件不存在，使用APT安装..."
+                curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+                echo "deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | tee /etc/apt/sources.list.d/kubernetes.list
+                apt-get update
+                apt-get install -y kubelet=1.29.0-00 kubeadm=1.29.0-00 kubectl=1.29.0-00
+                apt-mark hold kubelet kubeadm kubectl
+                echo "K8S组件APT安装完成"
+                return 0
+            fi
             
             # 安装kubelet, kubeadm, kubectl
             cp kubernetes/server/bin/kubelet /usr/local/bin/
@@ -1120,6 +1150,87 @@ create_simple_vms() {
     warn "请通过PVE控制台登录虚拟机进行配置"
 }
 
+# 部署K8S集群（APT安装）
+deploy_k8s_apt() {
+    log "部署K8S集群（APT安装）..."
+    
+    # 更新系统并安装依赖
+    for ip in "${VM_IPS[@]}"; do
+        log "配置节点: $ip"
+        run_remote_cmd "$ip" '
+            apt-get update -y
+            apt-get install -y curl wget tar gzip apt-transport-https ca-certificates gnupg
+            
+            # 配置系统
+            swapoff -a
+            sed -i "/swap/d" /etc/fstab
+            
+            modprobe br_netfilter
+            echo "br_netfilter" >> /etc/modules-load.d/k8s.conf
+            
+            cat > /etc/sysctl.d/k8s.conf << EOF
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+            sysctl --system
+            
+            # 安装containerd
+            echo "=== 安装containerd（APT） ==="
+            apt-get install -y containerd
+            
+            # 配置containerd
+            mkdir -p /etc/containerd
+            containerd config default > /etc/containerd/config.toml
+            sed -i "s/SystemdCgroup = false/SystemdCgroup = true/" /etc/containerd/config.toml
+            
+            systemctl restart containerd
+            systemctl enable containerd
+            
+            # 安装K8S组件
+            echo "=== 安装K8S组件（APT） ==="
+            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | tee /etc/apt/sources.list.d/kubernetes.list
+            
+            apt-get update
+            apt-get install -y kubelet=1.29.0-00 kubeadm=1.29.0-00 kubectl=1.29.0-00
+            apt-mark hold kubelet kubeadm kubectl
+            
+            systemctl enable kubelet
+            
+            echo "节点配置完成"
+        '
+    done
+    
+    # 初始化主节点
+    log "初始化K8S主节点..."
+    run_remote_cmd "$MASTER_IP" '
+        kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address='"$MASTER_IP"'
+        
+        mkdir -p /root/.kube
+        cp -i /etc/kubernetes/admin.conf /root/.kube/config
+        chown root:root /root/.kube/config
+        
+        # 安装Calico网络插件
+        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml
+        
+        # 生成加入命令
+        kubeadm token create --print-join-command > /tmp/join-command
+    '
+    
+    # 获取加入命令
+    local join_cmd
+    join_cmd=$(run_remote_cmd "$MASTER_IP" 'cat /tmp/join-command')
+    
+    # 工作节点加入集群
+    for worker_ip in "${WORKER_IPS[@]}"; do
+        log "工作节点 $worker_ip 加入集群..."
+        run_remote_cmd "$worker_ip" "$join_cmd"
+    done
+    
+    success "K8S集群部署完成（APT安装）"
+}
+
 # 清理所有资源
 cleanup_all() {
     log "清理所有资源..."
@@ -1155,6 +1266,7 @@ show_menu() {
     echo -e "  ${CYAN}4.${NC} 部署K8S集群"
     echo -e "  ${CYAN}5.${NC} 部署KubeSphere"
     echo -e "  ${CYAN}14.${NC} 创建简化虚拟机（无Cloud-init）"
+    echo -e "  ${CYAN}15.${NC} 部署K8S集群（APT安装）"
     echo ""
     echo -e "${YELLOW}修复功能：${NC}"
     echo -e "  ${CYAN}6.${NC} 修复K8S网络问题"
@@ -1185,7 +1297,7 @@ main() {
         show_banner
         show_menu
         
-        read -p "请选择操作 [0-14]: " choice
+        read -p "请选择操作 [0-15]: " choice
         
         case $choice in
             1)
@@ -1218,6 +1330,7 @@ main() {
             12) fix_all_ssh ;;
             13) reset_all_passwords ;;
             14) create_simple_vms ;;
+            15) deploy_k8s_apt ;;
             0) 
                 log "退出脚本"
                 exit 0 
