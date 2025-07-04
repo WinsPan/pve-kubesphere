@@ -652,16 +652,31 @@ create_vms() {
             --cores "$VM_CORES" \
             --net0 "virtio,bridge=$BRIDGE" \
             --scsihw virtio-scsi-pci \
-            --ide2 "$STORAGE:cloudinit" \
             --vga std \
-            --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY" \
-            --nameserver "$DNS" \
-            --ciuser "$CLOUDINIT_USER" \
-            --cipassword "$CLOUDINIT_PASS" \
-            --agent enabled=1; then
+            --ostype l26; then
             err "虚拟机 $vm_name 创建失败"
             continue
         fi
+        
+        # 单独配置cloud-init
+        log "配置cloud-init..."
+        qm set "$vm_id" --ide2 "$STORAGE:cloudinit"
+        qm set "$vm_id" --ciuser "$CLOUDINIT_USER"
+        qm set "$vm_id" --cipassword "$CLOUDINIT_PASS"
+        qm set "$vm_id" --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY"
+        qm set "$vm_id" --nameserver "$DNS"
+        qm set "$vm_id" --agent enabled=1
+        
+        # 添加SSH公钥（如果存在）
+        if [[ -f ~/.ssh/id_rsa.pub ]]; then
+            log "配置SSH公钥..."
+            qm set "$vm_id" --sshkey ~/.ssh/id_rsa.pub
+        fi
+        
+        # 强制重新生成cloud-init配置
+        log "强制重新生成cloud-init配置..."
+        qm set "$vm_id" --delete ide2
+        qm set "$vm_id" --ide2 "$STORAGE:cloudinit"
         
         # 导入云镜像并设置磁盘
         log "导入云镜像到存储..."
@@ -1041,6 +1056,70 @@ EOF
     success "密码重置完成"
 }
 
+# 创建简化虚拟机（无Cloud-init）
+create_simple_vms() {
+    log "创建简化虚拟机（无Cloud-init）..."
+    
+    for i in "${!VM_IDS[@]}"; do
+        local vm_id="${VM_IDS[$i]}"
+        local vm_name="${VM_NAMES[$i]}"
+        local vm_ip="${VM_IPS[$i]}"
+        
+        log "创建简化虚拟机: $vm_name (ID: $vm_id)"
+        
+        # 删除现有虚拟机
+        qm stop "$vm_id" 2>/dev/null || true
+        qm destroy "$vm_id" 2>/dev/null || true
+        
+        # 创建基础虚拟机（无cloud-init）
+        log "创建基础虚拟机配置..."
+        if ! qm create "$vm_id" \
+            --name "$vm_name" \
+            --memory "$VM_MEM" \
+            --cores "$VM_CORES" \
+            --net0 "virtio,bridge=$BRIDGE" \
+            --scsihw virtio-scsi-pci \
+            --vga std \
+            --ostype l26; then
+            err "虚拟机 $vm_name 创建失败"
+            continue
+        fi
+        
+        # 导入云镜像
+        log "导入云镜像..."
+        if qm importdisk "$vm_id" "$CLOUD_IMAGE_PATH" "$STORAGE" --format qcow2 >/dev/null 2>&1; then
+            qm set "$vm_id" --scsi0 "$STORAGE:vm-$vm_id-disk-0"
+        else
+            # 传统方式
+            qm set "$vm_id" --scsi0 "$STORAGE:$VM_DISK,format=qcow2"
+            sleep 2
+            
+            local disk_path
+            if [[ "$STORAGE" == "local-lvm" ]]; then
+                disk_path="/dev/pve/vm-$vm_id-disk-0"
+                qemu-img convert -f qcow2 -O raw "$CLOUD_IMAGE_PATH" "$disk_path" || true
+            else
+                disk_path="/var/lib/vz/images/$vm_id/vm-$vm_id-disk-0.qcow2"
+                cp "$CLOUD_IMAGE_PATH" "$disk_path" || true
+            fi
+        fi
+        
+        # 设置启动配置
+        qm set "$vm_id" --boot c --bootdisk scsi0
+        
+        # 启动虚拟机
+        log "启动虚拟机 $vm_name..."
+        if qm start "$vm_id"; then
+            success "虚拟机 $vm_name 创建完成"
+        else
+            warn "虚拟机 $vm_name 启动失败"
+        fi
+    done
+    
+    warn "简化虚拟机创建完成，需要手动配置网络和SSH"
+    warn "请通过PVE控制台登录虚拟机进行配置"
+}
+
 # 清理所有资源
 cleanup_all() {
     log "清理所有资源..."
@@ -1075,6 +1154,7 @@ show_menu() {
     echo -e "  ${CYAN}3.${NC} 创建虚拟机"
     echo -e "  ${CYAN}4.${NC} 部署K8S集群"
     echo -e "  ${CYAN}5.${NC} 部署KubeSphere"
+    echo -e "  ${CYAN}14.${NC} 创建简化虚拟机（无Cloud-init）"
     echo ""
     echo -e "${YELLOW}修复功能：${NC}"
     echo -e "  ${CYAN}6.${NC} 修复K8S网络问题"
@@ -1105,7 +1185,7 @@ main() {
         show_banner
         show_menu
         
-        read -p "请选择操作 [0-13]: " choice
+        read -p "请选择操作 [0-14]: " choice
         
         case $choice in
             1)
@@ -1137,6 +1217,7 @@ main() {
             11) test_all_ssh ;;
             12) fix_all_ssh ;;
             13) reset_all_passwords ;;
+            14) create_simple_vms ;;
             0) 
                 log "退出脚本"
                 exit 0 
