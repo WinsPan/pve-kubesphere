@@ -636,7 +636,13 @@ create_vm() {
     if [[ $import_result -eq 0 ]]; then
         # 导入成功后，检查VM配置获取unused磁盘
         sleep 2  # 等待配置更新
-        local unused_disk=$(qm config "$vm_id" | grep "unused0:" | cut -d: -f2 | tr -d ' ')
+        
+        log "检查VM配置获取unused磁盘..."
+        local vm_config=$(qm config "$vm_id")
+        log "VM配置信息:"
+        echo "$vm_config" | grep -E "(unused|scsi)"
+        
+        local unused_disk=$(echo "$vm_config" | grep "unused0:" | sed 's/unused0: //' | tr -d ' ')
         
         if [[ -n "$unused_disk" ]]; then
             success "磁盘导入成功: $unused_disk"
@@ -646,15 +652,38 @@ create_vm() {
             if qm set "$vm_id" --scsi0 "$unused_disk" --delete unused0; then
                 success "磁盘设置完成"
             else
-                error "移动磁盘到scsi0失败"
-                log "清理失败的VM..."
-                qm destroy "$vm_id" >/dev/null 2>&1 || true
-                return 1
+                warn "直接移动磁盘失败，尝试使用unused0引用..."
+                log "尝试的磁盘路径: $unused_disk"
+                
+                # 尝试使用unused0引用
+                if qm set "$vm_id" --scsi0 unused0; then
+                    success "磁盘设置完成（使用unused0引用）"
+                    # 清理unused0
+                    qm set "$vm_id" --delete unused0 >/dev/null 2>&1 || true
+                else
+                    warn "unused0引用也失败，尝试分步操作..."
+                    
+                    # 分步操作：先设置scsi0，再删除unused0
+                    if qm set "$vm_id" --scsi0 "$unused_disk"; then
+                        log "scsi0设置成功，清理unused0..."
+                        qm set "$vm_id" --delete unused0 >/dev/null 2>&1 || true
+                        success "磁盘设置完成（分步操作）"
+                    else
+                        error "所有方法都失败了"
+                        log "尝试的方法："
+                        log "1. 直接路径+删除: $unused_disk"
+                        log "2. unused0引用"
+                        log "3. 分步操作"
+                        log "清理失败的VM..."
+                        qm destroy "$vm_id" >/dev/null 2>&1 || true
+                        return 1
+                    fi
+                fi
             fi
         else
             error "导入磁盘失败：未找到unused磁盘"
-            log "VM配置信息:"
-            qm config "$vm_id" || true
+            log "完整VM配置信息:"
+            echo "$vm_config"
             log "清理失败的VM..."
             qm destroy "$vm_id" >/dev/null 2>&1 || true
             return 1
