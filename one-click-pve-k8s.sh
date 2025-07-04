@@ -555,7 +555,7 @@ create_vm() {
         qm destroy "$vm_id" >/dev/null 2>&1 || true
     fi
     
-        # 根据存储类型确定磁盘格式
+    # 根据存储类型确定磁盘格式和镜像路径
     local disk_format="qcow2"
     local image_path="/var/lib/vz/template/iso/debian-12-generic-amd64.qcow2"
     
@@ -568,38 +568,17 @@ create_vm() {
         if [[ ! -f "$raw_image_path" ]]; then
             log "转换qcow2镜像为raw格式..."
             
-            # 检查磁盘空间
-            local available_space=$(df /var/lib/vz/template/iso | awk 'NR==2 {print $4}')
-            local required_space=1048576  # 1GB in KB
-            if [[ $available_space -lt $required_space ]]; then
-                error "磁盘空间不足，需要至少1GB空间进行镜像转换"
-                log "可用空间: $(($available_space / 1024))MB"
-                return 1
-            fi
-            
             # 确保qemu-img可用
             if ! command -v qemu-img >/dev/null 2>&1; then
                 log "安装qemu-utils..."
-                if ! apt-get update >/dev/null 2>&1; then
-                    error "更新软件包列表失败"
-                    return 1
-                fi
-                if ! apt-get install -y qemu-utils >/dev/null 2>&1; then
-                    error "安装qemu-utils失败"
-                    return 1
-                fi
-                success "qemu-utils安装完成"
+                apt-get update >/dev/null 2>&1 && apt-get install -y qemu-utils >/dev/null 2>&1
             fi
             
             # 转换镜像格式
-            log "正在转换镜像格式，请稍等..."
-            if qemu-img convert -f qcow2 -O raw -p "$image_path" "$raw_image_path" 2>&1; then
+            if qemu-img convert -f qcow2 -O raw "$image_path" "$raw_image_path"; then
                 success "镜像格式转换完成"
-                local raw_size=$(du -h "$raw_image_path" | cut -f1)
-                log "转换后文件大小: $raw_size"
             else
                 error "镜像格式转换失败"
-                rm -f "$raw_image_path"
                 return 1
             fi
         fi
@@ -608,125 +587,62 @@ create_vm() {
     
     log "使用存储: $STORAGE, 磁盘格式: $disk_format"
 
-    # 创建VM（不预分配磁盘）
-    qm create "$vm_id" \
+    # 创建VM - 恢复原来简单有效的方式，在创建时就配置所有参数
+    if qm create "$vm_id" \
         --name "$vm_name" \
         --cores "$vm_cores" \
         --memory "$vm_memory" \
         --net0 "virtio,bridge=${DETECTED_BRIDGE:-$BRIDGE}" \
         --scsihw virtio-scsi-pci \
         --ide2 "$STORAGE:cloudinit" \
-        --boot c --bootdisk scsi0 \
-        --serial0 socket --vga serial0 \
-        --agent enabled=1 \
-        --ostype l26
-
-    # 导入云镜像
-    log "导入云镜像到VM $vm_id..."
-    log "镜像路径: $image_path"
-    log "存储: $STORAGE, 格式: $disk_format"
-    
-    # 执行导入命令
-    local import_output
-    import_output=$(qm importdisk "$vm_id" "$image_path" "$STORAGE" --format "$disk_format" 2>&1)
-    local import_result=$?
-    
-    log "导入命令输出: $import_output"
-    
-    if [[ $import_result -eq 0 ]]; then
-        # 导入成功后，检查VM配置获取unused磁盘
-        sleep 2  # 等待配置更新
+        --serial0 socket \
+        --vga std \
+        --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY" \
+        --nameserver "$DNS" \
+        --ciuser "$CLOUDINIT_USER" \
+        --cipassword "$CLOUDINIT_PASS" \
+        --cicustom "user=local:snippets/user-data-$vm_id.yml" \
+        --agent enabled=1; then
         
-        log "检查VM配置获取unused磁盘..."
-        local vm_config=$(qm config "$vm_id")
-        log "VM配置信息:"
-        echo "$vm_config" | grep -E "(unused|scsi)"
+        log "VM创建成功，开始导入磁盘..."
         
-        local unused_disk=$(echo "$vm_config" | grep "unused0:" | sed 's/unused0: //' | tr -d ' ')
-        
-        if [[ -n "$unused_disk" ]]; then
-            success "磁盘导入成功: $unused_disk"
-            log "将磁盘移动到scsi0..."
+        # 导入云镜像 - 使用原来的简单方式
+        if qm importdisk "$vm_id" "$image_path" "$STORAGE" --format "$disk_format" >/dev/null 2>&1; then
+            log "磁盘导入成功，设置为主磁盘..."
             
-            # 直接移动unused0到scsi0
-            if qm set "$vm_id" --scsi0 "$unused_disk" --delete unused0; then
-                success "磁盘设置完成"
-            else
-                warn "直接移动磁盘失败，尝试使用unused0引用..."
-                log "尝试的磁盘路径: $unused_disk"
+            # 设置主磁盘 - 使用原来的简单方式
+            if qm set "$vm_id" --scsi0 "$STORAGE:vm-$vm_id-disk-0"; then
+                log "设置启动磁盘..."
+                qm set "$vm_id" --boot c --bootdisk scsi0
                 
-                # 尝试使用unused0引用
-                if qm set "$vm_id" --scsi0 unused0; then
-                    success "磁盘设置完成（使用unused0引用）"
-                    # 清理unused0
-                    qm set "$vm_id" --delete unused0 >/dev/null 2>&1 || true
+                # 调整磁盘大小
+                log "调整磁盘大小到 ${vm_disk}G..."
+                qm resize "$vm_id" scsi0 "${vm_disk}G" >/dev/null 2>&1 || {
+                    warn "调整磁盘大小失败，继续使用默认大小"
+                }
+                
+                # 启动虚拟机
+                log "启动VM $vm_id..."
+                if qm start "$vm_id"; then
+                    success "虚拟机 $vm_name 创建并启动完成"
+                    return 0
                 else
-                    warn "unused0引用也失败，尝试分步操作..."
-                    
-                    # 分步操作：先设置scsi0，再删除unused0
-                    if qm set "$vm_id" --scsi0 "$unused_disk"; then
-                        log "scsi0设置成功，清理unused0..."
-                        qm set "$vm_id" --delete unused0 >/dev/null 2>&1 || true
-                        success "磁盘设置完成（分步操作）"
-                    else
-                        error "所有方法都失败了"
-                        log "尝试的方法："
-                        log "1. 直接路径+删除: $unused_disk"
-                        log "2. unused0引用"
-                        log "3. 分步操作"
-                        log "清理失败的VM..."
-                        qm destroy "$vm_id" >/dev/null 2>&1 || true
-                        return 1
-                    fi
+                    error "启动VM失败"
                 fi
+            else
+                error "设置主磁盘失败"
             fi
         else
-            error "导入磁盘失败：未找到unused磁盘"
-            log "完整VM配置信息:"
-            echo "$vm_config"
-            log "清理失败的VM..."
-            qm destroy "$vm_id" >/dev/null 2>&1 || true
-            return 1
+            error "导入磁盘失败"
         fi
     else
-        error "导入磁盘失败"
-        log "错误输出: $import_output"
-        log "清理失败的VM..."
-        qm destroy "$vm_id" >/dev/null 2>&1 || true
-        return 1
+        error "创建VM失败"
     fi
     
-
-    
-    # 调整磁盘大小
-    log "调整磁盘大小到 ${vm_disk}G..."
-    qm resize "$vm_id" scsi0 "${vm_disk}G" || {
-        warn "调整磁盘大小失败，继续使用默认大小"
-    }
-    
-    # 配置cloud-init
-    if ! qm set "$vm_id" --cicustom "user=local:snippets/user-data-$vm_id.yml"; then
-        error "配置cloud-init失败"
-        log "清理失败的VM..."
-        qm destroy "$vm_id" >/dev/null 2>&1 || true
-        return 1
-    fi
-    
-    if ! qm set "$vm_id" --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY"; then
-        error "配置网络失败"
-        log "清理失败的VM..."
-        qm destroy "$vm_id" >/dev/null 2>&1 || true
-        return 1
-    fi
-    
-    # 启动VM
-    log "启动VM $vm_id..."
-    if ! qm start "$vm_id"; then
-        error "启动VM失败"
-        return 1
-    fi
-    
-    success "虚拟机 $vm_name 创建并启动完成"
+    # 如果到这里说明失败了，清理VM
+    log "清理失败的VM..."
+    qm destroy "$vm_id" >/dev/null 2>&1 || true
+    return 1
 }
 
 create_all_vms() {
