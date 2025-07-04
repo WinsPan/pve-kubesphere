@@ -435,7 +435,7 @@ create_vms() {
             --nameserver "$DNS" \
             --ciuser "$CLOUDINIT_USER" \
             --cipassword "$CLOUDINIT_PASS" \
-            --sshkeys <(echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC...") \
+            --sshkeys /dev/null \
             --agent enabled=1
         
         # 导入云镜像
