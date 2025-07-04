@@ -11,8 +11,14 @@ set -euo pipefail
 # ==========================================
 # 全局配置
 # ==========================================
-readonly SCRIPT_VERSION="3.0"
-readonly SCRIPT_NAME="PVE K8S+KubeSphere 部署工具"
+readonly SCRIPT_VERSION="3.1"
+readonly SCRIPT_NAME="PVE K8S+KubeSphere 部署工具 (GitHub源码版)"
+
+# 版本配置（GitHub源码安装）
+readonly CONTAINERD_VERSION="1.7.12"
+readonly RUNC_VERSION="v1.1.10"
+readonly CNI_VERSION="v1.4.0"
+readonly K8S_VERSION="v1.29.0"
 
 # 颜色定义
 readonly GREEN='\e[0;32m'
@@ -463,22 +469,7 @@ deploy_k8s() {
         log "配置节点: $ip"
         run_remote_cmd "$ip" '
             apt-get update -y
-            apt-get install -y apt-transport-https ca-certificates curl
-            
-            # 安装Docker
-            curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
-            echo "deb [arch=amd64] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list
-            apt-get update -y
-            apt-get install -y docker-ce docker-ce-cli containerd.io
-            systemctl enable docker
-            systemctl start docker
-            
-            # 安装kubeadm
-            curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
-            echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
-            apt-get update -y
-            apt-get install -y kubelet kubeadm kubectl
-            apt-mark hold kubelet kubeadm kubectl
+            apt-get install -y curl wget tar gzip
             
             # 配置系统
             swapoff -a
@@ -494,7 +485,127 @@ net.ipv4.ip_forward = 1
 EOF
             sysctl --system
             
+            # 从GitHub源码安装containerd
+            echo "=== 安装containerd（从GitHub源码） ==="
+            cd /tmp
+            
+            # 下载containerd
+            echo "下载 containerd v'"$CONTAINERD_VERSION"'..."
+            wget -q https://github.com/containerd/containerd/releases/download/v'"$CONTAINERD_VERSION"'/containerd-'"$CONTAINERD_VERSION"'-linux-amd64.tar.gz
+            tar Cxzvf /usr/local containerd-'"$CONTAINERD_VERSION"'-linux-amd64.tar.gz
+            
+            # 下载runc
+            echo "下载 runc '"$RUNC_VERSION"'..."
+            wget -q https://github.com/opencontainers/runc/releases/download/'"$RUNC_VERSION"'/runc.amd64
+            install -m 755 runc.amd64 /usr/local/sbin/runc
+            
+            # 下载CNI插件
+            echo "下载 CNI 插件 '"$CNI_VERSION"'..."
+            mkdir -p /opt/cni/bin
+            wget -q https://github.com/containernetworking/plugins/releases/download/'"$CNI_VERSION"'/cni-plugins-linux-amd64-'"$CNI_VERSION"'.tgz
+            tar Cxzvf /opt/cni/bin cni-plugins-linux-amd64-'"$CNI_VERSION"'.tgz
+            
+            # 创建containerd配置
+            mkdir -p /etc/containerd
+            cat > /etc/containerd/config.toml << "EOFCONTAINERD"
+version = 2
+[plugins]
+  [plugins."io.containerd.grpc.v1.cri"]
+    sandbox_image = "registry.k8s.io/pause:3.9"
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+          runtime_type = "io.containerd.runc.v2"
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+            SystemdCgroup = true
+EOFCONTAINERD
+            
+            # 创建containerd systemd服务
+            cat > /etc/systemd/system/containerd.service << "EOFSVC"
+[Unit]
+Description=containerd container runtime
+Documentation=https://containerd.io
+After=network.target local-fs.target
+
+[Service]
+ExecStartPre=-/sbin/modprobe overlay
+ExecStart=/usr/local/bin/containerd
+Type=notify
+Delegate=yes
+KillMode=process
+Restart=always
+RestartSec=5
+LimitNPROC=infinity
+LimitCORE=infinity
+LimitNOFILE=infinity
+TasksMax=infinity
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target
+EOFSVC
+            
+            # 启动containerd
+            systemctl daemon-reload
+            systemctl enable containerd
+            systemctl start containerd
+            
+            # 从GitHub源码安装K8S组件
+            echo "=== 安装K8S组件（从GitHub源码） ==="
+            cd /tmp
+            
+            # 下载K8S二进制文件
+            echo "下载 Kubernetes '"$K8S_VERSION"'..."
+            wget -q https://github.com/kubernetes/kubernetes/releases/download/'"$K8S_VERSION"'/kubernetes-server-linux-amd64.tar.gz
+            tar -xzf kubernetes-server-linux-amd64.tar.gz
+            
+            # 安装kubelet, kubeadm, kubectl
+            cp kubernetes/server/bin/kubelet /usr/local/bin/
+            cp kubernetes/server/bin/kubeadm /usr/local/bin/
+            cp kubernetes/server/bin/kubectl /usr/local/bin/
+            chmod +x /usr/local/bin/kube*
+            
+            # 创建kubelet systemd服务
+            cat > /etc/systemd/system/kubelet.service << "EOFKUBELET"
+[Unit]
+Description=kubelet: The Kubernetes Node Agent
+Documentation=https://kubernetes.io/docs/home/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/kubelet
+Restart=always
+StartLimitInterval=0
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOFKUBELET
+            
+            # 创建kubelet配置目录
+            mkdir -p /etc/systemd/system/kubelet.service.d
+            cat > /etc/systemd/system/kubelet.service.d/10-kubeadm.conf << "EOFKUBELETCONF"
+[Service]
+Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+Environment="KUBELET_SYSTEM_PODS_ARGS=--pod-manifest-path=/etc/kubernetes/manifests"
+Environment="KUBELET_NETWORK_ARGS=--network-plugin=cni --cni-conf-dir=/etc/cni/net.d --cni-bin-dir=/opt/cni/bin"
+Environment="KUBELET_DNS_ARGS=--cluster-dns=10.96.0.10 --cluster-domain=cluster.local"
+Environment="KUBELET_AUTHZ_ARGS=--authorization-mode=Webhook --client-ca-file=/etc/kubernetes/pki/ca.crt"
+Environment="KUBELET_CADVISOR_ARGS=--cadvisor-port=0"
+Environment="KUBELET_CGROUP_ARGS=--cgroup-driver=systemd"
+Environment="KUBELET_CERTIFICATE_ARGS=--rotate-certificates=true --cert-dir=/var/lib/kubelet/pki"
+Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///var/run/containerd/containerd.sock"
+ExecStart=
+ExecStart=/usr/local/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_SYSTEM_PODS_ARGS $KUBELET_NETWORK_ARGS $KUBELET_DNS_ARGS $KUBELET_AUTHZ_ARGS $KUBELET_CADVISOR_ARGS $KUBELET_CGROUP_ARGS $KUBELET_CERTIFICATE_ARGS $KUBELET_EXTRA_ARGS
+EOFKUBELETCONF
+            
+            # 启动kubelet
+            systemctl daemon-reload
             systemctl enable kubelet
+            
+            echo "容器运行时和K8S组件安装完成"
         '
     done
     
@@ -561,8 +672,8 @@ show_banner() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║                                                              ║"
-    echo "║           PVE K8S + KubeSphere 一键部署工具 v3.0            ║"
-    echo "║                        重构精简版                            ║"
+    echo "║           PVE K8S + KubeSphere 一键部署工具 v3.1            ║"
+    echo "║                    GitHub源码安装版                          ║"
     echo "║                                                              ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
