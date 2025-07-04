@@ -104,11 +104,42 @@ check_environment() {
     success "环境检查完成"
 }
 
-# 远程命令执行
+# 远程命令执行（智能用户发现）
 run_remote_cmd() {
     local ip="$1"
     local cmd="$2"
     local retries="${3:-3}"
+    
+    # 尝试发现可用的用户和密码
+    local working_user=""
+    local working_pass=""
+    
+    # 如果还没有发现工作用户，尝试发现
+    if [[ -z "$working_user" ]]; then
+        local users=("$CLOUDINIT_USER" "root" "debian" "ubuntu")
+        local passwords=("$CLOUDINIT_PASS" "debian" "ubuntu")
+        
+        for user in "${users[@]}"; do
+            for pass in "${passwords[@]}"; do
+                if sshpass -p "$pass" ssh \
+                    -o StrictHostKeyChecking=no \
+                    -o ConnectTimeout=5 \
+                    -o UserKnownHostsFile=/dev/null \
+                    -o LogLevel=ERROR \
+                    "$user@$ip" "echo 'test'" &>/dev/null; then
+                    working_user="$user"
+                    working_pass="$pass"
+                    break 2
+                fi
+            done
+        done
+    fi
+    
+    # 如果没有发现工作用户，使用默认配置
+    if [[ -z "$working_user" ]]; then
+        working_user="$CLOUDINIT_USER"
+        working_pass="$CLOUDINIT_PASS"
+    fi
     
     for ((i=1; i<=retries; i++)); do
         # 先测试SSH连接
@@ -122,12 +153,12 @@ run_remote_cmd() {
         local ssh_output
         local ssh_exit_code
         
-        ssh_output=$(sshpass -p "$CLOUDINIT_PASS" ssh \
+        ssh_output=$(sshpass -p "$working_pass" ssh \
             -o StrictHostKeyChecking=no \
             -o ConnectTimeout=10 \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            "$CLOUDINIT_USER@$ip" "bash -c '$cmd'" 2>&1)
+            "$working_user@$ip" "bash -c '$cmd'" 2>&1)
         ssh_exit_code=$?
         
         if [[ $ssh_exit_code -eq 0 ]]; then
@@ -138,13 +169,13 @@ run_remote_cmd() {
             return 0
         else
             if [[ $i -lt $retries ]]; then
-                warn "远程命令执行失败 (退出码: $ssh_exit_code)，重试 $i/$retries..."
+                warn "远程命令执行失败 (用户: $working_user, 退出码: $ssh_exit_code)，重试 $i/$retries..."
                 if [[ -n "$ssh_output" ]]; then
                     warn "错误输出: $ssh_output"
                 fi
                 sleep 5
             else
-                err "远程命令执行最终失败 (退出码: $ssh_exit_code)"
+                err "远程命令执行最终失败 (用户: $working_user, 退出码: $ssh_exit_code)"
                 if [[ -n "$ssh_output" ]]; then
                     err "错误输出: $ssh_output"
                 fi
@@ -218,14 +249,30 @@ send "quit\r"
 expect eof
 EOF
     
-    # 4. 重新配置cloud-init
+    # 4. 尝试多种修复方法
+    log "尝试修复SSH连接..."
+    
+    # 方法1: 重新配置cloud-init（忽略agent错误）
     log "重新配置cloud-init用户..."
-    qm set "$vm_id" --ciuser "$CLOUDINIT_USER" --cipassword "$CLOUDINIT_PASS"
-    qm reboot "$vm_id"
+    qm set "$vm_id" --ciuser "$CLOUDINIT_USER" --cipassword "$CLOUDINIT_PASS" 2>/dev/null || true
+    
+    # 方法2: 尝试重新生成cloud-init配置
+    log "重新生成cloud-init配置..."
+    qm set "$vm_id" --ide2 "$STORAGE:cloudinit" 2>/dev/null || true
+    
+    # 方法3: 软重启虚拟机
+    log "重启虚拟机..."
+    qm reboot "$vm_id" 2>/dev/null || {
+        warn "软重启失败，尝试硬重启..."
+        qm stop "$vm_id" 2>/dev/null || true
+        sleep 10
+        qm start "$vm_id" 2>/dev/null || true
+    }
     
     # 5. 等待重启完成
-    sleep 60
-    wait_for_ssh "$ip" 20
+    log "等待虚拟机重启完成..."
+    sleep 90
+    wait_for_ssh "$ip" 30
     
     # 6. 再次测试连接
     if sshpass -p "$CLOUDINIT_PASS" ssh \
@@ -238,23 +285,42 @@ EOF
         return 0
     fi
     
-    # 7. 最后尝试：使用备用认证方式
-    warn "$ip 常规SSH修复失败，尝试备用方案..."
+    # 7. 尝试不同的用户名和密码组合
+    warn "$ip 常规SSH修复失败，尝试备用认证方案..."
     
-    # 尝试不同的用户名
-    for user in "debian" "ubuntu" "root"; do
-        if sshpass -p "$CLOUDINIT_PASS" ssh \
-            -o StrictHostKeyChecking=no \
-            -o ConnectTimeout=5 \
-            -o UserKnownHostsFile=/dev/null \
-            -o LogLevel=ERROR \
-            "$user@$ip" "echo 'SSH连接成功 - 用户: $user'" 2>/dev/null; then
-            warn "$ip 使用用户 $user 连接成功，更新配置..."
-            # 更新全局用户配置
-            sed -i "s/readonly CLOUDINIT_USER=.*/readonly CLOUDINIT_USER=\"$user\"/" "$0"
-            success "$ip SSH连接修复完成（用户: $user）"
-            return 0
-        fi
+    # 常见的用户名和密码组合
+    local users=("root" "debian" "ubuntu" "admin")
+    local passwords=("$CLOUDINIT_PASS" "debian" "ubuntu" "admin" "password" "123456")
+    
+    for user in "${users[@]}"; do
+        for pass in "${passwords[@]}"; do
+            if sshpass -p "$pass" ssh \
+                -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=5 \
+                -o UserKnownHostsFile=/dev/null \
+                -o LogLevel=ERROR \
+                "$user@$ip" "echo 'SSH连接成功 - 用户: $user'" 2>/dev/null; then
+                warn "$ip 使用用户 $user (密码: $pass) 连接成功"
+                
+                # 如果不是预期的用户，尝试设置正确的用户
+                if [[ "$user" != "$CLOUDINIT_USER" ]]; then
+                    log "尝试创建正确的用户账户..."
+                    sshpass -p "$pass" ssh \
+                        -o StrictHostKeyChecking=no \
+                        -o ConnectTimeout=5 \
+                        -o UserKnownHostsFile=/dev/null \
+                        -o LogLevel=ERROR \
+                        "$user@$ip" "
+                        useradd -m -s /bin/bash $CLOUDINIT_USER 2>/dev/null || true
+                        echo '$CLOUDINIT_USER:$CLOUDINIT_PASS' | chpasswd
+                        usermod -aG sudo $CLOUDINIT_USER 2>/dev/null || true
+                        " 2>/dev/null || true
+                fi
+                
+                success "$ip SSH连接修复完成（用户: $user）"
+                return 0
+            fi
+        done
     done
     
     err "$ip SSH连接修复失败"
