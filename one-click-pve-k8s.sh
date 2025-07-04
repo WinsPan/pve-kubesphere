@@ -683,7 +683,7 @@ create_vms() {
         
         # 首先创建指定大小的磁盘
         log "创建 ${VM_DISK}GB 磁盘..."
-        qm set "$vm_id" --scsi0 "$STORAGE:$VM_DISK,format=qcow2"
+        qm set "$vm_id" --scsi0 "$STORAGE:${VM_DISK}G,format=qcow2"
         
         # 等待磁盘创建完成
         sleep 5
@@ -1142,7 +1142,7 @@ create_simple_vms() {
             qm set "$vm_id" --scsi0 "$STORAGE:vm-$vm_id-disk-0"
         else
             # 传统方式
-            qm set "$vm_id" --scsi0 "$STORAGE:$VM_DISK,format=qcow2"
+            qm set "$vm_id" --scsi0 "$STORAGE:${VM_DISK}G,format=qcow2"
             sleep 2
             
             local disk_path
