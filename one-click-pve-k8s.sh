@@ -36,7 +36,7 @@ readonly VM_NAMES=("k8s-master" "k8s-worker1" "k8s-worker2")
 readonly VM_IPS=("10.0.0.10" "10.0.0.11" "10.0.0.12")
 readonly VM_CORES=8
 readonly VM_MEM=16384
-readonly VM_DISK=300
+readonly VM_DISK=500
 readonly CLOUDINIT_USER="root"
 readonly CLOUDINIT_PASS="kubesphere123"
 readonly GATEWAY="10.0.0.1"
@@ -854,8 +854,23 @@ EOFSVC
             echo "=== 安装K8S组件（从GitHub源码） ==="
             cd /tmp
             
-            # 清理旧文件
-            rm -rf kubernetes* kube*
+            # 检查磁盘空间
+            echo "=== 检查磁盘空间 ==="
+            df -h /tmp
+            df -h /
+            
+            # 清理旧文件和缓存
+            echo "=== 清理磁盘空间 ==="
+            rm -rf kubernetes* kube* containerd* runc* cni-plugins*
+            apt-get clean
+            apt-get autoclean
+            rm -rf /var/cache/apt/archives/*
+            rm -rf /tmp/*
+            
+            # 再次检查磁盘空间
+            echo "=== 清理后磁盘空间 ==="
+            df -h /tmp
+            df -h /
             
             # 下载K8S二进制文件
             echo "下载 Kubernetes '"$K8S_VERSION"'..."
@@ -1231,6 +1246,59 @@ EOF
     success "K8S集群部署完成（APT安装）"
 }
 
+# 清理磁盘并重新部署
+cleanup_and_redeploy() {
+    log "清理磁盘并重新部署..."
+    
+    # 清理所有虚拟机的磁盘空间
+    for ip in "${VM_IPS[@]}"; do
+        log "清理节点 $ip 磁盘空间..."
+        run_remote_cmd "$ip" '
+            echo "=== 清理前磁盘使用情况 ==="
+            df -h
+            
+            echo "=== 停止所有K8S服务 ==="
+            systemctl stop kubelet 2>/dev/null || true
+            systemctl stop containerd 2>/dev/null || true
+            
+            echo "=== 清理K8S相关文件 ==="
+            rm -rf /etc/kubernetes/*
+            rm -rf /var/lib/kubelet/*
+            rm -rf /var/lib/containerd/*
+            rm -rf /var/lib/etcd/*
+            rm -rf /opt/cni/*
+            rm -rf /usr/local/bin/kube*
+            rm -rf /usr/local/bin/containerd*
+            rm -rf /usr/local/bin/runc*
+            
+            echo "=== 清理临时文件 ==="
+            rm -rf /tmp/*
+            rm -rf /var/tmp/*
+            
+            echo "=== 清理APT缓存 ==="
+            apt-get clean
+            apt-get autoclean
+            rm -rf /var/cache/apt/archives/*
+            
+            echo "=== 清理日志文件 ==="
+            journalctl --vacuum-time=1d
+            rm -rf /var/log/*.log
+            rm -rf /var/log/*/*.log
+            
+            echo "=== 清理后磁盘使用情况 ==="
+            df -h
+            
+            echo "磁盘清理完成"
+        '
+    done
+    
+    success "磁盘清理完成"
+    
+    # 重新部署K8S（使用APT）
+    log "重新部署K8S集群..."
+    deploy_k8s_apt
+}
+
 # 清理所有资源
 cleanup_all() {
     log "清理所有资源..."
@@ -1267,6 +1335,7 @@ show_menu() {
     echo -e "  ${CYAN}5.${NC} 部署KubeSphere"
     echo -e "  ${CYAN}14.${NC} 创建简化虚拟机（无Cloud-init）"
     echo -e "  ${CYAN}15.${NC} 部署K8S集群（APT安装）"
+    echo -e "  ${CYAN}16.${NC} 清理磁盘并重新部署"
     echo ""
     echo -e "${YELLOW}修复功能：${NC}"
     echo -e "  ${CYAN}6.${NC} 修复K8S网络问题"
@@ -1297,7 +1366,7 @@ main() {
         show_banner
         show_menu
         
-        read -p "请选择操作 [0-15]: " choice
+        read -p "请选择操作 [0-16]: " choice
         
         case $choice in
             1)
@@ -1331,6 +1400,7 @@ main() {
             13) reset_all_passwords ;;
             14) create_simple_vms ;;
             15) deploy_k8s_apt ;;
+            16) cleanup_and_redeploy ;;
             0) 
                 log "退出脚本"
                 exit 0 
