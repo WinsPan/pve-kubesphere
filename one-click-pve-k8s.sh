@@ -323,6 +323,43 @@ EOF
         done
     done
     
+    # 8. 最后尝试：通过控制台重置密码
+    warn "$ip 所有SSH方法都失败，尝试通过控制台重置..."
+    
+    # 创建临时脚本来重置密码
+    cat > /tmp/reset_password_$vm_id.sh << 'EOF'
+#!/bin/bash
+# 等待登录提示
+sleep 5
+# 尝试以root登录（可能不需要密码）
+echo "root"
+sleep 2
+# 重置密码
+echo "echo 'root:kubesphere123' | chpasswd"
+sleep 1
+echo "systemctl enable ssh"
+sleep 1
+echo "systemctl start ssh"
+sleep 1
+echo "exit"
+EOF
+    
+    # 通过控制台执行重置
+    timeout 30 qm terminal "$vm_id" < /tmp/reset_password_$vm_id.sh 2>/dev/null || true
+    rm -f /tmp/reset_password_$vm_id.sh
+    
+    # 等待并再次测试
+    sleep 10
+    if sshpass -p "$CLOUDINIT_PASS" ssh \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=5 \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        "$CLOUDINIT_USER@$ip" "echo 'SSH连接成功'" 2>/dev/null; then
+        success "$ip SSH连接通过控制台重置成功"
+        return 0
+    fi
+    
     err "$ip SSH连接修复失败"
     return 1
 }
@@ -952,6 +989,58 @@ fix_all_ssh() {
     success "SSH连接修复完成"
 }
 
+# 通过控制台重置所有虚拟机密码
+reset_all_passwords() {
+    log "通过控制台重置所有虚拟机密码..."
+    
+    for i in "${!VM_IPS[@]}"; do
+        local ip="${VM_IPS[$i]}"
+        local vm_id="${VM_IDS[$i]}"
+        local vm_name="${VM_NAMES[$i]}"
+        
+        log "重置 $vm_name ($ip) 密码..."
+        
+        # 创建重置脚本
+        cat > /tmp/reset_password_$vm_id.sh << 'EOF'
+#!/bin/bash
+echo ""
+sleep 3
+echo "root"
+sleep 2
+echo "passwd root"
+sleep 1
+echo "kubesphere123"
+sleep 1
+echo "kubesphere123"
+sleep 1
+echo "systemctl enable ssh"
+sleep 1
+echo "systemctl start ssh"
+sleep 1
+echo "exit"
+EOF
+        
+        log "通过控制台重置 $vm_name 密码..."
+        timeout 60 qm terminal "$vm_id" < /tmp/reset_password_$vm_id.sh &>/dev/null || true
+        rm -f /tmp/reset_password_$vm_id.sh
+        
+        # 等待并测试
+        sleep 10
+        if sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$CLOUDINIT_USER@$ip" "echo 'SSH连接成功'" 2>/dev/null; then
+            success "$vm_name 密码重置成功"
+        else
+            warn "$vm_name 密码重置可能失败，请手动检查"
+        fi
+    done
+    
+    success "密码重置完成"
+}
+
 # 清理所有资源
 cleanup_all() {
     log "清理所有资源..."
@@ -996,6 +1085,7 @@ show_menu() {
     echo -e "${BLUE}诊断功能：${NC}"
     echo -e "  ${CYAN}11.${NC} 测试SSH连接"
     echo -e "  ${CYAN}12.${NC} 修复SSH连接"
+    echo -e "  ${CYAN}13.${NC} 通过控制台重置密码"
     echo ""
     echo -e "${RED}管理功能：${NC}"
     echo -e "  ${CYAN}10.${NC} 清理所有资源"
@@ -1015,7 +1105,7 @@ main() {
         show_banner
         show_menu
         
-        read -p "请选择操作 [0-12]: " choice
+        read -p "请选择操作 [0-13]: " choice
         
         case $choice in
             1)
@@ -1046,6 +1136,7 @@ main() {
             10) cleanup_all ;;
             11) test_all_ssh ;;
             12) fix_all_ssh ;;
+            13) reset_all_passwords ;;
             0) 
                 log "退出脚本"
                 exit 0 
