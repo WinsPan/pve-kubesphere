@@ -543,19 +543,22 @@ create_vms() {
         
         # 创建基础虚拟机
         log "创建基础虚拟机配置..."
-        qm create "$vm_id" \
+        if ! qm create "$vm_id" \
             --name "$vm_name" \
             --memory "$VM_MEM" \
             --cores "$VM_CORES" \
             --net0 "virtio,bridge=$BRIDGE" \
             --scsihw virtio-scsi-pci \
             --ide2 "$STORAGE:cloudinit" \
-            --serial0 stdio --vga std \
+            --vga std \
             --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY" \
             --nameserver "$DNS" \
             --ciuser "$CLOUDINIT_USER" \
             --cipassword "$CLOUDINIT_PASS" \
-            --agent enabled=1
+            --agent enabled=1; then
+            err "虚拟机 $vm_name 创建失败"
+            continue
+        fi
         
         # 导入云镜像并设置磁盘
         log "导入云镜像到存储..."
