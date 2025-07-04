@@ -681,44 +681,37 @@ create_vms() {
         # 导入云镜像并设置磁盘
         log "导入云镜像到存储..."
         
-        # 方法1：尝试直接导入
-        if qm importdisk "$vm_id" "$CLOUD_IMAGE_PATH" "$STORAGE" --format qcow2 >/dev/null 2>&1; then
-            log "使用导入方式设置磁盘"
-            qm set "$vm_id" --scsi0 "$STORAGE:vm-$vm_id-disk-0"
+        # 首先创建指定大小的磁盘
+        log "创建 ${VM_DISK}GB 磁盘..."
+        qm set "$vm_id" --scsi0 "$STORAGE:$VM_DISK,format=qcow2"
+        
+        # 等待磁盘创建完成
+        sleep 5
+        
+        # 获取磁盘路径
+        local disk_path
+        if [[ "$STORAGE" == "local-lvm" ]]; then
+            disk_path="/dev/pve/vm-$vm_id-disk-0"
         else
-            # 方法2：使用传统方式创建磁盘并复制镜像
-            log "导入失败，使用传统方式创建磁盘"
-            
-            # 创建空磁盘
-            qm set "$vm_id" --scsi0 "$STORAGE:$VM_DISK,format=qcow2"
-            
-            # 等待磁盘创建完成
-            sleep 2
-            
-            # 获取磁盘路径
-            local disk_path
-            if [[ "$STORAGE" == "local-lvm" ]]; then
-                disk_path="/dev/pve/vm-$vm_id-disk-0"
-            else
-                disk_path="/var/lib/vz/images/$vm_id/vm-$vm_id-disk-0.qcow2"
-            fi
-            
-            # 复制镜像内容
-            log "复制云镜像内容到VM磁盘..."
-            if [[ "$STORAGE" == "local-lvm" ]]; then
-                # LVM存储：转换并复制
-                qemu-img convert -f qcow2 -O raw "$CLOUD_IMAGE_PATH" "$disk_path" || {
-                    warn "直接复制失败，尝试使用dd"
-                    dd if="$CLOUD_IMAGE_PATH" of="$disk_path" bs=1M status=progress 2>/dev/null || true
-                }
-            else
-                # 文件存储：直接复制
-                cp "$CLOUD_IMAGE_PATH" "$disk_path" || {
-                    warn "直接复制失败，尝试使用qemu-img"
-                    qemu-img convert -f qcow2 -O qcow2 "$CLOUD_IMAGE_PATH" "$disk_path" || true
-                }
-            fi
+            disk_path="/var/lib/vz/images/$vm_id/vm-$vm_id-disk-0.qcow2"
         fi
+        
+        # 复制云镜像内容到磁盘
+        log "复制云镜像内容到 ${VM_DISK}GB 磁盘..."
+        if [[ "$STORAGE" == "local-lvm" ]]; then
+            # LVM存储：先转换为临时文件，再扩展并复制
+            local temp_img="/tmp/temp-$vm_id.img"
+            qemu-img convert -f qcow2 "$CLOUD_IMAGE_PATH" "$temp_img"
+            qemu-img resize "$temp_img" "${VM_DISK}G"
+            dd if="$temp_img" of="$disk_path" bs=1M status=progress 2>/dev/null || true
+            rm -f "$temp_img"
+        else
+            # 文件存储：复制并扩展
+            cp "$CLOUD_IMAGE_PATH" "$disk_path"
+            qemu-img resize "$disk_path" "${VM_DISK}G"
+        fi
+        
+        log "磁盘设置完成: ${VM_DISK}GB"
         
         # 设置启动配置
         qm set "$vm_id" --boot c --bootdisk scsi0
