@@ -854,10 +854,23 @@ EOFSVC
             echo "=== 安装K8S组件（从GitHub源码） ==="
             cd /tmp
             
-            # 检查磁盘空间
-            echo "=== 检查磁盘空间 ==="
-            df -h /tmp
-            df -h /
+            # 检查和扩展磁盘空间
+            echo "=== 检查磁盘信息 ==="
+            lsblk
+            df -h
+            
+            echo "=== 自动扩展磁盘分区 ==="
+            # 安装cloud-guest-utils（包含growpart）
+            apt-get install -y cloud-guest-utils
+            
+            # 扩展分区
+            growpart /dev/sda 1 2>/dev/null || echo "分区已是最大或扩展失败"
+            
+            # 扩展文件系统
+            resize2fs /dev/sda1 2>/dev/null || echo "文件系统已是最大或扩展失败"
+            
+            echo "=== 扩展后磁盘空间 ==="
+            df -h
             
             # 清理旧文件和缓存
             echo "=== 清理磁盘空间 ==="
