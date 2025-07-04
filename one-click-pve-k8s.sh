@@ -420,32 +420,51 @@ create_vms() {
         qm stop "$vm_id" 2>/dev/null || true
         qm destroy "$vm_id" 2>/dev/null || true
         
-        # 创建新虚拟机
+        # 创建基础虚拟机
+        log "创建基础虚拟机配置..."
         qm create "$vm_id" \
             --name "$vm_name" \
             --memory "$VM_MEM" \
             --cores "$VM_CORES" \
             --net0 "virtio,bridge=$BRIDGE" \
             --scsihw virtio-scsi-pci \
-            --scsi0 "$STORAGE:$VM_DISK,format=qcow2" \
             --ide2 "$STORAGE:cloudinit" \
-            --boot c --bootdisk scsi0 \
             --serial0 socket --vga serial0 \
             --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY" \
             --nameserver "$DNS" \
             --ciuser "$CLOUDINIT_USER" \
             --cipassword "$CLOUDINIT_PASS" \
-            --sshkeys /dev/null \
             --agent enabled=1
         
         # 导入云镜像
-        qm importdisk "$vm_id" "$CLOUD_IMAGE_PATH" "$STORAGE" --format qcow2
-        qm set "$vm_id" --scsi0 "$STORAGE:vm-$vm_id-disk-0"
+        log "导入云镜像到存储..."
+        local imported_disk
+        imported_disk=$(qm importdisk "$vm_id" "$CLOUD_IMAGE_PATH" "$STORAGE" --format qcow2 2>&1 | grep "Successfully imported disk" | awk '{print $NF}' | tr -d "'")
+        
+        if [[ -z "$imported_disk" ]]; then
+            err "云镜像导入失败"
+            continue
+        fi
+        
+        log "导入的磁盘: $imported_disk"
+        
+        # 设置启动磁盘
+        qm set "$vm_id" --scsi0 "$imported_disk"
+        qm set "$vm_id" --boot c --bootdisk scsi0
+        
+        # 验证VM配置
+        if ! qm config "$vm_id" >/dev/null 2>&1; then
+            err "虚拟机 $vm_name 配置验证失败"
+            continue
+        fi
         
         # 启动虚拟机
-        qm start "$vm_id"
-        
-        success "虚拟机 $vm_name 创建完成"
+        log "启动虚拟机 $vm_name..."
+        if qm start "$vm_id"; then
+            success "虚拟机 $vm_name 创建并启动完成"
+        else
+            warn "虚拟机 $vm_name 启动失败，但已创建"
+        fi
     done
 }
 
