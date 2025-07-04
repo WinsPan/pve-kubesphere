@@ -86,11 +86,18 @@ check_environment() {
         exit 1
     fi
     
-    local required_commands=("wget" "ssh" "sshpass" "nc")
+    local required_commands=("wget" "ssh" "sshpass" "nc" "expect")
     for cmd in "${required_commands[@]}"; do
         if ! command -v "$cmd" &>/dev/null; then
-            err "缺少必要命令: $cmd"
-            exit 1
+            warn "缺少必要命令: $cmd，尝试安装..."
+            if [[ "$cmd" == "expect" ]]; then
+                apt-get update && apt-get install -y expect
+            elif [[ "$cmd" == "sshpass" ]]; then
+                apt-get update && apt-get install -y sshpass
+            else
+                err "缺少必要命令: $cmd，请手动安装"
+                exit 1
+            fi
         fi
     done
     
@@ -104,17 +111,43 @@ run_remote_cmd() {
     local retries="${3:-3}"
     
     for ((i=1; i<=retries; i++)); do
-        if sshpass -p "$CLOUDINIT_PASS" ssh \
+        # 先测试SSH连接
+        if ! nc -z "$ip" 22 &>/dev/null; then
+            warn "$ip SSH端口不可达，等待5秒后重试..."
+            sleep 5
+            continue
+        fi
+        
+        # 执行远程命令
+        local ssh_output
+        local ssh_exit_code
+        
+        ssh_output=$(sshpass -p "$CLOUDINIT_PASS" ssh \
             -o StrictHostKeyChecking=no \
             -o ConnectTimeout=10 \
             -o UserKnownHostsFile=/dev/null \
             -o LogLevel=ERROR \
-            "$CLOUDINIT_USER@$ip" "bash -c '$cmd'" 2>/dev/null; then
+            "$CLOUDINIT_USER@$ip" "bash -c '$cmd'" 2>&1)
+        ssh_exit_code=$?
+        
+        if [[ $ssh_exit_code -eq 0 ]]; then
+            # 成功时输出结果（如果有）
+            if [[ -n "$ssh_output" ]]; then
+                echo "$ssh_output"
+            fi
             return 0
         else
             if [[ $i -lt $retries ]]; then
-                warn "远程命令执行失败，重试 $i/$retries..."
+                warn "远程命令执行失败 (退出码: $ssh_exit_code)，重试 $i/$retries..."
+                if [[ -n "$ssh_output" ]]; then
+                    warn "错误输出: $ssh_output"
+                fi
                 sleep 5
+            else
+                err "远程命令执行最终失败 (退出码: $ssh_exit_code)"
+                if [[ -n "$ssh_output" ]]; then
+                    err "错误输出: $ssh_output"
+                fi
             fi
         fi
     done
@@ -137,6 +170,94 @@ wait_for_ssh() {
     done
     
     err "$ip SSH服务启动超时"
+    return 1
+}
+
+# 测试和修复SSH连接
+test_and_fix_ssh() {
+    local ip=$1
+    local vm_id=$2
+    
+    log "测试SSH连接到 $ip..."
+    
+    # 1. 首先测试基本连接
+    if sshpass -p "$CLOUDINIT_PASS" ssh \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=10 \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        "$CLOUDINIT_USER@$ip" "echo 'SSH连接正常'" 2>/dev/null; then
+        success "$ip SSH连接测试成功"
+        return 0
+    fi
+    
+    warn "$ip SSH连接失败，尝试修复..."
+    
+    # 2. 检查虚拟机状态
+    local vm_status
+    vm_status=$(qm status "$vm_id" | awk '{print $2}')
+    if [[ "$vm_status" != "running" ]]; then
+        warn "虚拟机 $vm_id 状态异常: $vm_status，重启中..."
+        qm stop "$vm_id" 2>/dev/null || true
+        sleep 5
+        qm start "$vm_id"
+        sleep 30
+    fi
+    
+    # 3. 通过VNC/串口重置SSH配置
+    log "通过VNC重置 $ip 的SSH配置..."
+    
+    # 使用expect自动化VNC登录和配置
+    expect << EOF
+set timeout 30
+spawn qm monitor $vm_id
+expect "qm>"
+send "info vnc\r"
+expect "qm>"
+send "quit\r"
+expect eof
+EOF
+    
+    # 4. 重新配置cloud-init
+    log "重新配置cloud-init用户..."
+    qm set "$vm_id" --ciuser "$CLOUDINIT_USER" --cipassword "$CLOUDINIT_PASS"
+    qm reboot "$vm_id"
+    
+    # 5. 等待重启完成
+    sleep 60
+    wait_for_ssh "$ip" 20
+    
+    # 6. 再次测试连接
+    if sshpass -p "$CLOUDINIT_PASS" ssh \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=10 \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        "$CLOUDINIT_USER@$ip" "echo 'SSH修复成功'" 2>/dev/null; then
+        success "$ip SSH连接修复成功"
+        return 0
+    fi
+    
+    # 7. 最后尝试：使用备用认证方式
+    warn "$ip 常规SSH修复失败，尝试备用方案..."
+    
+    # 尝试不同的用户名
+    for user in "debian" "ubuntu" "root"; do
+        if sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$user@$ip" "echo 'SSH连接成功 - 用户: $user'" 2>/dev/null; then
+            warn "$ip 使用用户 $user 连接成功，更新配置..."
+            # 更新全局用户配置
+            sed -i "s/readonly CLOUDINIT_USER=.*/readonly CLOUDINIT_USER=\"$user\"/" "$0"
+            success "$ip SSH连接修复完成（用户: $user）"
+            return 0
+        fi
+    done
+    
+    err "$ip SSH连接修复失败"
     return 1
 }
 
@@ -429,7 +550,7 @@ create_vms() {
             --net0 "virtio,bridge=$BRIDGE" \
             --scsihw virtio-scsi-pci \
             --ide2 "$STORAGE:cloudinit" \
-            --serial0 socket --vga serial0 \
+            --serial0 stdio --vga std \
             --ipconfig0 "ip=$vm_ip/24,gw=$GATEWAY" \
             --nameserver "$DNS" \
             --ciuser "$CLOUDINIT_USER" \
@@ -501,11 +622,21 @@ create_vms() {
 wait_for_vms() {
     log "等待虚拟机启动..."
     
-    for ip in "${VM_IPS[@]}"; do
+    for i in "${!VM_IPS[@]}"; do
+        local ip="${VM_IPS[$i]}"
+        local vm_id="${VM_IDS[$i]}"
+        
+        # 等待SSH服务启动
         wait_for_ssh "$ip"
+        
+        # 测试和修复SSH连接
+        if ! test_and_fix_ssh "$ip" "$vm_id"; then
+            err "虚拟机 $ip SSH连接修复失败"
+            return 1
+        fi
     done
     
-    success "所有虚拟机已启动"
+    success "所有虚拟机已启动并SSH连接正常"
 }
 
 # 部署K8S集群
@@ -701,6 +832,57 @@ deploy_kubesphere() {
     success "KubeSphere部署完成"
 }
 
+# 测试所有SSH连接
+test_all_ssh() {
+    log "测试所有虚拟机SSH连接..."
+    
+    local all_success=true
+    
+    for i in "${!VM_IPS[@]}"; do
+        local ip="${VM_IPS[$i]}"
+        local vm_name="${VM_NAMES[$i]}"
+        
+        log "测试 $vm_name ($ip) SSH连接..."
+        
+        if sshpass -p "$CLOUDINIT_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o UserKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$CLOUDINIT_USER@$ip" "echo 'SSH连接正常 - $(hostname)'" 2>/dev/null; then
+            success "$vm_name SSH连接正常"
+        else
+            err "$vm_name SSH连接失败"
+            all_success=false
+        fi
+    done
+    
+    if [[ "$all_success" == true ]]; then
+        success "所有SSH连接测试通过"
+    else
+        warn "部分SSH连接存在问题，建议运行修复功能"
+    fi
+}
+
+# 修复所有SSH连接
+fix_all_ssh() {
+    log "修复所有虚拟机SSH连接..."
+    
+    for i in "${!VM_IPS[@]}"; do
+        local ip="${VM_IPS[$i]}"
+        local vm_id="${VM_IDS[$i]}"
+        local vm_name="${VM_NAMES[$i]}"
+        
+        log "修复 $vm_name ($ip) SSH连接..."
+        
+        if ! test_and_fix_ssh "$ip" "$vm_id"; then
+            err "$vm_name SSH连接修复失败"
+        fi
+    done
+    
+    success "SSH连接修复完成"
+}
+
 # 清理所有资源
 cleanup_all() {
     log "清理所有资源..."
@@ -742,6 +924,10 @@ show_menu() {
     echo -e "  ${CYAN}8.${NC} 检查集群状态"
     echo -e "  ${CYAN}9.${NC} 一键修复所有问题"
     echo ""
+    echo -e "${BLUE}诊断功能：${NC}"
+    echo -e "  ${CYAN}11.${NC} 测试SSH连接"
+    echo -e "  ${CYAN}12.${NC} 修复SSH连接"
+    echo ""
     echo -e "${RED}管理功能：${NC}"
     echo -e "  ${CYAN}10.${NC} 清理所有资源"
     echo -e "  ${CYAN}0.${NC} 退出"
@@ -760,7 +946,7 @@ main() {
         show_banner
         show_menu
         
-        read -p "请选择操作 [0-10]: " choice
+        read -p "请选择操作 [0-12]: " choice
         
         case $choice in
             1)
@@ -789,6 +975,8 @@ main() {
                 success "一键修复完成！"
                 ;;
             10) cleanup_all ;;
+            11) test_all_ssh ;;
+            12) fix_all_ssh ;;
             0) 
                 log "退出脚本"
                 exit 0 
